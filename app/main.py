@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from transformers import pipeline
 import trafilatura
+from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
 
 
 # Environment: load from .env if present (root or app folder)
@@ -914,6 +915,9 @@ def schedule_jobs():
     # Run quiz generation daily at 2 AM
     scheduler.add_job(generate_daily_quiz_questions, "cron", hour=2, minute=0, id="generate_quiz", replace_existing=True)
     
+    # Run riddle generation daily at 11:59 PM
+    scheduler.add_job(generate_daily_riddle, "cron", hour=23, minute=59, id="generate_riddle", replace_existing=True)
+    
     scheduler.start()
     
     # Kick off initial runs asynchronously
@@ -936,6 +940,18 @@ def schedule_jobs():
             print("✅ Initial quiz question generation completed")
         
         threading.Thread(target=immediate_quiz_generation, daemon=True).start()
+        
+        # Start riddle generation immediately on startup if no riddle exists for today
+        def immediate_riddle_generation():
+            print("🧩 Checking for today's riddle...")
+            if not check_today_riddle_exists():
+                print("🚀 Generating daily riddle immediately on backend startup...")
+                generate_daily_riddle()
+                print("✅ Initial riddle generation completed")
+            else:
+                print("✅ Today's riddle already exists")
+        
+        threading.Thread(target=immediate_riddle_generation, daemon=True).start()
         
     except Exception as e:
         print(f"❌ Error starting initial jobs: {e}")
@@ -1075,6 +1091,20 @@ class AdUnlockResponse(BaseModel):
     remaining_attempts: int
     max_attempts: int
     next_reset: Optional[str] = None
+
+
+# Riddle models
+class Riddle(BaseModel):
+    id: str
+    question: str
+    answer: str
+    explanation: Optional[str] = None
+    created_at: str
+
+
+class RiddleResponse(BaseModel):
+    riddle: Optional[Riddle] = None
+    message: str
 
 
 @app.post("/api/ingest")
@@ -1410,7 +1440,8 @@ def submit_quiz_attempt(submission: QuizSubmission):
         "correct_answers": correct_answers,
         "score": percentage_score,
         "total_questions": len(submission.questions),
-        "time_spent": submission.time_spent
+        "time_spent": submission.time_spent,
+        "completed_at": datetime.now().isoformat()
     }
     
     attempt_result = client.table("quiz_attempts").insert(attempt_data).execute()
@@ -1519,6 +1550,42 @@ def unlock_ad_attempt(quiz_type: str):
         raise HTTPException(status_code=500, detail="Failed to process ad unlock")
 
 
+# Riddle endpoints
+@app.get("/riddles/latest", response_model=RiddleResponse)
+def get_latest_riddle_endpoint():
+    """
+    Get the most recent riddle for the app.
+    Returns the latest riddle or a message if none found.
+    """
+    try:
+        riddle_data = get_latest_riddle()
+        
+        if riddle_data:
+            riddle = Riddle(
+                id=riddle_data["id"],
+                question=riddle_data["question"],
+                answer=riddle_data["answer"],
+                explanation=riddle_data.get("explanation"),
+                created_at=riddle_data["created_at"]
+            )
+            return RiddleResponse(
+                riddle=riddle,
+                message="Latest riddle retrieved successfully"
+            )
+        else:
+            return RiddleResponse(
+                riddle=None,
+                message="No riddles found. Please try again later."
+            )
+            
+    except Exception as e:
+        print(f"❌ Error fetching latest riddle: {e}")
+        return RiddleResponse(
+            riddle=None,
+            message="Error retrieving riddle. Please try again later."
+        )
+
+
 # Helper functions
 def _get_user_id_from_auth() -> Optional[str]:
     """
@@ -1602,7 +1669,7 @@ def _check_quiz_attempt_limits(user_id: str, quiz_type: str) -> dict:
             .select("id")
             .eq("user_id", user_id)
             .eq("quiz_type", quiz_type)
-            .gte("created_at", today_start.isoformat())
+            .gte("completed_at", today_start.isoformat())
             .execute()
         )
         used_attempts = len(result.data or [])
@@ -1619,7 +1686,7 @@ def _check_quiz_attempt_limits(user_id: str, quiz_type: str) -> dict:
             .select("id")
             .eq("user_id", user_id)
             .eq("quiz_type", quiz_type)
-            .gte("created_at", week_start.isoformat())
+            .gte("completed_at", week_start.isoformat())
             .execute()
         )
         used_attempts = len(result.data or [])
@@ -1635,7 +1702,7 @@ def _check_quiz_attempt_limits(user_id: str, quiz_type: str) -> dict:
             .select("id")
             .eq("user_id", user_id)
             .eq("quiz_type", quiz_type)
-            .gte("created_at", month_start.isoformat())
+            .gte("completed_at", month_start.isoformat())
             .execute()
         )
         used_attempts = len(result.data or [])
