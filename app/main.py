@@ -918,6 +918,17 @@ def schedule_jobs():
     # Run riddle generation daily at 11:59 PM
     scheduler.add_job(generate_daily_riddle, "cron", hour=23, minute=59, id="generate_riddle", replace_existing=True)
     
+    # Conversation Intelligence - contextual chat feature
+    # Periodic cleanup for conversations older than 10 minutes
+    scheduler.add_job(
+        cleanup_old_conversations,
+        "interval",
+        minutes=2,
+        id="cleanup_conversations",
+        replace_existing=True,
+        kwargs={"max_age_minutes": 10}
+    )
+    
     scheduler.start()
     
     # Kick off initial runs asynchronously
@@ -1496,10 +1507,15 @@ def unlock_ad_attempt(quiz_type: str):
     """
     user_id = _get_user_id_from_auth()
     
+    # Allow guest users to unlock attempts (they'll be tracked locally in the app)
     if not user_id:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required for ad unlocks"
+        # For guest users, return success without backend tracking
+        return AdUnlockResponse(
+            success=True,
+            message="Ad unlock successful for guest user",
+            remaining_attempts=1,  # Guest users get 1 additional attempt
+            max_attempts=3,  # Default max for guests
+            next_reset="2024-01-01T00:00:00Z"  # Placeholder
         )
     
     if quiz_type not in ["daily", "weekly", "monthly"]:
@@ -1584,6 +1600,204 @@ def get_latest_riddle_endpoint():
             riddle=None,
             message="Error retrieving riddle. Please try again later."
         )
+
+
+# Conversation Intelligence - contextual chat feature
+class ContextChatRequest(BaseModel):
+    article_id: str
+    user_id: Optional[str] = None
+    message: str
+    conversation_id: Optional[str] = None  # optional existing context row id
+
+
+# Conversation Intelligence - contextual chat feature
+@app.post("/context/chat")
+def contextual_chat(req: ContextChatRequest):
+    """
+    Handle article-context chat without modifying general chat flow.
+    - Fetch article (title + summary/content)
+    - Load prior conversation messages from conversation_context (if any)
+    - Call Groq with combined context
+    - Append new user+assistant turns back to conversation_context
+    Returns: { reply, conversation_id }
+    """
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY missing")
+
+    client = supabase_client()
+
+    # 1) Fetch article basics
+    try:
+        ares = (
+            client.table("articles")
+            .select("id,title,summary,content,description")
+            .eq("id", req.article_id)
+            .limit(1)
+            .execute()
+        )
+        if not ares.data:
+            raise HTTPException(status_code=404, detail="Article not found")
+        art = ares.data[0]
+        article_title = art.get("title") or ""
+        article_context = (
+            art.get("summary")
+            or art.get("content")
+            or art.get("description")
+            or ""
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ContextChat: article fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch article")
+
+    # 2) Get existing conversation (by provided id, or by user+article)
+    conv_row = None
+    try:
+        if req.conversation_id:
+            cres = (
+                client.table("conversation_context")
+                .select("id,messages,user_id,article_id,created_at")
+                .eq("id", req.conversation_id)
+                .limit(1)
+                .execute()
+            )
+            conv_row = (cres.data or [None])[0]
+        else:
+            # find the most recent conversation for this user+article (user_id may be null)
+            q = (
+                client.table("conversation_context")
+                .select("id,messages,user_id,article_id,created_at")
+                .eq("article_id", req.article_id)
+                .order("created_at", desc=True)
+                .limit(1)
+            )
+            if req.user_id:
+                q = q.eq("user_id", req.user_id)
+            else:
+                q = q.is_("user_id", None)
+            cres = q.execute()
+            conv_row = (cres.data or [None])[0]
+    except Exception as e:
+        print(f"ContextChat: conversation fetch error: {e}")
+        conv_row = None
+
+    # Build message history for Groq
+    history = []
+    if conv_row and conv_row.get("messages"):
+        try:
+            history = conv_row["messages"] or []
+        except Exception:
+            history = []
+
+    # 3) Call Groq with context
+    try:
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        system_prompt = (
+            "You are a helpful news assistant. Answer concisely using the provided article context. "
+            "If the user's question goes beyond the article, answer based on general knowledge "
+            "without hallucinating specifics. Keep answers brief and clear."
+        )
+
+        # Compose messages: system + article context + prior turns + user message
+        groq_messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Article Title: {article_title}\n\n"
+                    f"Article Context:\n{article_context}\n\n"
+                    "Use this article context to answer questions."
+                ),
+            },
+        ]
+
+        # Append prior turns (truncate to last ~10 turns to control length)
+        prior = history[-10:] if len(history) > 10 else history
+        for m in prior:
+            role = m.get("role") or "user"
+            content = m.get("content") or ""
+            if role in ("user", "assistant") and content:
+                groq_messages.append({"role": role, "content": content})
+
+        # Current user message
+        groq_messages.append({"role": "user", "content": req.message})
+
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": groq_messages,
+            "temperature": 0.2,
+            "max_tokens": 512,
+        }
+
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            print(f"ContextChat: Groq error {resp.status_code}: {resp.text[:200]}")
+            raise HTTPException(status_code=502, detail="AI service error")
+        data = resp.json()
+        reply = (
+            data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            or ""
+        ).strip()
+        if not reply:
+            reply = "Sorry, I couldn't generate a response."
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ContextChat: Groq call exception: {e}")
+        raise HTTPException(status_code=502, detail="AI service error")
+
+    # 4) Persist conversation turns
+    try:
+        new_messages = history + [
+            {"role": "user", "content": req.message, "ts": datetime.now().isoformat()},
+            {"role": "assistant", "content": reply, "ts": datetime.now().isoformat()},
+        ]
+
+        if conv_row:
+            upd = (
+                client.table("conversation_context")
+                .update({"messages": new_messages})
+                .eq("id", conv_row["id"])  # type: ignore
+                .execute()
+            )
+            conv_id = conv_row["id"]
+        else:
+            ins = (
+                client.table("conversation_context")
+                .insert({
+                    "article_id": req.article_id,
+                    "user_id": req.user_id,
+                    "messages": new_messages,
+                })
+                .execute()
+            )
+            conv_id = (ins.data or [{}])[0].get("id")
+    except Exception as e:
+        print(f"ContextChat: persist error: {e}")
+        # Do not fail the response if storage fails
+        conv_id = conv_row["id"] if conv_row else None
+
+    return {"reply": reply, "conversation_id": conv_id}
+
+
+# Conversation Intelligence - contextual chat feature
+def cleanup_old_conversations(max_age_minutes: int = 10):
+    """Delete conversation_context rows older than max_age_minutes."""
+    try:
+        client = supabase_client()
+        cutoff = (datetime.utcnow() - timedelta(minutes=max_age_minutes)).isoformat()
+        client.table("conversation_context").delete().lt("created_at", cutoff).execute()
+    except Exception as e:
+        print(f"⚠️ cleanup_old_conversations error: {e}")
 
 
 # Helper functions
