@@ -18,6 +18,7 @@ import trafilatura
 from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
 
 
+
 # Environment: load from .env if present (root or app folder)
 _ENV_CANDIDATES = [
     PPath(__file__).resolve().parent.parent / ".env",  # voice_backend/.env
@@ -112,9 +113,13 @@ def summarize_text_if_possible(content, titles=None):
 
             summary = summarizer(
                 content,
-                max_length=50,
+                max_length=100,
                 min_length=30,
-                do_sample=False
+                do_sample=False,
+                num_beams=6,
+                no_repeat_ngram_size=3,
+                length_penalty=1.0,
+                early_stopping=True
             )
             return summary[0]["summary_text"]
 
@@ -127,9 +132,13 @@ def summarize_text_if_possible(content, titles=None):
                     continue
                 summary = summarizer(
                     text,
-                    max_length=60,
-                    min_length=45,
-                    do_sample=False
+                    max_length=100,
+                    min_length=30,
+                    do_sample=False,
+                    num_beams=6,
+                    no_repeat_ngram_size=3,
+                    length_penalty=1.0,
+                    early_stopping=True
                 )
                 results.append(summary[0]["summary_text"])
 
@@ -151,7 +160,7 @@ def summarize_text_if_possible(content, titles=None):
             return [None] * len(content)
 
 
-# def call_groq_summarize(titles: List[str], texts: List[str]) -> List[str]:
+def call_groq_summarize(titles: List[str], texts: List[str]) -> List[str]:
     """
     Summarize multiple articles in one Groq API call. Returns a list of concise
     2–3 sentence paragraphs in the same order as inputs. If Groq is unavailable,
@@ -253,11 +262,28 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
         # Try fetching full article text
         if url:
             full_text = fetch_full_article_text(url)
-            full_text = full_text[:500]  # limit length
+            full_text = full_text[:1000]  # limit length increased to 1000
+            if full_text:
+                try:
+                    title_dbg = (title or a.get("title") or "")[:80]
+                    print(f"Summary input source: full_page_text (len={len(full_text)}) for title='{title_dbg}'")
+                except Exception:
+                    pass
 
         # Fallback to short content/description
         if not full_text:
-            full_text = a.get("content") or a.get("description") or ""
+            chosen = ""
+            if a.get("content"):
+                full_text = a.get("content")
+                chosen = "content"
+            else:
+                full_text = a.get("description") or ""
+                chosen = "description" if a.get("description") else "none"
+            try:
+                title_dbg = (title or a.get("title") or "")[:80]
+                print(f"Summary input source: {chosen} (len={len(full_text)}) for title='{title_dbg}'")
+            except Exception:
+                pass
 
         if full_text:
             to_sum.append((a, title, full_text))
@@ -333,10 +359,21 @@ def _prepare_texts(items):
 
     def build_text(item):
         url = item.get("url")
-        full = fetch_full_article_text(url)[:500] if url else ""
-        if not full:
-            full = item.get("content") or item.get("description") or ""
-        return full
+        full = fetch_full_article_text(url)[:1000] if url else ""
+        if full:
+            try:
+                print(f"Summary input source: full_page_text (len={len(full)}) for title='{(item.get('title') or '')[:80]}'")
+            except Exception:
+                pass
+            return full
+
+        fallback = item.get("content") or item.get("description") or ""
+        try:
+            src = "content" if item.get("content") else ("description" if item.get("description") else "none")
+            print(f"Summary input source: {src} (len={len(fallback)}) for title='{(item.get('title') or '')[:80]}'")
+        except Exception:
+            pass
+        return fallback
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(build_text, items))
