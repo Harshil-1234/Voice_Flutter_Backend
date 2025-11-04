@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 # from transformers import pipeline  # Commented out - using Groq instead of BART
 import trafilatura
-from .riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
+from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
