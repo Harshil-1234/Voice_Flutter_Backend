@@ -13,12 +13,10 @@ from pydantic import BaseModel
 from pathlib import Path as PPath
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-# from transformers import pipeline  # Commented out - using Groq instead of BART
+from transformers import pipeline
 import trafilatura
 from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 
 
 # Environment: load from .env if present (root or app folder)
@@ -40,26 +38,11 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-# Support multiple summary API keys (comma-separated) for fallback/rotation
-# Format: GROQ_SUMMARY_API_KEY=key1,key2,key3,key4,key5
-# Falls back to GROQ_API_KEY if not set
-_summary_keys_str = os.getenv("GROQ_SUMMARY_API_KEY") or GROQ_API_KEY
-GROQ_SUMMARY_API_KEYS = [key.strip() for key in _summary_keys_str.split(",") if key.strip()]
-if not GROQ_SUMMARY_API_KEYS and GROQ_API_KEY:
-    GROQ_SUMMARY_API_KEYS = [GROQ_API_KEY]  # Fallback to main key
-
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 # Default batch size set to 20 per requirements
 SUMMARIZE_BATCH_SIZE = int(os.getenv("SUMMARIZE_BATCH_SIZE", "20"))
 
-# BART summarizer commented out - using Groq instead
-# summarizer = pipeline(
-#     "summarization",
-#     model="facebook/bart-large-cnn",  # You can switch to smaller models below
-#     tokenizer="facebook/bart-large-cnn",
-#     device=-1  # CPU; use device=0 if you have GPU
-# )
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
 
 CATEGORIES = [
     "general",
@@ -100,24 +83,6 @@ def supabase_client():
 def md5_lower(text: str) -> str:
     return hashlib.md5(text.lower().encode("utf-8")).hexdigest()
 
-# _summarizer = None
-
-# def _load_summarizer():
-#     global _summarizer
-#     if _summarizer is None:
-#         try:
-#             _summarizer = pipeline(
-#                 "summarization",
-#                 model="sshleifer/distilbart-cnn-6-6",
-#                 tokenizer="sshleifer/distilbart-cnn-6-6",
-#                 device=-1  # CPU only
-#             )
-#             print("✅ Loaded lightweight summarizer (DistilBART, CPU)")
-#         except Exception as e:
-#             print(f"⚠️ Could not load summarizer: {e}")
-#             _summarizer = None
-#     return _summarizer
-
 def fetch_full_article_text(url: str) -> str:
     """
     Extract full article text from a news URL using trafilatura.
@@ -133,437 +98,56 @@ def fetch_full_article_text(url: str) -> str:
         print(f"❌ Error fetching article: {url} — {e}")
         return ""
 
-# BART-based summarization commented out - using Groq instead
-# def summarize_text_if_possible(content, titles=None):
-#     """
-#     Summarize text using BART if length is sufficient.
-#     - If `content` is a single string → returns a single summary (string or None).
-#     - If `content` is a list of strings → returns a list of summaries aligned with input.
-#     Titles are optional, mainly used for debugging/logging.
-#     """
-#     try:
-#         # Case 1: Single string
-#         if isinstance(content, str):
-#             if not content or len(content.split()) < 30:
-#                 return None
-#
-#             summary = summarizer(
-#                 content,
-#                 max_length=100,
-#                 min_length=30,
-#                 do_sample=False,
-#                 num_beams=6,
-#                 no_repeat_ngram_size=3,
-#                 length_penalty=1.0,
-#                 early_stopping=True
-#             )
-#             return summary[0]["summary_text"]
-#
-#         # Case 2: List of strings
-#         elif isinstance(content, list):
-#             results = []
-#             for idx, text in enumerate(content):
-#                 if not text or len(text.split()) < 30:
-#                     results.append(None)
-#                     continue
-#                 summary = summarizer(
-#                     text,
-#                     max_length=100,
-#                     min_length=30,
-#                     do_sample=False,
-#                     num_beams=6,
-#                     no_repeat_ngram_size=3,
-#                     length_penalty=1.0,
-#                     early_stopping=True
-#                 )
-#                 results.append(summary[0]["summary_text"])
-#
-#                 # optional: log which title got summarized
-#                 if titles and idx < len(titles):
-#                     snippet = summary[0]["summary_text"][:120].replace("\n", " ")
-#                     print(f"✅ Summarized: {titles[idx]} → {snippet}...")
-#
-#             return results
-#
-#         else:
-#             return None
-#
-#     except Exception as e:
-#         print(f"Summarization error: {e}")
-#         if isinstance(content, str):
-#             return None
-#         elif isinstance(content, list):
-#             return [None] * len(content)
-
-
-# Global counter for tracking first few summaries to log
-_summary_log_counter = 0
-_MAX_LOGGED_SUMMARIES = 5
-
-# API key rotation tracking (simple round-robin for now)
-_summary_key_index = 0
-_summary_key_lock = threading.Lock()  # Thread-safe key rotation
-
-def _get_next_summary_key():
-    """Get next API key in rotation for summarization."""
-    global _summary_key_index
-    if not GROQ_SUMMARY_API_KEYS:
-        return None
-    with _summary_key_lock:
-        key = GROQ_SUMMARY_API_KEYS[_summary_key_index]
-        _summary_key_index = (_summary_key_index + 1) % len(GROQ_SUMMARY_API_KEYS)
-        return key
-
-def summarize_with_groq(text: str, title: Optional[str] = None) -> Optional[str]:
-    """
-    Summarize text using Groq API with llama-3.1-8b-instant model.
-    Uses multiple GROQ_SUMMARY_API_KEYS with rotation/fallback for rate limit handling.
-    Returns a summary string or None if summarization fails.
-    Includes exponential backoff retry logic and automatic key rotation on rate limits.
-    """
-    global _summary_log_counter
-    
-    if not GROQ_SUMMARY_API_KEYS:
-        print("⚠️ GROQ_SUMMARY_API_KEYS not set, skipping summarization")
-        return None
-    
-    if not text or len(text.split()) < 30:
-        return None
-    
-    # Get initial API key (round-robin)
-    current_key = _get_next_summary_key()
-    if not current_key:
-        return None
-    
-    headers = {
-        "Authorization": f"Bearer {current_key}",
-        "Content-Type": "application/json",
-    }
-    
-    system_prompt = (
-        "You are an expert news article summarizer. "
-        "Create concise, informative summaries that capture the key points of news articles. "
-        "Keep summaries between 60-100 words. Focus on the main facts, events, and implications."
-    )
-    
-    user_prompt = f"Summarize the following news article{' titled: ' + title if title else ''}:\n\n{text[:2000]}"
-    
-    payload = {
-        "model": "llama-3.1-8b-instant",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.3,
-        "max_tokens": 200,
-    }
-    
-    # Log first few articles being summarized
-    if _summary_log_counter < _MAX_LOGGED_SUMMARIES:
-        _summary_log_counter += 1
-        text_preview = text[:200].replace("\n", " ").strip()
-        print(f"\n📝 [Summary #{_summary_log_counter}] Starting Groq summarization:")
-        print(f"   Title: {title[:80] if title else 'N/A'}")
-        print(f"   Text preview: {text_preview}...")
-        print(f"   Text length: {len(text)} chars, {len(text.split())} words")
-        print(f"   Requested model in payload: {payload['model']}")
-    
-    # Exponential backoff retry logic with key rotation on rate limits
-    max_key_rotations = len(GROQ_SUMMARY_API_KEYS)  # Try all keys before giving up
-    retries_per_key = 2  # Retries per key before rotating
-    backoffs = [5, 10]  # Wait times in seconds
-    attempt = 0
-    key_attempt = 0
-    keys_tried = set()
-    
-    try:
-        while key_attempt < max_key_rotations:
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=30,
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                # Log the actual model used by the API
-                actual_model = data.get("model", "unknown")
-                requested_model = payload.get("model", "unknown")
-                if actual_model != requested_model:
-                    print(f"\n⚠️ [MODEL MISMATCH] Requested: {requested_model}, API used: {actual_model}")
-                    print(f"   Title: {title[:80] if title else 'N/A'}")
-                    print(f"   Response model field: {actual_model}")
-                    print("-" * 80)
-                
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                if content:
-                    summary = content.strip()
-                    
-                    # Log first few successful summaries
-                    if _summary_log_counter <= _MAX_LOGGED_SUMMARIES:
-                        key_num = GROQ_SUMMARY_API_KEYS.index(current_key) + 1 if current_key in GROQ_SUMMARY_API_KEYS else "?"
-                        print(f"\n✅ [Summary #{_summary_log_counter}] Successfully summarized (Key #{key_num}):")
-                        print(f"   Title: {title[:80] if title else 'N/A'}")
-                        print(f"   Requested model: {requested_model}")
-                        print(f"   Actual model used: {actual_model}")
-                        print(f"   Summary: {summary}")
-                        print(f"   Summary length: {len(summary)} chars, {len(summary.split())} words")
-                        print("-" * 80)
-                    
-                    return summary
-                return None
-                    
-            elif resp.status_code == 429:
-                # Rate limit hit - try next API key or retry with backoff
-                if attempt < retries_per_key:
-                    wait_s = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
-                    attempt += 1
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    key_num = GROQ_SUMMARY_API_KEYS.index(current_key) + 1 if current_key in GROQ_SUMMARY_API_KEYS else "?"
-                    print(f"\n🚨 [RATE LIMIT HIT - Key #{key_num}] {timestamp}")
-                    print(f"   Article: {title[:80] if title else 'N/A'}")
-                    print(f"   Status: 429 Too Many Requests")
-                    print(f"   Retry #{attempt}/{retries_per_key} on same key: Waiting {wait_s} seconds...")
-                    time.sleep(wait_s)
-                    continue
-                else:
-                    # Rotate to next key
-                    keys_tried.add(current_key)
-                    if len(keys_tried) >= len(GROQ_SUMMARY_API_KEYS):
-                        print(f"\n❌ [ALL KEYS EXHAUSTED] All {len(GROQ_SUMMARY_API_KEYS)} API keys hit rate limits")
-                        return None
-                    
-                    current_key = _get_next_summary_key()
-                    while current_key in keys_tried and len(keys_tried) < len(GROQ_SUMMARY_API_KEYS):
-                        current_key = _get_next_summary_key()
-                    
-                    if current_key and current_key not in keys_tried:
-                        headers["Authorization"] = f"Bearer {current_key}"
-                        attempt = 0  # Reset attempt counter for new key
-                        key_attempt += 1
-                        key_num = GROQ_SUMMARY_API_KEYS.index(current_key) + 1 if current_key in GROQ_SUMMARY_API_KEYS else "?"
-                        print(f"\n🔄 [ROTATING TO KEY #{key_num}] Trying next API key...")
-                        continue
-                    else:
-                        print(f"\n❌ [NO MORE KEYS] All keys exhausted")
-                        return None
-            else:
-                # Non-rate-limit error - try next key once, then give up
-                if key_attempt == 0 and len(GROQ_SUMMARY_API_KEYS) > 1:
-                    current_key = _get_next_summary_key()
-                    headers["Authorization"] = f"Bearer {current_key}"
-                    key_attempt += 1
-                    key_num = GROQ_SUMMARY_API_KEYS.index(current_key) + 1 if current_key in GROQ_SUMMARY_API_KEYS else "?"
-                    print(f"\n⚠️ [API ERROR {resp.status_code}] Rotating to Key #{key_num}...")
-                    continue
-                else:
-                    print(f"⚠️ Groq summarization error {resp.status_code}: {resp.text[:200]}")
-                    if _summary_log_counter <= _MAX_LOGGED_SUMMARIES:
-                        print(f"   Failed article: {title[:80] if title else 'N/A'}")
-                    return None
-                
-    except Exception as e:
-        print(f"⚠️ Groq summarization exception: {e}")
-        if _summary_log_counter <= _MAX_LOGGED_SUMMARIES:
-            print(f"   Failed article: {title[:80] if title else 'N/A'}")
-        return None
-
-
-def summarize_batch_with_groq(articles_data: List[Tuple[str, str, int]]) -> List[Optional[str]]:
-    """
-    Summarize multiple articles in a single Groq API call with proper mapping.
-    Uses multiple GROQ_SUMMARY_API_KEYS with rotation/fallback for rate limit handling.
-    articles_data: List of (title, text, index) tuples
-    Returns a list of summaries aligned with input order (indexed properly).
-    """
-    if not GROQ_SUMMARY_API_KEYS:
-        print("⚠️ GROQ_SUMMARY_API_KEYS not set, skipping batch summarization")
-        return [None] * len(articles_data)
-    
-    if not articles_data:
-        return []
-    
-    # Get initial API key (round-robin)
-    current_key = _get_next_summary_key()
-    if not current_key:
-        return [None] * len(articles_data)
-    
-    try:
-        headers = {
-            "Authorization": f"Bearer {current_key}",
-            "Content-Type": "application/json",
-        }
-        
-        system_prompt = (
-            "You are an expert news article summarizer. "
-            "I will provide multiple news articles numbered starting from 0. For each article, create a concise, "
-            "informative summary that captures the key points (60-100 words). Focus on main facts, events, and implications. "
-            "Return ONLY a valid JSON object with this exact format: "
-            '{"summaries": [{"index": 0, "summary": "summary text"}, {"index": 1, "summary": "summary text"}, ...]} '
-            "The index MUST match the article number (0, 1, 2, etc.) in the order provided."
-        )
-        
-        # Build user prompt with numbered articles (using local index 0, 1, 2...)
-        articles_text = []
-        for local_idx, (title, text, original_idx) in enumerate(articles_data):
-            article_text = text[:1500]  # Limit per article to fit in context
-            articles_text.append(f"Article {local_idx} (Title: {title[:100]}):\n{article_text}")
-        
-        user_prompt = (
-            f"Summarize the following {len(articles_data)} news articles. Return a JSON object with a 'summaries' array "
-            "where each entry has 'index' (matching the article number 0, 1, 2, etc.) and 'summary' fields.\n\n" +
-            "\n\n---\n\n".join(articles_text)
-        )
-        
-        payload = {
-            "model": "llama-3.1-8b-instant",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.3,
-            "max_tokens": 200 * len(articles_data),  # Allocate tokens for all summaries
-            "response_format": {"type": "json_object"}
-        }
-        
-        # Exponential backoff retry logic with key rotation on rate limits
-        max_key_rotations = len(GROQ_SUMMARY_API_KEYS)
-        retries_per_key = 2
-        backoffs = [5, 10]
-        attempt = 0
-        key_attempt = 0
-        keys_tried = set()
-        
-        while key_attempt < max_key_rotations:
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=60,  # Longer timeout for batch processing
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                # Log the actual model used by the API
-                actual_model = data.get("model", "unknown")
-                requested_model = payload.get("model", "unknown")
-                if actual_model != requested_model:
-                    print(f"\n⚠️ [BATCH MODEL MISMATCH] Requested: {requested_model}, API used: {actual_model}")
-                    print(f"   Response model field: {actual_model}")
-                    print("-" * 80)
-                
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                
-                if content:
-                    try:
-                        # Parse JSON response
-                        result = json.loads(content)
-                        summaries_data = result.get("summaries", [])
-                        
-                        # Create a dictionary mapping local index to summary
-                        # Local index is 0, 1, 2... matching the order in articles_data
-                        summary_map = {}
-                        for item in summaries_data:
-                            idx = item.get("index")
-                            if idx is not None and isinstance(idx, int):
-                                summary_map[idx] = item.get("summary", "").strip()
-                        
-                        # Build results list in correct order (local index matches position in articles_data)
-                        results = [None] * len(articles_data)
-                        for local_idx in range(len(articles_data)):
-                            if local_idx in summary_map:
-                                results[local_idx] = summary_map[local_idx]
-                        
-                        success_count = len([r for r in results if r])
-                        key_num = GROQ_SUMMARY_API_KEYS.index(current_key) + 1 if current_key in GROQ_SUMMARY_API_KEYS else "?"
-                        print(f"✅ Batch summarized {success_count}/{len(articles_data)} articles (Key #{key_num}, model: {actual_model})")
-                        return results
-                        
-                    except json.JSONDecodeError as e:
-                        print(f"⚠️ Failed to parse batch summary JSON: {e}")
-                        print(f"Response content: {content[:500]}")
-                        # Fallback to individual summarization
-                        return [None] * len(articles_data)
-                else:
-                    return [None] * len(articles_data)
-                    
-            elif resp.status_code == 429:
-                # Rate limit hit - try next API key or retry with backoff
-                if attempt < retries_per_key:
-                    wait_s = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
-                    attempt += 1
-                    key_num = GROQ_SUMMARY_API_KEYS.index(current_key) + 1 if current_key in GROQ_SUMMARY_API_KEYS else "?"
-                    print(f"⚠️ [BATCH RATE LIMIT - Key #{key_num}] Retrying in {wait_s}s (attempt {attempt}/{retries_per_key})...")
-                    time.sleep(wait_s)
-                    continue
-                else:
-                    # Rotate to next key
-                    keys_tried.add(current_key)
-                    if len(keys_tried) >= len(GROQ_SUMMARY_API_KEYS):
-                        print(f"❌ [BATCH ALL KEYS EXHAUSTED] All {len(GROQ_SUMMARY_API_KEYS)} API keys hit rate limits")
-                        return [None] * len(articles_data)
-                    
-                    current_key = _get_next_summary_key()
-                    while current_key in keys_tried and len(keys_tried) < len(GROQ_SUMMARY_API_KEYS):
-                        current_key = _get_next_summary_key()
-                    
-                    if current_key and current_key not in keys_tried:
-                        headers["Authorization"] = f"Bearer {current_key}"
-                        attempt = 0
-                        key_attempt += 1
-                        key_num = GROQ_SUMMARY_API_KEYS.index(current_key) + 1 if current_key in GROQ_SUMMARY_API_KEYS else "?"
-                        print(f"🔄 [BATCH ROTATING TO KEY #{key_num}] Trying next API key...")
-                        continue
-                    else:
-                        print(f"❌ [BATCH NO MORE KEYS] All keys exhausted")
-                        return [None] * len(articles_data)
-            else:
-                # Non-rate-limit error - try next key once, then give up
-                if key_attempt == 0 and len(GROQ_SUMMARY_API_KEYS) > 1:
-                    current_key = _get_next_summary_key()
-                    headers["Authorization"] = f"Bearer {current_key}"
-                    key_attempt += 1
-                    key_num = GROQ_SUMMARY_API_KEYS.index(current_key) + 1 if current_key in GROQ_SUMMARY_API_KEYS else "?"
-                    print(f"⚠️ [BATCH API ERROR {resp.status_code}] Rotating to Key #{key_num}...")
-                    continue
-                else:
-                    print(f"⚠️ Groq batch summarization error {resp.status_code}: {resp.text[:200]}")
-                    return [None] * len(articles_data)
-            
-    except Exception as e:
-        print(f"⚠️ Groq batch summarization exception: {e}")
-    
-    return [None] * len(articles_data)
-
-
 def summarize_text_if_possible(content, titles=None):
     """
-    Summarize text using Groq API if length is sufficient.
+    Summarize text using BART if length is sufficient.
     - If `content` is a single string → returns a single summary (string or None).
-    - If `content` is a list of strings → returns a list of summaries aligned with input using batch processing.
+    - If `content` is a list of strings → returns a list of summaries aligned with input.
     Titles are optional, mainly used for debugging/logging.
     """
     try:
         # Case 1: Single string
         if isinstance(content, str):
-            title = titles if isinstance(titles, str) else None
-            summary = summarize_with_groq(content, title)
-            return summary
+            if not content or len(content.split()) < 30:
+                return None
 
-        # Case 2: List of strings - use batch processing for efficiency
+            summary = summarizer(
+                content,
+                max_length=100,
+                min_length=30,
+                do_sample=False,
+                num_beams=6,
+                no_repeat_ngram_size=3,
+                length_penalty=1.0,
+                early_stopping=True
+            )
+            return summary[0]["summary_text"]
+
+        # Case 2: List of strings
         elif isinstance(content, list):
-            if len(content) == 0:
-                return []
-            
-            # Use parallel batch summarization for multiple articles
-            if len(content) > 1:
-                return parallel_summarize_texts(content, titles, max_workers=25, batch_size=10)
-            else:
-                # Single item - use individual call
-                title = titles[0] if titles and len(titles) > 0 else None
-                summary = summarize_with_groq(content[0], title)
-                return [summary] if summary else [None]
+            results = []
+            for idx, text in enumerate(content):
+                if not text or len(text.split()) < 30:
+                    results.append(None)
+                    continue
+                summary = summarizer(
+                    text,
+                    max_length=100,
+                    min_length=30,
+                    do_sample=False,
+                    num_beams=6,
+                    no_repeat_ngram_size=3,
+                    length_penalty=1.0,
+                    early_stopping=True
+                )
+                results.append(summary[0]["summary_text"])
+
+                # optional: log which title got summarized
+                if titles and idx < len(titles):
+                    snippet = summary[0]["summary_text"][:120].replace("\n", " ")
+                    print(f"✅ Summarized: {titles[idx]} → {snippet}...")
+
+            return results
 
         else:
             return None
@@ -576,130 +160,99 @@ def summarize_text_if_possible(content, titles=None):
             return [None] * len(content)
 
 
-def call_groq_summarize(titles: List[str], texts: List[str], max_workers: int = 25, batch_size: int = 10) -> List[str]:
+def call_groq_summarize(titles: List[str], texts: List[str]) -> List[str]:
     """
-    Parallelize Groq summarization safely for multiple articles using batch processing.
-    Returns a list of summaries aligned with the input.
-    
-    Args:
-        titles: List of article titles
-        texts: List of article texts
-        max_workers: Maximum concurrent batch API calls (default 25)
-        batch_size: Number of articles per batch API call (default 10)
+    Summarize multiple articles in one Groq API call. Returns a list of concise
+    2–3 sentence paragraphs in the same order as inputs. If Groq is unavailable,
+    returns empty list.
     """
-    # Use the batch summarization function
-    batch_data = [(titles[idx] if titles and idx < len(titles) else "", text, idx) for idx, text in enumerate(texts)]
-    
-    # Process in parallel batches
-    batches = []
-    for i in range(0, len(batch_data), batch_size):
-        batches.append((batch_data[i:i + batch_size], i))
-    
-    results = [None] * len(texts)
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_batch = {
-            executor.submit(summarize_batch_with_groq, batch_data): (batch_data, start_idx)
-            for batch_data, start_idx in batches
-        }
-
-        for future in as_completed(future_to_batch):
-            batch_data, start_idx = future_to_batch[future]
-            try:
-                batch_results = future.result()
-                for local_idx, summary in enumerate(batch_results):
-                    global_idx = start_idx + local_idx
-                    if global_idx < len(results):
-                        results[global_idx] = summary
-                        if summary and titles and global_idx < len(titles):
-                            print(f"✅ Summarized (Groq batch): {titles[global_idx][:60]}")
-            except Exception as e:
-                print(f"⚠️ Batch summarization failed for batch at index {start_idx}: {e}")
-    
-    return results
-
-
-def parallel_summarize_texts(texts: List[str], titles: Optional[List[str]] = None, max_workers: int = 25, batch_size: int = 10) -> List[Optional[str]]:
-    """
-    Parallelize Groq summarization for multiple texts using batch API calls.
-    Uses batch summarization (multiple articles per API call) for efficiency.
-    Returns a list of summaries aligned with the input texts.
-    
-    Args:
-        texts: List of article texts to summarize
-        titles: Optional list of article titles
-        max_workers: Maximum concurrent batch API calls (default 25, within Groq free tier limits)
-        batch_size: Number of articles per batch API call (default 10)
-    """
-    if not texts:
+    if not GROQ_API_KEY:
         return []
-    
-    results = [None] * len(texts)
-    
-    # Group articles into batches
-    batches = []
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i + batch_size]
-        batch_titles = titles[i:i + batch_size] if titles else [None] * len(batch_texts)
-        # Create tuples of (title, text, original_index)
-        batch_data = [(batch_titles[j] or "", batch_texts[j], i + j) for j in range(len(batch_texts))]
-        batches.append((batch_data, i))  # Store batch data and starting index
-    
-    # Process batches in parallel
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_batch = {
-            executor.submit(summarize_batch_with_groq, batch_data): (batch_data, start_idx)
-            for batch_data, start_idx in batches
+    try:
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        # System prompt: concise 2–3 sentence paragraphs, no bullet points
+        system_prompt = (
+            "You are a concise summarization assistant. Summarize news articles into clear 2–3 sentence paragraphs. "
+            "No bullet points. Return ONLY the summary text, never include the original article content."
+        )
+
+        # Build a single user message containing all articles, separated by a delimiter
+        # Ask model to return one paragraph per article, in order, separated by the same delimiter
+        delimiter = "\n\n===\n\n"
+        parts: List[str] = []
+        for idx, (t, x) in enumerate(zip(titles, texts), start=1):
+            safe_t = t or ""
+            safe_x = x or ""
+            parts.append(f"Article {idx}:\nTitle: {safe_t}\nContent: {safe_x}")
+        user_instruction = (
+            "Summarize the following news articles. Return exactly one paragraph per article, "
+            "in the same order, separated by the delimiter '" + delimiter.strip() + "'. "
+            "Each summary must be 2–3 sentences (50–60 words). Do not use bullet points. "
+            "IMPORTANT: Return ONLY the summary, not the original article content."
+        )
+        user_content = user_instruction + "\n\n" + delimiter.join(parts)
+
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": 0.2,
+            # Scale max tokens with batch size to stay within limits
+            "max_tokens": max(1024, min(4096, max(1, len(titles)) * 80)),
         }
 
-        for future in as_completed(future_to_batch):
-            batch_data, start_idx = future_to_batch[future]
-            try:
-                batch_results = future.result()
-                # Map batch results to correct positions in results array
-                for local_idx, summary in enumerate(batch_results):
-                    global_idx = start_idx + local_idx
-                    if global_idx < len(results):
-                        results[global_idx] = summary
-                        if summary and titles and global_idx < len(titles):
-                            snippet = summary[:80].replace("\n", " ")
-                            print(f"✅ Batch Groq summary [{global_idx}]: {titles[global_idx][:60]} → {snippet}...")
-            except Exception as e:
-                print(f"⚠️ Batch summarization failed for batch starting at index {start_idx}: {e}")
-                # Fallback to individual summarization for this batch
-                for local_idx, (title, text, _) in enumerate(batch_data):
-                    global_idx = start_idx + local_idx
-                    if global_idx < len(results):
-                        try:
-                            results[global_idx] = summarize_with_groq(text, title)
-                        except Exception as e2:
-                            print(f"⚠️ Individual fallback failed for index {global_idx}: {e2}")
-                            results[global_idx] = None
-    
-    return results
+        # Exponential backoff for rate limit handling (429)
+        retries = 3
+        backoffs = [10, 20, 30]
+        attempt = 0
+        while True:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                msg = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if not msg:
+                    return []
+                result = msg.strip()
+                # Split by delimiter into summaries; if counts mismatch, best-effort alignment
+                chunks = [c.strip() for c in result.split(delimiter) if c.strip()]
+                # Ensure length matches inputs; pad or trim if needed
+                if len(chunks) < len(titles):
+                    chunks.extend([""] * (len(titles) - len(chunks)))
+                elif len(chunks) > len(titles):
+                    chunks = chunks[: len(titles)]
+                return chunks
+            elif resp.status_code == 429 and attempt < retries:
+                wait_s = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
+                attempt += 1
+                print(f"Groq rate limit reached (429). Retrying in {wait_s}s (attempt {attempt}/{retries}).")
+                time.sleep(wait_s)
+                continue
+            else:
+                print(f"Groq summarize error {resp.status_code}: {resp.text[:200]}")
+                break
+    except Exception as e:
+        print(f"Groq summarize exception: {e}")
+    return []
 
-CACHE_FILE = "summary_cache.json"
-if os.path.exists(CACHE_FILE):
-    with open(CACHE_FILE, "r") as f:
-        summary_cache = json.load(f)
-else:
-    summary_cache = {}
-
-def get_cached_summary(url_hash):
-    return summary_cache.get(url_hash)
-
-def save_summary_to_cache(url_hash, summary_text):
-    summary_cache[url_hash] = summary_text
-    if len(summary_cache) % 20 == 0:  # Save every 20 entries
-        with open(CACHE_FILE, "w") as f:
-            json.dump(summary_cache, f)
 
 def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
     """
-    Summarize articles in batches using parallel threads + caching.
+    Summarize articles in batches using Groq or local model.
     Saves each summary individually to Supabase.
     Returns (num_batches, num_summarized).
     """
+    # if not GROQ_API_KEY:
+    #     return (0, 0)
     to_sum = []
     for a in articles:
         title = a.get("title") or ""
@@ -739,48 +292,39 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
         print("⚠️ No articles with text available for summarization.")
         return (0, 0)
 
-    # Process ALL articles, no batch size limit
-    print(f"📊 Starting summarization for {len(to_sum)} articles...")
+    batch_size = 20
+    batches = 0
     summarized_count = 0
-    client = supabase_client()
+    client = supabase_client() 
 
-    # Prepare all titles and texts for batch summarization
-    all_titles = [t for (_, t, _) in to_sum]
-    all_texts = [x for (_, _, x) in to_sum]
+    for i in range(0, len(to_sum), batch_size):
+        batch = to_sum[i : i + batch_size]
+        titles = [t for (_, t, _) in batch]
+        texts = [x for (_, _, x) in batch]
 
-    # Use batch summarization with proper mapping (10 articles per API call, 25 concurrent calls)
-    # This ensures all articles are summarized and summaries are correctly mapped
-    summaries = parallel_summarize_texts(all_texts, all_titles, max_workers=25, batch_size=10)
-    
-    # Count batches (approximate based on batch_size)
-    batches = (len(to_sum) + 10 - 1) // 10  # Ceiling division
+        # Summarize this batch
+        summaries = summarize_text_if_possible(texts, titles)
+        batches += 1
 
-    # Map summaries back to articles and save to Supabase
-    for (article, title, _), summary_text in zip(to_sum, summaries):
-        if not summary_text:
-            continue
-
-        try:
-            url_hash = hashlib.md5(article["url"].lower().encode()).hexdigest()
-
-            # Cache check/save
-            if get_cached_summary(url_hash):
+        # Align summaries and update Supabase per-article
+        for (article, title, _), summary_text in zip(batch, summaries):
+            if not summary_text:
                 continue
-            save_summary_to_cache(url_hash, summary_text)
 
-            # Update Supabase - ensure summary is mapped to correct article by url_hash
-            client.table("articles").update({
-                "summary": summary_text,
-                "summarized": True,
-                "summarization_needed": False,
-                "updated_at": "now()"
-            }).eq("url_hash", url_hash).execute()
+            try:
+                url_hash = md5_lower(article["url"])
+                # url_hash = hashlib.md5(article["url"].lower().encode()).hexdigest()
+                client.table("articles").update({
+                    "summary": summary_text,
+                    "summarized": True,
+                    "summarization_needed": False,
+                    "updated_at": "now()"
+                }).eq("url_hash", url_hash).execute()
 
-            summarized_count += 1
-            print(f"✅ Saved summary for: {title[:80]}")
-
-        except Exception as e:
-            print(f"⚠️ Error saving summary for {title[:80]}: {e}")
+                summarized_count += 1
+                print(f"✅ Saved summary for: {title[:80]}")
+            except Exception as e:
+                print(f"⚠️ Error saving summary for {title[:80]}: {e}")
 
     print(f"✅ Summarization complete — batches: {batches}, summarized: {summarized_count}")
     return (batches, summarized_count)
@@ -1387,7 +931,8 @@ def get_category_news(
     return _fetch_prioritized_articles(client, base_query, page, page_size)
 
 
-scheduler = BackgroundScheduler()
+# Configure scheduler with UTC timezone for consistency
+scheduler = BackgroundScheduler(timezone="UTC")
 
 
 @app.on_event("startup")
@@ -1405,11 +950,25 @@ def schedule_jobs():
         kwargs={"per_category_limit": 2, "max_cycles": 10}
     )
 
-    # Run quiz generation daily at 2 AM
-    scheduler.add_job(generate_daily_quiz_questions, "cron", hour=2, minute=0, id="generate_quiz", replace_existing=True)
+    # Run quiz generation daily at 2 AM UTC
+    scheduler.add_job(generate_daily_quiz_questions, "cron", hour=2, minute=0, id="generate_quiz", replace_existing=True, timezone="UTC")
     
-    # Run riddle generation daily at 11:59 PM
-    scheduler.add_job(generate_daily_riddle, "cron", hour=23, minute=59, id="generate_riddle", replace_existing=True)
+    # Run riddle generation daily at 11:59 PM UTC (before midnight so it's ready when app refreshes)
+    def scheduled_riddle_generation():
+        """Wrapper function for scheduled riddle generation with error handling and logging"""
+        try:
+            print(f"🕛 [SCHEDULER] Running scheduled daily riddle generation at {datetime.now().isoformat()} UTC")
+            result = generate_daily_riddle()
+            if result:
+                print(f"✅ [SCHEDULER] Successfully generated riddle: {result.get('id', 'unknown')}")
+            else:
+                print(f"⚠️ [SCHEDULER] Riddle generation returned None - may have failed or already exists")
+        except Exception as e:
+            print(f"❌ [SCHEDULER] Error in scheduled riddle generation: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    scheduler.add_job(scheduled_riddle_generation, "cron", hour=23, minute=59, id="generate_riddle", replace_existing=True, timezone="UTC")
     
     scheduler.start()
     

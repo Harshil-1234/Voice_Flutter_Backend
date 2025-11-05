@@ -192,11 +192,13 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
                         
                         # All validations passed - store in Supabase
                         client = supabase_client()
+                        # Use UTC for consistency with scheduler
+                        from datetime import timezone
                         riddle_row = {
                             "question": question,
                             "answer": answer,
                             "explanation": riddle_data["explanation"],
-                            "created_at": datetime.now().isoformat()
+                            "created_at": datetime.now(timezone.utc).isoformat()
                         }
                         
                         result = client.table("riddles").insert(riddle_row).execute()
@@ -268,25 +270,37 @@ def get_latest_riddle() -> Optional[Dict[str, Any]]:
 
 def check_today_riddle_exists() -> bool:
     """
-    Check if a riddle already exists for today.
+    Check if a riddle already exists for today (UTC).
     Returns True if today's riddle exists, False otherwise.
     """
     try:
         client = supabase_client()
-        today = datetime.now().date()
-        tomorrow = today + timedelta(days=1)
+        # Use UTC for consistency with scheduler
+        from datetime import timezone
+        now_utc = datetime.now(timezone.utc)
+        today_utc = now_utc.date()
+        tomorrow_utc = today_utc + timedelta(days=1)
         
+        # Query for riddles created today (UTC)
         result = (
             client.table("riddles")
             .select("id")
-            .gte("created_at", today.isoformat())
-            .lt("created_at", tomorrow.isoformat())
+            .gte("created_at", today_utc.isoformat())
+            .lt("created_at", tomorrow_utc.isoformat())
             .limit(1)
             .execute()
         )
         
-        return len(result.data or []) > 0
+        exists = len(result.data or []) > 0
+        if exists:
+            print(f"✅ Riddle already exists for today (UTC): {today_utc.isoformat()}")
+        else:
+            print(f"ℹ️ No riddle found for today (UTC): {today_utc.isoformat()}")
+        
+        return exists
         
     except Exception as e:
         print(f"❌ Error checking today's riddle: {e}")
+        import traceback
+        traceback.print_exc()
         return False
