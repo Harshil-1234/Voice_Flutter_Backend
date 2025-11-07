@@ -104,11 +104,15 @@ def summarize_text_if_possible(content, titles=None):
     - If `content` is a single string → returns a single summary (string or None).
     - If `content` is a list of strings → returns a list of summaries aligned with input.
     Titles are optional, mainly used for debugging/logging.
+    Skips articles with less than 100 characters as they are not proper news articles.
     """
     try:
         # Case 1: Single string
         if isinstance(content, str):
-            if not content or len(content.split()) < 30:
+            # Skip articles shorter than 100 characters - not proper news articles
+            if not content or len(content) < 100:
+                return None
+            if len(content.split()) < 30:
                 return None
 
             summary = summarizer(
@@ -127,7 +131,13 @@ def summarize_text_if_possible(content, titles=None):
         elif isinstance(content, list):
             results = []
             for idx, text in enumerate(content):
-                if not text or len(text.split()) < 30:
+                # Skip articles shorter than 100 characters - not proper news articles
+                if not text or len(text) < 100:
+                    results.append(None)
+                    if titles and idx < len(titles):
+                        print(f"⏭️ Skipped short article (len={len(text) if text else 0}): {titles[idx][:80]}")
+                    continue
+                if len(text.split()) < 30:
                     results.append(None)
                     continue
                 summary = summarizer(
@@ -285,8 +295,21 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
             except Exception:
                 pass
 
-        if full_text:
+        # Only add articles with at least 100 characters - skip short articles that aren't proper news
+        if full_text and len(full_text) >= 100:
             to_sum.append((a, title, full_text))
+        elif full_text:
+            print(f"⏭️ Skipping short article (len={len(full_text)}): {title[:80]}")
+            # Mark as not needing summarization so it doesn't get picked up again
+            try:
+                url_hash = md5_lower(a.get("url", ""))
+                client = supabase_client()
+                client.table("articles").update({
+                    "summarization_needed": False,
+                    "updated_at": "now()"
+                }).eq("url_hash", url_hash).execute()
+            except Exception as e:
+                print(f"⚠️ Error marking short article as not needing summarization: {e}")
 
     if not to_sum:
         print("⚠️ No articles with text available for summarization.")
@@ -378,10 +401,21 @@ def _prepare_texts(items):
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(build_text, items))
 
+    # Filter out articles with less than 100 characters - not proper news articles
+    filtered_items = []
+    filtered_titles = []
+    filtered_texts = []
+    
     for item, txt in zip(items, results):
-        titles.append(item.get("title") or "")
-        texts.append(txt)
-    return titles, texts
+        if txt and len(txt) >= 100:
+            filtered_items.append(item)
+            filtered_titles.append(item.get("title") or "")
+            filtered_texts.append(txt)
+        else:
+            title = item.get("title") or ""
+            print(f"⏭️ Skipping short article (len={len(txt) if txt else 0}): {title[:80]}")
+    
+    return filtered_titles, filtered_texts, filtered_items
 
 
 def summarize_pending_round_robin(per_category_limit: int = 2, max_cycles: int = 50):
@@ -408,14 +442,27 @@ def summarize_pending_round_robin(per_category_limit: int = 2, max_cycles: int =
         if not combined:
             break
 
-        # Prepare texts
-        titles, texts = _prepare_texts(combined)
+        # Prepare texts (returns filtered items)
+        titles, texts, filtered_items = _prepare_texts(combined)
+
+        # Mark short articles (that were filtered out) as not needing summarization
+        filtered_ids = {item.get("id") for item in filtered_items}
+        for item in combined:
+            if item.get("id") not in filtered_ids:
+                # This article was filtered out (too short), mark it as not needing summarization
+                try:
+                    client.table("articles").update({
+                        "summarization_needed": False,
+                        "updated_at": "now()"
+                    }).eq("id", item["id"]).execute()
+                except Exception as e:
+                    print(f"⚠️ Error marking short article as not needing summarization: {e}")
 
         # Summarize in one go (model batches over all categories)
         summaries = summarize_text_if_possible(texts, titles) or []
 
-        # Persist results
-        for item, summary_text in zip(combined, summaries):
+        # Persist results (use filtered_items which aligns with summaries)
+        for item, summary_text in zip(filtered_items, summaries):
             if not summary_text:
                 continue
             try:
@@ -1166,8 +1213,11 @@ def ingest_articles(items: List[IncomingArticle]):
     for a in items:
         try:
             summary = None
-            if a.content:
+            # Only summarize if content exists and is at least 100 characters
+            if a.content and len(a.content) >= 100:
                 summary = summarize_text_if_possible(a.content, a.title)
+            elif a.content:
+                print(f"⏭️ Skipping short article in ingest (len={len(a.content)}): {a.title[:80]}")
             row = {
                 "url": a.url,
                 "title": a.title,
