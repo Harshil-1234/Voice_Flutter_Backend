@@ -4,8 +4,9 @@ import time
 import random
 from typing import List, Optional, Tuple
 
-from fastapi import FastAPI, Query, Path, HTTPException
+from fastapi import FastAPI, Query, Path, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, HTMLResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
 import json
@@ -1691,6 +1692,207 @@ def get_latest_riddle_endpoint():
             riddle=None,
             message="Error retrieving riddle. Please try again later."
         )
+
+
+@app.get("/article/{encoded_url:path}")
+def redirect_to_article(encoded_url: str, request):
+    """
+    Redirect endpoint for article deep links.
+    Accepts base64-encoded article URL and redirects to app deep link.
+    Falls back to Play Store/App Store if app is not installed.
+    """
+    try:
+        import base64
+        
+        # Decode the base64 URL (URL-safe base64)
+        # Replace URL-safe characters back to standard base64
+        base64_url = encoded_url.replace('-', '+').replace('_', '/')
+        # Add padding if needed
+        padding = (4 - len(base64_url) % 4) % 4
+        padded = base64_url + '=' * padding
+        
+        # Decode base64 to get original article URL (for reference, not used in fallback)
+        decoded_bytes = base64.b64decode(padded)
+        article_url = decoded_bytes.decode('utf-8')
+        
+        # Create deep link for the app
+        deep_link = f"readdio://article/{encoded_url}"
+        
+        # Detect user agent to determine platform
+        user_agent = request.headers.get("user-agent", "").lower()
+        is_android = "android" in user_agent
+        is_ios = "iphone" in user_agent or "ipad" in user_agent or "ipod" in user_agent
+        
+        # App Store URLs
+        play_store_url = "https://play.google.com/store/apps/details?id=com.readdio.app"  # Package name: com.readdio.app
+        app_store_url = "https://apps.apple.com/app/readdio/id0000000000"  # TODO: Replace with actual App Store ID when app is published
+        
+        # Determine which store to redirect to
+        store_url = app_store_url if is_ios else play_store_url
+        
+        # Return HTML page with JavaScript to try app deep link, then fallback to store
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Open in Readdio</title>
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: center;
+                    min-height: 100vh;
+                    margin: 0;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    text-align: center;
+                    padding: 20px;
+                }}
+                .container {{
+                    background: rgba(255, 255, 255, 0.1);
+                    backdrop-filter: blur(10px);
+                    border-radius: 20px;
+                    padding: 40px;
+                    max-width: 500px;
+                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+                }}
+                h1 {{
+                    margin: 0 0 20px 0;
+                    font-size: 32px;
+                }}
+                p {{
+                    margin: 10px 0;
+                    font-size: 16px;
+                    opacity: 0.9;
+                }}
+                .button {{
+                    display: inline-block;
+                    margin-top: 20px;
+                    padding: 12px 24px;
+                    background: white;
+                    color: #667eea;
+                    text-decoration: none;
+                    border-radius: 8px;
+                    font-weight: bold;
+                    transition: transform 0.2s;
+                }}
+                .button:hover {{
+                    transform: scale(1.05);
+                }}
+                .spinner {{
+                    border: 3px solid rgba(255, 255, 255, 0.3);
+                    border-top: 3px solid white;
+                    border-radius: 50%;
+                    width: 40px;
+                    height: 40px;
+                    animation: spin 1s linear infinite;
+                    margin: 20px auto;
+                }}
+                @keyframes spin {{
+                    0% {{ transform: rotate(0deg); }}
+                    100% {{ transform: rotate(360deg); }}
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>📰 Open in Readdio</h1>
+                <p>Opening article in the Readdio app...</p>
+                <div class="spinner"></div>
+                <p style="font-size: 14px; opacity: 0.7; margin-top: 20px;">
+                    Don't have the app? <a href="{store_url}" style="color: white; text-decoration: underline; font-weight: bold;">Download from {"App Store" if is_ios else "Play Store"}</a>
+                </p>
+            </div>
+            <script>
+                var appOpened = false;
+                var startTime = Date.now();
+                
+                // Function to check if app opened (page becomes hidden)
+                function checkAppOpened() {{
+                    if (document.hidden || document.webkitHidden) {{
+                        appOpened = true;
+                        return true;
+                    }}
+                    return false;
+                }}
+                
+                // Listen for page visibility changes
+                document.addEventListener('visibilitychange', function() {{
+                    if (document.hidden) {{
+                        appOpened = true;
+                    }}
+                }});
+                
+                // Try to open the app deep link
+                window.location.href = "{deep_link}";
+                
+                // Check if app opened immediately
+                setTimeout(function() {{
+                    if (!checkAppOpened()) {{
+                        // App didn't open, redirect to store
+                        window.location.href = "{store_url}";
+                    }}
+                }}, 1500);
+                
+                // Additional check after a longer delay
+                setTimeout(function() {{
+                    if (!appOpened && !document.hidden) {{
+                        window.location.href = "{store_url}";
+                    }}
+                }}, 2500);
+            </script>
+        </body>
+        </html>
+        """
+        
+        return HTMLResponse(content=html_content)
+        
+    except Exception as e:
+        print(f"❌ Error processing article redirect: {e}")
+        # Return error page
+        error_html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Error - Readdio</title>
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    min-height: 100vh;
+                    margin: 0;
+                    background: #f5f5f5;
+                    text-align: center;
+                    padding: 20px;
+                }
+                .container {
+                    background: white;
+                    border-radius: 12px;
+                    padding: 40px;
+                    max-width: 400px;
+                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+                }
+                h1 { color: #333; }
+                p { color: #666; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>⚠️ Error</h1>
+                <p>Unable to process this link. Please try again.</p>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=error_html, status_code=400)
 
 
 # Helper functions
