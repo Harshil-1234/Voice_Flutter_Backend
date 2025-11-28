@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 from transformers import pipeline
 import trafilatura
 from googlenewsdecoder import new_decoderv1
-from .riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
+from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
 
 
 
