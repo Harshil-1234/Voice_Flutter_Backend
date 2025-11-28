@@ -64,3 +64,5 @@ tzlocal==5.3.1
 urllib3==2.5.0
 uvicorn==0.30.0
 websockets==12.0
+feedparser==6.0.10
+beautifulsoup4==4.12.3

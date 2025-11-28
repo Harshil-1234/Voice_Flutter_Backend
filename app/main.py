@@ -2,7 +2,13 @@ import os
 import hashlib
 import time
 import random
+import re
+import codecs
+import base64
 from typing import List, Optional, Tuple
+import feedparser
+from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Query, Path, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +22,9 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from transformers import pipeline
 import trafilatura
-from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
+from googlenewsdecoder import new_decoderv1
+from .riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
+
 
 
 
@@ -37,26 +45,43 @@ for _p in _ENV_CANDIDATES:
 # Read environment variables after attempting to load .env
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 # Default batch size set to 20 per requirements
 SUMMARIZE_BATCH_SIZE = int(os.getenv("SUMMARIZE_BATCH_SIZE", "20"))
 
 summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
 
-CATEGORIES = [
-    "general",
-    "technology",
-    "sports",
-    "science",
-    "health",
-    "entertainment",
-    "world",
-    "politics",
-    "business",
-    "environment",
+# --- NEW RSS INGESTION CONFIG ---
+RSS_TOPIC_IDS = {
+    "technology": "TECHNOLOGY",
+    "science": "SCIENCE",
+    "world": "WORLD",
+    "business": "BUSINESS",
+    "health": "HEALTH",
+    "entertainment": "ENTERTAINMENT",
+    "sports": "SPORTS",
+    "politics": "POLITICS",
+    "general": "NATION",
+}
+
+# Categories to be fetched once with a global country code (e.g., US)
+GLOBAL_CATEGORIES = ["technology", "science", "world", "business", "health", "entertainment"]
+
+# Categories to be fetched for each active country
+LOCAL_CATEGORIES = ["general", "politics", "sports"]
+
+# List of active countries to fetch local news for
+# Expanded list of active countries for local category fetches
+# Include major regions so local feeds include UK, CA, DE, JP, RU, FR, AU, BR, IT, ZA
+ACTIVE_COUNTRIES = [
+    "IN",  # India
+    "US",  # United States
+    "GB",  # United Kingdom
+    
 ]
+
+RSS_URL_PATTERN = "https://news.google.com/rss/headlines/section/topic/{topic_id}?hl=en-{country_code}&gl={country_code}&ceid={country_code}:en"
+# --- END NEW RSS INGESTION CONFIG ---
 
 
 class ArticleOut(BaseModel):
@@ -84,20 +109,219 @@ def supabase_client():
 def md5_lower(text: str) -> str:
     return hashlib.md5(text.lower().encode("utf-8")).hexdigest()
 
-def fetch_full_article_text(url: str) -> str:
+
+def resolve_redirect_url(url: str, timeout: int = 10) -> str:
     """
-    Extract full article text from a news URL using trafilatura.
-    Returns cleaned text or empty string if extraction fails.
+    Resolve redirect chains (e.g., Google News redirects) to get the final URL.
+    Uses requests.head() to follow redirects without downloading the full page.
+    Returns the final URL or original URL if resolution fails.
     """
     try:
-        downloaded = trafilatura.fetch_url(url)
-        if not downloaded:
-            return ""
-        text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
-        return text or ""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.head(url, allow_redirects=True, timeout=timeout, headers=headers)
+        final_url = response.url
+        if final_url != url:
+            print(f"🔗 Resolved redirect: {url[:80]}... → {final_url[:80]}...")
+        return final_url
     except Exception as e:
-        print(f"❌ Error fetching article: {url} — {e}")
-        return ""
+        print(f"⚠️ Redirect resolution failed for {url}: {e}")
+        return url
+
+
+def extract_with_trafilatura(url: str) -> Optional[str]:
+    """
+    Extract full article text using trafilatura with proper headers and configuration.
+    Returns cleaned text or None if extraction fails or is too short.
+    """
+    try:
+        # Use requests to fetch HTML (handles headers & redirects reliably)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        resp = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
+        resp.raise_for_status()
+        html = resp.text
+        final_url = resp.url
+        # Pass raw HTML string to trafilatura.extract
+        text = trafilatura.extract(html, include_comments=False, include_tables=False)
+        if text:
+            # Log scraped length and resolved URL for debugging
+            print(f"🔎 Trafilatura extracted {len(text)} chars from {final_url}")
+            return text
+        return None
+    except Exception as e:
+        print(f"⚠️ Trafilatura extraction failed for {url}: {e}")
+        return None
+
+
+def extract_with_beautifulsoup_fallback(url: str) -> Optional[str]:
+    """
+    Fallback extraction using requests + BeautifulSoup for when trafilatura fails.
+    Extracts all paragraph text and joins them.
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.decompose()
+        
+        # Extract all paragraph text
+        paragraphs = soup.find_all(['p', 'article', 'div', 'section'])
+        texts = []
+        for para in paragraphs:
+            text = para.get_text(separator="\n", strip=True)
+            if text and len(text) > 20:  # Skip very short fragments
+                texts.append(text)
+        
+        combined_text = "\n\n".join(texts)
+        return combined_text if combined_text else None
+    except Exception as e:
+        print(f"⚠️ BeautifulSoup fallback failed for {url}: {e}")
+        return None
+
+
+def extract_hero_image(html_content: str) -> Optional[str]:
+    """
+    Extract the main article image (hero image) from HTML.
+    Searches for Open Graph (og:image) or Twitter Card image meta tags.
+    
+    Priority:
+    1. Open Graph image (og:image) - standard for FB/WhatsApp/LinkedIn
+    2. Twitter Card image (twitter:image) - fallback for Twitter
+    
+    Returns: URL to the hero image or None if not found
+    """
+    try:
+        if not html_content:
+            return None
+        
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Priority 1: Open Graph Image (og:image)
+        og_image_tag = soup.find('meta', property='og:image')
+        if og_image_tag and og_image_tag.get('content'):
+            image_url = og_image_tag['content'].strip()
+            if image_url:
+                print(f"🖼️ [extract_hero_image] Found og:image: {image_url[:80]}")
+                return image_url
+        
+        # Priority 2: Twitter Card Image (twitter:image)
+        twitter_image_tag = soup.find('meta', name='twitter:image')
+        if twitter_image_tag and twitter_image_tag.get('content'):
+            image_url = twitter_image_tag['content'].strip()
+            if image_url:
+                print(f"🖼️ [extract_hero_image] Found twitter:image: {image_url[:80]}")
+                return image_url
+        
+        # No image found
+        print(f"⚠️ [extract_hero_image] No og:image or twitter:image found")
+        return None
+        
+    except Exception as e:
+        print(f"❌ [extract_hero_image] Error extracting image: {e}")
+        return None
+
+
+def extract_youtube_thumbnail(youtube_url: str) -> Optional[str]:
+    """
+    Extract YouTube video thumbnail URL from a YouTube link.
+    Constructs the high-quality thumbnail: https://img.youtube.com/vi/{VIDEO_ID}/hqdefault.jpg
+    """
+    try:
+        # Extract video ID from various YouTube URL formats
+        video_id = None
+        
+        if "youtube.com/watch?v=" in youtube_url:
+            video_id = youtube_url.split("v=")[1].split("&")[0]
+        elif "youtu.be/" in youtube_url:
+            video_id = youtube_url.split("youtu.be/")[1].split("?")[0]
+        
+        if video_id:
+            thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+            print(f"🎬 [extract_youtube_thumbnail] Generated thumbnail: {thumbnail_url}")
+            return thumbnail_url
+    except Exception as e:
+        print(f"⚠️ [extract_youtube_thumbnail] Error: {e}")
+    
+    return None
+
+
+def fetch_article_content(url: str) -> Tuple[Optional[str], str, bool, Optional[str]]:
+    """
+    Specialized Google News resolver with googlenewsdecoder library.
+    
+    Strategy:
+    1) Decode Google URL using new_decoderv1 (handles Protobuf/Base64 encoding)
+    2) Validate: ensure decoded URL is NOT a Google domain
+    3) Check for YouTube: if video, mark is_video=True and extract thumbnail
+    4) Scrape: use trafilatura.fetch_url() → trafilatura.extract() and extract_hero_image()
+    
+    Returns: (extracted_text or None, final_url, is_video, image_url or None)
+    """
+    print(f"\n🚀 [fetch_article_content] Starting with Google URL: {url[:80]}")
+    final_url = url
+    image_url = None
+    
+    # STEP 1: Decode the Google URL using the googlenewsdecoder library
+    try:
+        decoded_data = new_decoderv1(url)
+        if decoded_data.get("status"):
+            final_url = decoded_data["decoded_url"]
+            print(f"✅ [googlenewsdecoder] Successfully decoded to: {final_url[:80]}")
+        else:
+            print(f"⚠️ [googlenewsdecoder] Decode failed (status=False). Keeping original URL.")
+    except Exception as e:
+        print(f"❌ [googlenewsdecoder] Decoder error: {e}. Keeping original URL.")
+
+    # STEP 2: Safety Check - If still stuck on Google, ABORT immediately
+    if "news.google.com" in final_url or "google.com" in final_url:
+        print(f"⏭️ Skipping: Could not resolve from Google domain: {final_url[:80]}")
+        return None, final_url, False, None
+
+    # STEP 3: Video Detection (YouTube) - Extract thumbnail instead of scraping
+    if "youtube.com" in final_url.lower() or "youtu.be" in final_url.lower():
+        print(f"📹 [fetch_article_content] YouTube video detected: {final_url[:80]}")
+        thumbnail = extract_youtube_thumbnail(final_url)
+        return None, final_url, True, thumbnail
+
+    # STEP 4: Scrape the actual publisher URL with trafilatura
+    try:
+        print(f"📄 [fetch_article_content] Fetching real article from: {final_url[:80]}")
+        
+        # Use trafilatura.fetch_url to handle headers, redirects, and encoding automatically
+        downloaded = trafilatura.fetch_url(final_url)
+        if not downloaded:
+            print(f"⚠️ [trafilatura] fetch_url returned None/empty for {final_url[:80]}")
+            return None, final_url, False, None
+        
+        # Extract text from the downloaded HTML
+        text = trafilatura.extract(downloaded)
+        
+        # Extract hero image from the HTML (NEW)
+        image_url = extract_hero_image(downloaded)
+        
+        # Basic validation: ensure we have sufficient text
+        if text and len(text) > 200:
+            print(f"✅ [fetch_article_content] Extracted {len(text)} chars from {final_url[:80]}")
+            return text, final_url, False, image_url
+        else:
+            text_len = len(text) if text else 0
+            print(f"⚠️ [fetch_article_content] Text too short ({text_len} chars) from {final_url[:80]}")
+            return None, final_url, False, image_url
+            
+    except Exception as e:
+        print(f"❌ [fetch_article_content] Scrape/extraction failed for {final_url[:80]}: {e}")
+        return None, final_url, False, None
+
 
 def summarize_text_if_possible(content, titles=None):
     """
@@ -105,9 +329,16 @@ def summarize_text_if_possible(content, titles=None):
     - If `content` is a single string → returns a single summary (string or None).
     - If `content` is a list of strings → returns a list of summaries aligned with input.
     Titles are optional, mainly used for debugging/logging.
-    Skips articles with less than 100 characters as they are not proper news articles.
+    Skips articles with less than 600 characters as they are not proper news articles.
+    Truncates input text to 2000 characters for performance.
     """
     try:
+        # Truncate content before summarization
+        if isinstance(content, str):
+            content = content[:2000]
+        elif isinstance(content, list):
+            content = [c[:2000] for c in content]
+
         # Case 1: Single string
         if isinstance(content, str):
             # Skip articles shorter than 100 characters - not proper news articles
@@ -197,7 +428,7 @@ def call_groq_summarize(titles: List[str], texts: List[str]) -> List[str]:
         for idx, (t, x) in enumerate(zip(titles, texts), start=1):
             safe_t = t or ""
             safe_x = x or ""
-            parts.append(f"Article {idx}:\nTitle: {safe_t}\nContent: {safe_x}")
+            parts.append(f"Article {idx}:\nTitle: {safe_t}\nContent: {safe_x[:2000]}") # Truncate input
         user_instruction = (
             "Summarize the following news articles. Return exactly one paragraph per article, "
             "in the same order, separated by the delimiter '" + delimiter.strip() + "'. "
@@ -262,58 +493,20 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
     Saves each summary individually to Supabase.
     Returns (num_batches, num_summarized).
     """
-    # if not GROQ_API_KEY:
-    #     return (0, 0)
     to_sum = []
     for a in articles:
         title = a.get("title") or ""
-        url = a.get("url")
-        full_text = ""
+        # Use the 'content' field which now holds the full text
+        full_text = a.get("content", "")
 
-        # Try fetching full article text
-        if url:
-            full_text = fetch_full_article_text(url)
-            full_text = full_text[:1000]  # limit length increased to 1000
-            if full_text:
-                try:
-                    title_dbg = (title or a.get("title") or "")[:80]
-                    print(f"Summary input source: full_page_text (len={len(full_text)}) for title='{title_dbg}'")
-                except Exception:
-                    pass
-
-        # Fallback to short content/description
-        if not full_text:
-            chosen = ""
-            if a.get("content"):
-                full_text = a.get("content")
-                chosen = "content"
-            else:
-                full_text = a.get("description") or ""
-                chosen = "description" if a.get("description") else "none"
-            try:
-                title_dbg = (title or a.get("title") or "")[:80]
-                print(f"Summary input source: {chosen} (len={len(full_text)}) for title='{title_dbg}'")
-            except Exception:
-                pass
-
-        # Only add articles with at least 100 characters - skip short articles that aren't proper news
-        if full_text and len(full_text) >= 100:
+        # Only add articles with at least 600 characters for summarization
+        if full_text and len(full_text) >= 600:
             to_sum.append((a, title, full_text))
         elif full_text:
-            print(f"⏭️ Skipping short article (len={len(full_text)}): {title[:80]}")
-            # Mark as not needing summarization so it doesn't get picked up again
-            try:
-                url_hash = md5_lower(a.get("url", ""))
-                client = supabase_client()
-                client.table("articles").update({
-                    "summarization_needed": False,
-                    "updated_at": "now()"
-                }).eq("url_hash", url_hash).execute()
-            except Exception as e:
-                print(f"⚠️ Error marking short article as not needing summarization: {e}")
+            print(f"⏭️ Skipping short article for summarization (len={len(full_text)}): {title[:80]}")
 
     if not to_sum:
-        print("⚠️ No articles with text available for summarization.")
+        print("⚠️ No articles with sufficient text available for summarization.")
         return (0, 0)
 
     batch_size = 20
@@ -337,7 +530,6 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
 
             try:
                 url_hash = md5_lower(article["url"])
-                # url_hash = hashlib.md5(article["url"].lower().encode()).hexdigest()
                 client.table("articles").update({
                     "summary": summary_text,
                     "summarized": True,
@@ -356,7 +548,8 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
 
 def _fetch_pending_by_category(client, per_category_limit: int = 2):
     out = {}
-    for c in CATEGORIES:
+    all_categories = list(RSS_TOPIC_IDS.keys())
+    for c in all_categories:
         try:
             res = (
                 client.table("articles")
@@ -382,18 +575,19 @@ def _prepare_texts(items):
     titles = []
 
     def build_text(item):
-        url = item.get("url")
-        full = fetch_full_article_text(url)[:1000] if url else ""
-        if full:
+        # The 'content' field now holds the full scraped text.
+        # Truncate to 2000 chars before sending to summarizer.
+        full_text = (item.get("content") or "")[:2000]
+        if full_text:
             try:
-                print(f"Summary input source: full_page_text (len={len(full)}) for title='{(item.get('title') or '')[:80]}'")
+                print(f"Summary input source: content field (len={len(full_text)}) for title='{(item.get('title') or '')[:80]}'")
             except Exception:
                 pass
-            return full
+            return full_text
 
-        fallback = item.get("content") or item.get("description") or ""
+        fallback = item.get("description") or ""
         try:
-            src = "content" if item.get("content") else ("description" if item.get("description") else "none")
+            src = "description" if item.get("description") else "none"
             print(f"Summary input source: {src} (len={len(fallback)}) for title='{(item.get('title') or '')[:80]}'")
         except Exception:
             pass
@@ -402,19 +596,19 @@ def _prepare_texts(items):
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(build_text, items))
 
-    # Filter out articles with less than 100 characters - not proper news articles
+    # Filter out articles with less than 600 characters for BART
     filtered_items = []
     filtered_titles = []
     filtered_texts = []
     
     for item, txt in zip(items, results):
-        if txt and len(txt) >= 100:
+        if txt and len(txt) >= 600:
             filtered_items.append(item)
             filtered_titles.append(item.get("title") or "")
             filtered_texts.append(txt)
         else:
             title = item.get("title") or ""
-            print(f"⏭️ Skipping short article (len={len(txt) if txt else 0}): {title[:80]}")
+            print(f"⏭️ Skipping short article for summarization (len={len(txt) if txt else 0}): {title[:80]}")
     
     return filtered_titles, filtered_texts, filtered_items
 
@@ -479,172 +673,255 @@ def summarize_pending_round_robin(per_category_limit: int = 2, max_cycles: int =
 
     print(f"✅ Round‑robin summarization complete: cycles={cycles}, updated={total_updated}")
 
+# --- START NEW INGESTION LOGIC ---
 
-def ingest_category(category: str, page_size: int = 100, summarize_now: bool = True):
-    """Ingest one category with strict NewsAPI call count and GNews fallback.
-    Returns a dict of metrics for logging and verification.
-    If summarize_now is False, this function will only store articles and
-    leave summarization for the background round-robin summarizer.
+def fetch_rss_feed(category: str, country_code: str) -> List[dict]:
+    """Fetches and parses a Google News RSS feed."""
+    topic_id = RSS_TOPIC_IDS.get(category.lower())
+    if not topic_id:
+        return []
+    
+    url = RSS_URL_PATTERN.format(topic_id=topic_id, country_code=country_code)
+    try:
+        print(f"📡 Fetching RSS feed: {url}")
+        feed = feedparser.parse(url)
+        if feed.bozo:
+            print(f"⚠️ Warning: Malformed feed from {url}. Reason: {feed.bozo_exception}")
+        return feed.entries
+    except Exception as e:
+        print(f"❌ Error fetching or parsing RSS feed {url}: {e}")
+        return []
+
+def process_rss_entry(entry: dict, category: str, country: str) -> Optional[dict]:
+    """Processes a single RSS entry into a dictionary for database insertion."""
+    try:
+        link = entry.get("link")
+        if not link:
+            return None
+
+        # Extract clean description from summary HTML
+        soup = BeautifulSoup(entry.get("summary", ""), "html.parser")
+        description = soup.get_text(separator="\n", strip=True)
+
+        # Attempt to decode Google News redirect to the real publisher URL (no network calls)
+        final_link = link
+        try:
+            dec = None
+            try:
+                dec = new_decoderv1(link)
+            except Exception as e:
+                print(f"⚠️ googlenewsdecoder error for {link}: {e}")
+            if dec and dec.get("status") and dec.get("decoded_url"):
+                final_link = dec.get("decoded_url") or link
+                print(f"🔗 Decoded RSS link to: {final_link}")
+        except Exception as e:
+            print(f"⚠️ Error during decode for {link}: {e}")
+
+        is_video = False
+        if final_link and ("youtube.com" in final_link.lower() or "youtu.be" in final_link.lower()):
+            is_video = True
+
+        return {
+            "url": final_link,
+            "original_rss_link": link,
+            "title": entry.get("title", "No Title"),
+            "description": description,
+            "source": entry.get("source", {}).get("title"),
+            "published_at": entry.get("published"),
+            "category": category,
+            "country": country,
+            "summarization_needed": False, # Default to false, updated by logic below
+            "is_video": is_video,
+            "content": None, # Will be filled if scraped
+            "summary": None, # Will be filled by logic below
+        }
+    except Exception as e:
+        print(f"Error processing RSS entry: {e}")
+        return None
+
+def smart_ingest_all_categories():
     """
-    metrics = {
-        "category": category,
-        "newsapi_requested": False,
-        "newsapi_status": None,
-        "newsapi_articles": 0,
-        "gnews_fallback": False,
-        "gnews_articles": 0,
-        "stored": 0,
-        "summarized_batches": 0,
-        "summarized_count": 0,
-    }
-
-    if not NEWS_API_KEY:
-        print("NEWS_API_KEY missing; skipping ingestion")
-        return metrics
-
-    params = {
-        "apiKey": NEWS_API_KEY,
-        "pageSize": str(page_size),
-        "language": "en",
-        "sortBy": "publishedAt",
-        "q": category,
-        "from": time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30 * 24 * 3600)),
-    }
-    url = "https://newsapi.org/v2/everything"
-    metrics["newsapi_requested"] = True
-    resp = requests.get(url, params=params, timeout=30)
-    metrics["newsapi_status"] = resp.status_code
-    articles = []
-    newsapi_articles = []
-    if resp.status_code == 200:
-        data = resp.json()
-        if data.get("status") == "ok":
-            newsapi_articles = data.get("articles", [])
-            articles = newsapi_articles
-        else:
-            print(f"NewsAPI response not ok: {data}")
-    else:
-        print(f"NewsAPI error {resp.status_code}: {resp.text[:200]}")
-
-    metrics["newsapi_articles"] = len(newsapi_articles)
-
-    # Explicit fallback to GNews on quota hit (429) or empty result
-    if resp.status_code == 429 or not articles:
-        try:
-            gparams = {
-                "apikey": GNEWS_API_KEY or "",
-                "max": str(page_size),
-                "lang": "en",
-                "country": "us",
-                "q": category,
-            }
-            gurl = "https://gnews.io/api/v4/search"
-            gresp = requests.get(gurl, params=gparams, timeout=30)
-            if gresp.status_code == 200:
-                gdata = gresp.json()
-                garts = gdata.get("articles", [])
-                articles = garts
-                metrics["gnews_fallback"] = True
-                metrics["gnews_articles"] = len(garts)
-                print(f"Fallback to GNews for category '{category}': {len(garts)} articles")
-            else:
-                print(f"GNews error {gresp.status_code}: {gresp.text[:200]}")
-        except Exception as ge:
-            print(f"GNews fallback failed: {ge}")
-
+    Main function to fetch news from Google News RSS feeds, process, and store them.
+    This replaces the old NewsAPI-based ingestion.
+    """
+    print("🚀 Starting smart ingestion cycle...")
     client = supabase_client()
+    
+    all_new_articles = []
 
-    # Prepare rows; store raw first, then batch summarize and update
-    rows = []
-    for a in articles:
-        try:
-            if not a.get("url") or a.get("title") == "[Removed]":
-                continue
-            url_val = a.get("url")
-            rows.append({
-                "url": url_val,
-                "title": a.get("title") or "",
-                "description": a.get("description"),
-                "content": a.get("content"),
-                "author": a.get("author"),
-                "source": (a.get("source") or {}).get("name"),
-                "image_url": a.get("urlToImage") or a.get("image"),
-                "category": category,
-                "published_at": a.get("publishedAt") or a.get("published_at"),
-                "summary": None,
-                "summarized": False,
-                "summarization_needed": True,
-            })
-        except Exception as e:
-            print(f"Row build error: {e}")
+    # 1. Fetch Global Categories
+    print("--- Fetching Global Categories (Country: GLOBAL) ---")
+    for category in GLOBAL_CATEGORIES:
+        entries = fetch_rss_feed(category, "US")
+        processed_entries = [process_rss_entry(e, category, "GLOBAL") for e in entries[:5]]
+        all_new_articles.extend([p for p in processed_entries if p])
 
-    # Deduplicate rows by URL to avoid ON CONFLICT double-update errors
-    if rows:
-        dedup_by_url = {}
-        for r in rows:
-            k = (r.get("url") or "").strip().lower()
-            if k and k not in dedup_by_url:
-                dedup_by_url[k] = r
-        rows = list(dedup_by_url.values())
-        fetched_count = len(rows)
-        try:
-            client.table("articles").upsert(rows, on_conflict="url_hash").execute()
-            metrics["stored"] = len(rows)
-            print(f"Stored {len(rows)} articles for category '{category}'")
-        except Exception as e:
-            print(f"Bulk insert error: {e}")
-
-        # Summarize in batches where possible (optional)
-        if summarize_now:
-            batches, summarized = _summarize_in_batches(rows)
-            metrics["summarized_batches"] = batches
-            metrics["summarized_count"] = summarized
-            if summarized:
+    # 2. Fetch Local Categories for each active country
+    for country_code in ACTIVE_COUNTRIES:
+        print(f"--- Fetching Local Categories for Country: {country_code} ---")
+        for category in LOCAL_CATEGORIES:
+            entries = []
+            
+            # SPECIAL HANDLING: Sports category gets dual-fetch (local + global)
+            if category == "sports":
+                print(f"⚽ [Sports] Performing dual-fetch: Local + International")
+                
+                # Fetch 1: Local Sports (Cricket, local tournaments, etc.)
+                local_entries = fetch_rss_feed(category, country_code)
+                print(f"   → Local Sports entries: {len(local_entries)}")
+                
+                # Fetch 2: Global search for international sports (Football, F1, Tennis)
                 try:
-                    client.table("articles").upsert(rows, on_conflict="url_hash").execute()
-                    print(f"Updated {summarized} summaries for category '{category}' in {batches} batches")
+                    global_query = "Football OR Soccer OR Premier League OR Champions League OR F1 OR Tennis"
+                    global_url = f"https://news.google.com/rss/search?q={global_query}&hl=en-{country_code.lower()}&gl={country_code}&ceid={country_code}:en"
+                    print(f"   → Fetching global search: {global_url[:80]}...")
+                    global_feed = feedparser.parse(global_url)
+                    global_entries = global_feed.entries if hasattr(global_feed, 'entries') else []
+                    print(f"   → Global Sports entries: {len(global_entries)}")
                 except Exception as e:
-                    print(f"Bulk summary update error: {e}")
+                    print(f"   ⚠️ Global sports fetch failed: {e}")
+                    global_entries = []
+                
+                # Merge: Take top 4 from local + top 4 from global
+                entries = local_entries[:4] + global_entries[:4]
+                print(f"   ✅ Combined entries (local + global): {len(entries)}")
+            else:
+                # Standard fetch for non-sports categories
+                entries = fetch_rss_feed(category, country_code)
+            
+            processed_entries = [process_rss_entry(e, category, country_code) for e in entries[:5]]
+            all_new_articles.extend([p for p in processed_entries if p])
 
-        # Verification logging per category
+    if not all_new_articles:
+        print("No new articles found in this cycle.")
+        return
+
+    # 3. Deduplication
+    print(f"Found {len(all_new_articles)} potential articles. Checking for duplicates...")
+    existing_urls_hashes = set()
+    try:
+        # Fetch all url_hash values from the table. This might be slow on very large tables.
+        # An alternative is to check one by one, but that's many queries.
+        # For now, this is a reasonable trade-off.
+        result = client.table("articles").select("url_hash").execute()
+        existing_urls_hashes = {item['url_hash'] for item in result.data}
+    except Exception as e:
+        print(f"⚠️ Could not fetch existing URLs for deduplication: {e}")
+
+    unique_articles = []
+    for article in all_new_articles:
+        url_hash = md5_lower(article["url"])
+        if url_hash not in existing_urls_hashes:
+            article["url_hash"] = url_hash
+            unique_articles.append(article)
+            existing_urls_hashes.add(url_hash) # Add to set to handle duplicates within the same batch
+
+    print(f"Found {len(unique_articles)} unique articles to process.")
+    if not unique_articles:
+        return
+
+    # 4. Processing and Scraping Strategy (in parallel)
+    def process_and_scrape(article: dict) -> dict:
+        url = article["url"]
+        
+        # Rule: Text Extraction + Image Extraction
         try:
-            print(f"Category={category}, fetched={fetched_count}, batches={batches}, summarized={summarized}")
-        except Exception:
-            pass
-
-    return metrics
-
-
-def ingest_all_categories():
-    print("Starting scheduled ingestion for categories...")
-    print(f"Planned NewsAPI requests this cycle: {len(CATEGORIES)} (pageSize=100)")
-    cycle_metrics = []
-    # Sequential ingestion with small delay to avoid rate limits
-    for c in CATEGORIES:
-        try:
-            m = ingest_category(c, page_size=100, summarize_now=False)
-            cycle_metrics.append(m)
-            # Respect API limits between category calls
-            time.sleep(1.5)
+            text, real_url, is_video, image_url = fetch_article_content(url)
         except Exception as e:
-            print(f"Category {c} ingestion failed: {e}")
-            cycle_metrics.append({'category': c, 'error': str(e)})
-    # Verification logging
-    newsapi_calls = sum(1 for m in cycle_metrics if m.get("newsapi_requested"))
-    stored_total = sum(m.get("stored", 0) for m in cycle_metrics)
-    summarized_total = sum(m.get("summarized_count", 0) for m in cycle_metrics)
-    print(
-        f"Cycle verification: categories={len(cycle_metrics)}, newsapi_calls={newsapi_calls}, "
-        f"stored_total={stored_total}, summarized_total={summarized_total}"
-    )
-    for m in cycle_metrics:
-        print(
-            f"Category {m.get('category')}: newsapi_status={m.get('newsapi_status')}, "
-            f"newsapi_articles={m.get('newsapi_articles')}, gnews_fallback={m.get('gnews_fallback')}, "
-            f"gnews_articles={m.get('gnews_articles')}, stored={m.get('stored')}, "
-            f"summ_batches={m.get('summarized_batches')}, summarized={m.get('summarized_count')}"
-        )
-    print("Ingestion cycle complete.")
+            print(f"⚠️ Error during fetch_article_content for {url}: {e}")
+            text, real_url, is_video, image_url = None, url, False, None
+
+        # Update article URL to resolved URL when available
+        if real_url:
+            article["url"] = real_url
+        
+        # Store extracted image (if available)
+        if image_url:
+            article["image_url"] = image_url
+            print(f"📷 Stored image for article: {article.get('title')[:60]}")
+
+        # If it's a video, mark and skip scraping/summarization
+        if is_video:
+            article["is_video"] = True
+            article["summarization_needed"] = False
+            article["summary"] = article.get("description")
+            article["content"] = ""
+            print(f"📹 Detected YouTube video after resolution, skipping scraping: {article.get('title')}")
+            return article
+        
+        # CRITICAL: Prefer the scraped text if it's substantial, otherwise fall back to RSS description
+        final_content = (text if text and len(text) > 500 else (article.get("description") or ""))
+        article["content"] = final_content
+
+        # Inline summarization: if we have enough text, summarize immediately using the local BART pipeline
+        if final_content and len(final_content) >= 600:
+            try:
+                print(f"✂️ Summarizing article inline (len={len(final_content)}): {article.get('title')}")
+                # Truncate to 2000 chars before passing to the summarizer for performance
+                input_text = final_content[:2000]
+                summary_obj = summarizer(
+                    input_text,
+                    max_length=100,
+                    min_length=30,
+                    do_sample=False,
+                    num_beams=6,
+                    no_repeat_ngram_size=3,
+                    length_penalty=1.0,
+                    early_stopping=True,
+                )
+                summary_text = summary_obj[0]["summary_text"] if summary_obj and isinstance(summary_obj, list) else None
+                article["summary"] = summary_text or article.get("description")
+                article["summarization_needed"] = False
+                print(f"✅ Inline summarization complete for: {article.get('title')}")
+            except Exception as e:
+                print(f"⚠️ Inline summarization failed for {article.get('title')}: {e}")
+                article["summary"] = article.get("description")
+                article["summarization_needed"] = False
+        else:
+            # Not enough text to summarize; use description as the summary
+            article["summarization_needed"] = False
+            article["summary"] = article.get("description")
+            print(f"📝 Text too short, using description as summary: {article.get('title')}")
+
+        return article
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        processed_articles = list(executor.map(process_and_scrape, unique_articles))
+
+    # 5. Database Insertion
+    if processed_articles:
+        try:
+            # FIX: Deduplicate batch based on cleaned 'url' (strip query params) to prevent duplicates
+            # Create dict keyed by cleaned URL (last duplicate wins), then extract values
+            print(f"📊 Before deduplication: {len(processed_articles)} articles")
+            unique_map = {}
+            for a in processed_articles:
+                raw_url = (a.get('url') or '')
+                clean_url = raw_url.split('?')[0]
+                a['url'] = clean_url
+                unique_map[clean_url] = a
+            unique_batch = list(unique_map.values())
+            print(f"📊 After deduplication: {len(unique_batch)} unique articles")
+
+            # Remove 'url_hash' key from each article (DB generates it automatically)
+            sanitized = []
+            for a in unique_batch:
+                # Ensure we store a clean URL without query parameters
+                if a.get('url'):
+                    a['url'] = a['url'].split('?')[0]
+                row = {k: v for k, v in a.items() if k != "url_hash"}
+                sanitized.append(row)
+
+            print(f"📤 Upserting {len(sanitized)} articles to database...")
+            # Upsert by title to enforce uniqueness on title (DB UNIQUE constraint on title)
+            client.table("articles").upsert(sanitized, on_conflict="title").execute()
+            print(f"✅ Successfully inserted/updated {len(sanitized)} articles in the database.")
+        except Exception as e:
+            print(f"❌ Database insertion failed: {e}")
+
+    print("🏁 Smart ingestion cycle complete.")
+
+# --- END NEW INGESTION LOGIC ---
 
 
 def fetch_recent_summarized_articles() -> List[dict]:
@@ -985,8 +1262,8 @@ scheduler = BackgroundScheduler(timezone="UTC")
 
 @app.on_event("startup")
 def schedule_jobs():
-    # Run news ingestion immediately on startup, then every 3 hours
-    scheduler.add_job(ingest_all_categories, "interval", hours=3, id="ingest_news", replace_existing=True)
+    # Run news ingestion immediately on startup, then every 15 minutes
+    scheduler.add_job(smart_ingest_all_categories, "interval", minutes=15, id="ingest_news", replace_existing=True)
     
     # Add periodic round-robin summarizer (keeps summaries flowing across categories)
     scheduler.add_job(
@@ -1024,7 +1301,7 @@ def schedule_jobs():
     try:
         import threading
         # Start news ingestion
-        threading.Thread(target=ingest_all_categories, daemon=True).start()
+        threading.Thread(target=smart_ingest_all_categories, daemon=True).start()
         
         # Kick the summarizer once on startup for quicker initial coverage
         threading.Thread(
@@ -1219,8 +1496,10 @@ def ingest_articles(items: List[IncomingArticle]):
                 summary = summarize_text_if_possible(a.content, a.title)
             elif a.content:
                 print(f"⏭️ Skipping short article in ingest (len={len(a.content)}): {a.title[:80]}")
+            # Clean the URL by stripping query parameters to keep DB tidy
+            clean_url = (a.url or "").split('?')[0]
             row = {
-                "url": a.url,
+                "url": clean_url,
                 "title": a.title,
                 "description": a.description,
                 "content": a.content,
@@ -1233,7 +1512,8 @@ def ingest_articles(items: List[IncomingArticle]):
                 "summarized": bool(summary),
                 "summarization_needed": not bool(summary),
             }
-            client.table("articles").upsert(row, on_conflict="url_hash").execute()
+            # Upsert by title to rely on UNIQUE(title) constraint and update existing rows
+            client.table("articles").upsert(row, on_conflict="title").execute()
             inserted += 1
         except Exception as e:
             print(f"Ingest error: {e}")
@@ -1694,6 +1974,42 @@ def get_latest_riddle_endpoint():
         )
 
 
+@app.get("/.well-known/assetlinks.json")
+def get_assetlinks():
+    """
+    Android App Links verification file.
+    Replace YOUR_SHA256_FINGERPRINT with your app's actual SHA-256 fingerprint.
+    Get it using: keytool -list -v -keystore ~/.android/debug.keystore -alias androiddebugkey
+    """
+    return [{
+        "relation": ["delegate_permission/common.handle_all_urls"],
+        "target": {
+            "namespace": "android_app",
+            "package_name": "com.readdio.app",
+            "sha256_cert_fingerprints": [
+                "YOUR_SHA256_FINGERPRINT_HERE"  # TODO: Replace with actual fingerprint
+            ]
+        }
+    }]
+
+@app.get("/.well-known/apple-app-site-association")
+def get_apple_app_site_association():
+    """
+    iOS Universal Links verification file.
+    Replace TEAM_ID with your Apple Developer Team ID.
+    """
+    return {
+        "applinks": {
+            "apps": [],
+            "details": [
+                {
+                    "appID": "TEAM_ID.com.readdio.app",  # TODO: Replace TEAM_ID with actual Team ID
+                    "paths": ["/article/*"]
+                }
+            ]
+        }
+    }
+
 @app.get("/article/{encoded_url:path}")
 def redirect_to_article(encoded_url: str, request):
     """
@@ -1975,13 +2291,13 @@ def _check_quiz_attempt_limits(user_id: str, quiz_type: str) -> dict:
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         result = (
             client.table("quiz_attempts")
-            .select("id")
+            .select("id", count="exact")
             .eq("user_id", user_id)
             .eq("quiz_type", quiz_type)
             .gte("completed_at", today_start.isoformat())
             .execute()
         )
-        used_attempts = len(result.data or [])
+        used_attempts = result.count
         next_reset = (today_start + timedelta(days=1)).isoformat()
         
     elif quiz_type == "weekly":
@@ -1992,181 +2308,100 @@ def _check_quiz_attempt_limits(user_id: str, quiz_type: str) -> dict:
         week_start = datetime.combine(monday, datetime.min.time())
         result = (
             client.table("quiz_attempts")
-            .select("id")
+            .select("id", count="exact")
             .eq("user_id", user_id)
             .eq("quiz_type", quiz_type)
             .gte("completed_at", week_start.isoformat())
             .execute()
         )
-        used_attempts = len(result.data or [])
+        used_attempts = result.count
         next_monday = monday + timedelta(days=7)
         next_reset = datetime.combine(next_monday, datetime.min.time()).isoformat()
         
     elif quiz_type == "monthly":
         max_attempts = 5
-        # Count attempts from this month
+        # Count attempts from this month (1st day 00:00)
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         result = (
             client.table("quiz_attempts")
-            .select("id")
+            .select("id", count="exact")
             .eq("user_id", user_id)
             .eq("quiz_type", quiz_type)
             .gte("completed_at", month_start.isoformat())
             .execute()
         )
-        used_attempts = len(result.data or [])
-        # Next month's first day
-        if now.month == 12:
-            next_month = now.replace(year=now.year + 1, month=1, day=1)
-        else:
-            next_month = now.replace(month=now.month + 1, day=1)
-        next_reset = next_month.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    
+        used_attempts = result.count
+        # Next reset is the first day of the next month
+        next_month_start = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+        next_reset = next_month_start.isoformat()
+        
     else:
-        # Default for unknown quiz types
-        return {
-            "remaining_attempts": 1,
-            "max_attempts": 1,
-            "next_reset": None,
-            "can_attempt": True
-        }
+        return {"remaining_attempts": 0, "max_attempts": 0, "next_reset": None, "can_attempt": False}
+
+    # Check for ad unlocks
+    ad_unlock_result = (
+        client.table("ad_attempts")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .eq("quiz_type", quiz_type)
+        .gte("unlock_date", _get_period_start(quiz_type, now).isoformat())
+        .execute()
+    )
+    ad_unlocks = ad_unlock_result.count
     
-    # Get ad-unlocked attempts
-    ad_attempts = _get_user_ad_attempts(user_id, quiz_type)
-    
-    # Calculate remaining attempts including ad unlocks
-    remaining_attempts = max(0, max_attempts - used_attempts + ad_attempts)
+    # Total attempts available = 1 free + ad unlocks
+    total_available = 1 + ad_unlocks
+    remaining = max(0, total_available - used_attempts)
     
     return {
-        "remaining_attempts": remaining_attempts,
+        "remaining_attempts": remaining,
         "max_attempts": max_attempts,
         "next_reset": next_reset,
-        "can_attempt": remaining_attempts > 0
+        "can_attempt": remaining > 0
     }
 
-
-def _get_user_ad_attempts(user_id: str, quiz_type: str) -> int:
-    """
-    Get additional attempts unlocked via rewarded ads
-    Query the ad_attempts table to count ad unlocks for this user and quiz type
-    """
-    if not user_id:
-        return 0
-    
-    client = supabase_client()
-    now = datetime.now()
-    
+def _get_user_wrong_questions(client, user_id: str, limit: int, since: str) -> List[dict]:
+    """Fetch questions the user answered incorrectly."""
     try:
-        # Define time period based on quiz type
-        if quiz_type == "daily":
-            # Count ad unlocks from today
-            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            result = (
-                client.table("ad_attempts")
-                .select("id")
-                .eq("user_id", user_id)
-                .eq("quiz_type", quiz_type)
-                .gte("unlock_date", today_start.isoformat())
-                .execute()
-            )
-        elif quiz_type == "weekly":
-            # Count ad unlocks from this week (Monday 00:00)
-            today = now.date()
-            monday = today - timedelta(days=today.weekday())
-            week_start = datetime.combine(monday, datetime.min.time())
-            result = (
-                client.table("ad_attempts")
-                .select("id")
-                .eq("user_id", user_id)
-                .eq("quiz_type", quiz_type)
-                .gte("unlock_date", week_start.isoformat())
-                .execute()
-            )
-        elif quiz_type == "monthly":
-            # Count ad unlocks from this month
-            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            result = (
-                client.table("ad_attempts")
-                .select("id")
-                .eq("user_id", user_id)
-                .eq("quiz_type", quiz_type)
-                .gte("unlock_date", month_start.isoformat())
-                .execute()
-            )
-        else:
-            return 0
-        
-        return len(result.data or [])
-        
-    except Exception as e:
-        print(f"Error fetching ad attempts: {e}")
-        return 0
-
-
-def _get_user_wrong_questions(client, user_id: str, limit: int, since_date: str) -> List[dict]:
-    """
-    Get user's wrong answers since specific date
-    """
-    try:
-        result = (
+        res = (
             client.table("user_question_performance")
             .select("question_id")
             .eq("user_id", user_id)
             .eq("is_correct", False)
-            .gte("attempted_at", since_date)
+            .gte("attempted_at", since)
             .order("attempted_at", desc=True)
             .limit(limit)
             .execute()
         )
-        
-        question_ids = [item["question_id"] for item in result.data or []]
-        
-        if not question_ids:
+        q_ids = [row["question_id"] for row in res.data or []]
+        if not q_ids:
             return []
         
-        # Get full question details
-        questions_result = (
-            client.table("quiz_questions")
-            .select("*")
-            .in_("id", question_ids)
-            .eq("is_active", True)
-            .execute()
-        )
-        
-        return questions_result.data or []
-        
+        # Fetch full question details
+        questions_res = client.table("quiz_questions").select("*").in_("id", q_ids).execute()
+        return questions_res.data or []
     except Exception as e:
-        print(f"Error fetching wrong questions: {e}")
+        print(f"Error fetching wrong answers: {e}")
         return []
 
-
 def _randomize_question_options(question: dict) -> dict:
-    """
-    Randomize question options while maintaining correct answer mapping
-    """
-    if not question.get("options"):
+    """Randomize the order of options and update the correct_answer index."""
+    try:
+        options = json.loads(question.get("options", "[]"))
+        correct_index = question.get("correct_answer", 0)
+        
+        if not isinstance(options, list) or correct_index >= len(options):
+            return question
+
+        correct_option_text = options[correct_index]
+        
+        random.shuffle(options)
+        
+        new_correct_index = options.index(correct_option_text)
+        
+        question["options"] = json.dumps(options)
+        question["correct_answer"] = new_correct_index
         return question
-    
-    options = question["options"]
-    correct_index = question["correct_answer"]
-    
-    # Convert to list if it's JSONB
-    if isinstance(options, str):
-        options = json.loads(options)
-    
-    # Create mapping of original indices to randomized indices
-    original_indices = list(range(len(options)))
-    random.shuffle(original_indices)
-    
-    # Create new options list
-    new_options = [options[i] for i in original_indices]
-    
-    # Find new correct answer index
-    new_correct_index = original_indices.index(correct_index)
-    
-    # Return updated question
-    randomized_question = question.copy()
-    randomized_question["options"] = new_options
-    randomized_question["correct_answer"] = new_correct_index
-    
-    return randomized_question
+    except (json.JSONDecodeError, ValueError, IndexError) as e:
+        print(f"Error randomizing options for question {question.get('id')}: {e}")
+        return question
