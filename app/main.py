@@ -820,115 +820,65 @@ def smart_ingest_all_categories():
     if not unique_articles:
         return
 
-    # 4. Processing and Scraping Strategy (in parallel)
-    def process_and_scrape(article: dict) -> dict:
+    # 4. Processing and Saving Core Article Data (in parallel)
+    def process_and_scrape(article: dict):
+        """
+        Fetches full content, resolves final URL, and saves the initial article
+        data to Supabase. It flags the article if it needs summarization later.
+        """
+        client = supabase_client()
         url = article["url"]
         
-        # Rule: Text Extraction + Image Extraction
         try:
             text, real_url, is_video, image_url = fetch_article_content(url)
         except Exception as e:
             print(f"⚠️ Error during fetch_article_content for {url}: {e}")
             text, real_url, is_video, image_url = None, url, False, None
 
-        # Update article URL to resolved URL when available
+        # Update article URL to resolved URL and clean it
         if real_url:
-            article["url"] = real_url
+            article["url"] = real_url.split('?')[0]
         
-        # Store extracted image (if available)
+        # Recalculate hash based on the final, clean URL for consistency
+        article["url_hash"] = md5_lower(article["url"])
+
+        # Store extracted image
         if image_url:
             article["image_url"] = image_url
-            print(f"📷 Stored image for article: {article.get('title')[:60]}")
 
-        # If it's a video, mark and skip scraping/summarization
+        # Handle video content
         if is_video:
             article["is_video"] = True
             article["summarization_needed"] = False
             article["summary"] = article.get("description")
             article["content"] = ""
-            print(f"📹 Detected YouTube video after resolution, skipping scraping: {article.get('title')}")
-            return article
-        
-        # CRITICAL: Prefer the scraped text if it's substantial, otherwise fall back to RSS description
-        final_content = (text if text and len(text) > 500 else (article.get("description") or ""))
-        article["content"] = final_content
-
-        # Inline summarization: if we have enough text, summarize immediately using the local BART pipeline
-        if final_content and len(final_content) >= 600:
-            try:
-                print(f"✂️ Summarizing article inline (len={len(final_content)}): {article.get('title')}")
-                # Truncate to 2000 chars before passing to the summarizer for performance
-                input_text = final_content[:2000]
-                summary_obj = summarizer(
-                    input_text,
-                    max_length=100,
-                    min_length=30,
-                    do_sample=False,
-                    num_beams=6,
-                    no_repeat_ngram_size=3,
-                    length_penalty=1.0,
-                    early_stopping=True,
-                )
-                summary_text = summary_obj[0]["summary_text"] if summary_obj and isinstance(summary_obj, list) else None
-                article["summary"] = summary_text or article.get("description")
-                article["summarization_needed"] = False
-                print(f"✅ Inline summarization complete for: {article.get('title')}")
-            except Exception as e:
-                print(f"⚠️ Inline summarization failed for {article.get('title')}: {e}")
-                article["summary"] = article.get("description")
-                article["summarization_needed"] = False
+            print(f"📹 Detected video, skipping summarization: {article.get('title')}")
         else:
-            # Not enough text to summarize; use description as the summary
-            article["summarization_needed"] = False
-            article["summary"] = article.get("description")
-            print(f"📝 Text too short, using description as summary: {article.get('title')}")
+            # Store full content and decide if summarization is needed
+            final_content = (text if text and len(text) > 500 else (article.get("description") or ""))
+            article["content"] = final_content
+            
+            if final_content and len(final_content) >= 600:
+                article["summarization_needed"] = True
+                print(f"📝 Article queued for summarization: {article.get('title')}")
+            else:
+                article["summarization_needed"] = False
+                article["summary"] = article.get("description") # Fallback for short content
+                print(f"📝 Text too short, using description as summary: {article.get('title')}")
 
-        return article
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        processed_articles = list(executor.map(process_and_scrape, unique_articles))
-
-    # 5. Database Insertion
-    if processed_articles:
+        # Immediately upsert the article to the database
         try:
-            # FIX: Deduplicate batch based on cleaned 'url' (strip query params) to prevent duplicates
-            # Create dict keyed by cleaned URL (last duplicate wins), then extract values
-            print(f"📊 Before deduplication: {len(processed_articles)} articles")
-            unique_map = {}
-            for a in processed_articles:
-                raw_url = (a.get('url') or '')
-                clean_url = raw_url.split('?')[0]
-                a['url'] = clean_url
-                unique_map[clean_url] = a
-            unique_batch = list(unique_map.values())
-            print(f"📊 After deduplication: {len(unique_batch)} unique articles")
-
-            # Sanitize and prepare the batch for upsert.
-            # The original comment about the DB generating the hash appears incorrect,
-            # as the application calculates and uses it for deduplication.
-            sanitized = []
-            for a in unique_batch:
-                # Ensure we store a clean URL without query parameters
-                clean_url = (a.get('url') or '').split('?')[0]
-                a['url'] = clean_url
-                
-                if clean_url:
-                    # Recalculate hash based on the final, clean URL for consistency.
-                    a['url_hash'] = md5_lower(clean_url)
-                
-                # We will now pass the whole article dictionary.
-                # Supabase client typically ignores extra keys that aren't columns.
-                sanitized.append(a)
-
-            print(f"📤 Upserting {len(sanitized)} articles to database...")
-            # Upsert by title to enforce uniqueness on title (DB UNIQUE constraint on title)
-            # The 'sanitized' list now contains the corrected and necessary 'url_hash'.
-            client.table("articles").upsert(sanitized, on_conflict="title").execute()
-            print(f"✅ Successfully inserted/updated {len(sanitized)} articles in the database.")
+            # `on_conflict` on `url_hash` assumes it has a UNIQUE constraint in the DB.
+            client.table("articles").upsert(article, on_conflict="url_hash").execute()
+            print(f"✅ Saved initial data for: {article.get('title')[:60]}")
         except Exception as e:
-            print(f"❌ Database insertion failed: {e}")
+            print(f"❌ DB insert/update failed for {article.get('title')}: {e}")
 
-    print("🏁 Smart ingestion cycle complete.")
+    # Run the scraping and saving process in parallel for each unique article
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        executor.map(process_and_scrape, unique_articles)
+
+    print("🏁 Smart ingestion cycle complete. Summaries will be processed by the background worker.")
 
 # --- END NEW INGESTION LOGIC ---
 
