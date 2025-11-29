@@ -62,10 +62,11 @@ RSS_TOPIC_IDS = {
     "sports": "SPORTS",
     "politics": "POLITICS",
     "general": "NATION",
+    "environment": "ENVIRONMENT",
 }
 
 # Categories to be fetched once with a global country code (e.g., US)
-GLOBAL_CATEGORIES = ["technology", "science", "world", "business", "health", "entertainment"]
+GLOBAL_CATEGORIES = ["technology", "science", "world", "business", "health", "entertainment", "environment"]
 
 # Categories to be fetched for each active country
 LOCAL_CATEGORIES = ["general", "politics", "sports"]
@@ -1173,7 +1174,7 @@ def _fetch_prioritized_articles(
     page: int,
     page_size: int,
 ):
-    # First, fetch summarized articles
+    # Only fetch summarized articles to ensure a summary is always available.
     offset = (page - 1) * page_size
     summarized_query = (
         base_query.eq("summarized", True)
@@ -1183,17 +1184,8 @@ def _fetch_prioritized_articles(
     summarized_res = summarized_query.execute()
     items = summarized_res.data or []
 
-    # If not enough, fetch raw articles to fill the page
-    if len(items) < page_size:
-        remaining = page_size - len(items)
-        raw_offset = (page - 1) * page_size
-        raw_query = (
-            base_query.eq("summarized", False)
-            .order("created_at", desc=True)
-            .range(raw_offset, raw_offset + remaining - 1)
-        )
-        raw_res = raw_query.execute()
-        items.extend(raw_res.data or [])
+    # The fallback to fetch non-summarized articles has been removed
+    # to guarantee that only articles with summaries are sent to the client.
 
     out: List[ArticleOut] = []
     for r in items:
@@ -1209,7 +1201,9 @@ def _fetch_prioritized_articles(
                 author=r.get("author"),
                 source=r.get("source"),
                 category=r.get("category"),
-                content=r.get("content"),
+                # Ensure the 'content' field for the API response contains the summary,
+                # so the app displays the summary instead of the full article text.
+                content=r.get("summary"),
                 summary=r.get("summary"),
             )
         )
@@ -1356,12 +1350,12 @@ def search_news(
 ):
     client = supabase_client()
     pattern = f"%{query}%"
-    # Filter across title/description/content
+    # Filter across title/description/content, but only for summarized articles
     res = (
         client.table("articles")
         .select("*")
+        .eq("summarized", True)
         .or_(f"title.ilike.{pattern},description.ilike.{pattern},content.ilike.{pattern}")
-        .order("summarized", desc=True)
         .order("created_at", desc=True)
         .range((page - 1) * page_size, (page * page_size) - 1)
         .execute()
@@ -1381,7 +1375,7 @@ def search_news(
                 author=r.get("author"),
                 source=r.get("source"),
                 category=r.get("category"),
-                content=r.get("content"),
+                content=r.get("summary"), # Use summary for content
                 summary=r.get("summary"),
             )
         )
