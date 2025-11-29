@@ -903,17 +903,26 @@ def smart_ingest_all_categories():
             unique_batch = list(unique_map.values())
             print(f"📊 After deduplication: {len(unique_batch)} unique articles")
 
-            # Remove 'url_hash' key from each article (DB generates it automatically)
+            # Sanitize and prepare the batch for upsert.
+            # The original comment about the DB generating the hash appears incorrect,
+            # as the application calculates and uses it for deduplication.
             sanitized = []
             for a in unique_batch:
                 # Ensure we store a clean URL without query parameters
-                if a.get('url'):
-                    a['url'] = a['url'].split('?')[0]
-                row = {k: v for k, v in a.items() if k != "url_hash"}
-                sanitized.append(row)
+                clean_url = (a.get('url') or '').split('?')[0]
+                a['url'] = clean_url
+                
+                if clean_url:
+                    # Recalculate hash based on the final, clean URL for consistency.
+                    a['url_hash'] = md5_lower(clean_url)
+                
+                # We will now pass the whole article dictionary.
+                # Supabase client typically ignores extra keys that aren't columns.
+                sanitized.append(a)
 
             print(f"📤 Upserting {len(sanitized)} articles to database...")
             # Upsert by title to enforce uniqueness on title (DB UNIQUE constraint on title)
+            # The 'sanitized' list now contains the corrected and necessary 'url_hash'.
             client.table("articles").upsert(sanitized, on_conflict="title").execute()
             print(f"✅ Successfully inserted/updated {len(sanitized)} articles in the database.")
         except Exception as e:
