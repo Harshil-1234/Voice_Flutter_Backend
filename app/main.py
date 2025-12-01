@@ -62,11 +62,10 @@ RSS_TOPIC_IDS = {
     "sports": "SPORTS",
     "politics": "POLITICS",
     "general": "NATION",
-    "environment": "ENVIRONMENT",
 }
 
 # Categories to be fetched once with a global country code (e.g., US)
-GLOBAL_CATEGORIES = ["technology", "science", "world", "business", "health", "entertainment", "environment"]
+GLOBAL_CATEGORIES = ["technology", "science", "world", "business", "health", "entertainment"]
 
 # Categories to be fetched for each active country
 LOCAL_CATEGORIES = ["general", "politics", "sports"]
@@ -83,6 +82,17 @@ ACTIVE_COUNTRIES = [
 
 RSS_URL_PATTERN = "https://news.google.com/rss/headlines/section/topic/{topic_id}?hl=en-{country_code}&gl={country_code}&ceid={country_code}:en"
 # --- END NEW RSS INGESTION CONFIG ---
+
+# --- NEW SEARCH-BASED CATEGORIES ---
+SEARCH_CATEGORIES = {
+    "ai": "Artificial Intelligence OR AI OR Machine Learning",
+    "esports": "Esports OR Gaming News OR Video Games",
+    "animation": "Anime OR Manga OR Webtoon OR Crunchyroll",
+    "crypto": "Cryptocurrency OR Bitcoin OR Ethereum OR Web3",
+    "space": "SpaceX OR NASA OR ISRO OR Astronomy OR Space Exploration",
+    "environment": "Environment OR Climate Change OR Nature",
+}
+# --- END NEW SEARCH-BASED CATEGORIES ---
 
 
 class ArticleOut(BaseModel):
@@ -757,7 +767,27 @@ def smart_ingest_all_categories():
         processed_entries = [process_rss_entry(e, category, "GLOBAL") for e in entries[:5]]
         all_new_articles.extend([p for p in processed_entries if p])
 
-    # 2. Fetch Local Categories for each active country
+    # 2. Fetch Search-based Niche Categories
+    print("--- Fetching Search-based Niche Categories (Country: GLOBAL) ---")
+    for category, query in SEARCH_CATEGORIES.items():
+        try:
+            # URL-encode the query by replacing spaces with '+'
+            encoded_query = query.replace(" ", "+")
+            # Using "US" as the reference country for these global searches
+            country_code = "US"
+            search_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-{country_code}&gl={country_code}&ceid={country_code}:en"
+            
+            print(f"   → Fetching niche category '{category}': {search_url[:120]}...")
+            feed = feedparser.parse(search_url)
+            entries = feed.entries if hasattr(feed, 'entries') else []
+            print(f"   → Found {len(entries)} entries for '{category}'")
+            
+            processed_entries = [process_rss_entry(e, category, "GLOBAL") for e in entries[:5]]
+            all_new_articles.extend([p for p in processed_entries if p])
+        except Exception as e:
+            print(f"   ⚠️ Niche category fetch failed for '{category}': {e}")
+
+    # 3. Fetch Local Categories for each active country
     for country_code in ACTIVE_COUNTRIES:
         print(f"--- Fetching Local Categories for Country: {country_code} ---")
         for category in LOCAL_CATEGORIES:
@@ -774,7 +804,8 @@ def smart_ingest_all_categories():
                 # Fetch 2: Global search for international sports (Football, F1, Tennis)
                 try:
                     global_query = "Football OR Soccer OR Premier League OR Champions League OR F1 OR Tennis"
-                    global_url = f"https://news.google.com/rss/search?q={global_query}&hl=en-{country_code.lower()}&gl={country_code}&ceid={country_code}:en"
+                    encoded_query = global_query.replace(" ", "+")
+                    global_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-{country_code.lower()}&gl={country_code}&ceid={country_code}:en"
                     print(f"   → Fetching global search: {global_url[:80]}...")
                     global_feed = feedparser.parse(global_url)
                     global_entries = global_feed.entries if hasattr(global_feed, 'entries') else []

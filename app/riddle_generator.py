@@ -34,16 +34,13 @@ def get_existing_riddles(limit: int = 100) -> Set[str]:
             .execute()
         )
         
-        # Create a set of normalized questions and answers for duplicate checking
+        # Create a set of normalized questions for duplicate checking
         existing = set()
         for riddle in (result.data or []):
             # Normalize: lowercase and strip whitespace
             question = riddle.get("question", "").lower().strip()
-            answer = riddle.get("answer", "").lower().strip()
             if question:
                 existing.add(question)
-            if answer:
-                existing.add(answer)
         
         return existing
         
@@ -97,22 +94,21 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
         
         # System prompt for generating high-difficulty riddles with 1-word answers
         system_prompt = (
-            "You are an expert riddle creator specializing in HIGH DIFFICULTY riddles. "
-            "Generate a challenging riddle that requires deep reasoning, lateral thinking, "
-            "or clever wordplay. The riddle must be HIGH DIFFICULTY - not easily solvable "
-            "and requiring careful analysis or creative thinking.\n\n"
-            "CRITICAL REQUIREMENTS:\n"
-            "1. The answer MUST be exactly ONE WORD only (no phrases, no multiple words)\n"
-            "2. The difficulty must be HIGH - challenging and thought-provoking\n"
-            "3. The riddle should be intellectually stimulating and engaging\n"
-            "4. Avoid common or obvious answers\n\n"
-            "Example style: 'I am the parent of civilizations, the killer of heroes. "
-            "Without me, you cannot survive, but embrace me too much, and you'll cease "
-            "to thrive. What am I?' (Answer: 'time' - one word)\n\n"
-            "Return ONLY a valid JSON object with these exact keys:\n"
-            "- question: string (the riddle question)\n"
-            "- answer: string (the correct answer - MUST be exactly ONE WORD)\n"
-            "- explanation: string (brief explanation of why this is the answer)"
+            "You are a master riddler known for wit, clever wordplay, and 'Aha!' moments. "
+            "Generate a riddle that is challenging but logically sound. "
+            "Do not generate nonsense. The riddle must describe something common (an object, "
+            "concept, or element) in a poetic or metaphorical way.\n\n"
+            "CRITICAL RULES:\n"
+            "1. The answer MUST be exactly ONE WORD. No multi-word answers.\n"
+            "2. The difficulty should be 'Medium-Hard'. It should require lateral thinking but MUST be solvable.\n"
+            "3. FAIRNESS TEST: When the user hears the answer, it must make perfect sense. If the connection is too vague, reject it.\n"
+            "4. Style: Use rhyme, metaphor, or personification.\n\n"
+            "BAD EXAMPLE (Too Vague): 'I am big and small.' (Answer: A box? A shadow? Nonsense.)\n"
+            "GOOD EXAMPLE (Witty): 'I have cities, but no houses. I have mountains, but no trees. I have water, but no fish. What am I?' (Answer: 'Map')\n\n"
+            "Return ONLY a valid JSON object:\n"
+            "- question: string (The riddle text)\n"
+            "- answer: string (One word, lowercase, singular form if possible)\n"
+            "- explanation: string (A brief, fun sentence explaining the clues)"
         )
         
         # Generate up to 5 attempts to find a unique riddle with 1-word answer
@@ -178,16 +174,10 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
                         
                         # Check for duplicates (normalize for comparison)
                         question_normalized = question.lower().strip()
-                        answer_normalized = answer.lower().strip()
                         
                         if question_normalized in existing_riddles:
                             print(f"⚠️ Attempt {generation_attempt}: Duplicate question detected")
                             print(f"   Retrying to generate a unique riddle...")
-                            break
-                        
-                        if answer_normalized in existing_riddles:
-                            print(f"⚠️ Attempt {generation_attempt}: Duplicate answer detected: '{answer}'")
-                            print(f"   Retrying to generate a riddle with unique answer...")
                             break
                         
                         # All validations passed - store in Supabase
