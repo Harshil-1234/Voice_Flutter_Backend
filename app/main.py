@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import feedparser
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote_plus
 
 from fastapi import FastAPI, Query, Path, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -766,13 +767,14 @@ def smart_ingest_all_categories():
         entries = fetch_rss_feed(category, "US")
         processed_entries = [process_rss_entry(e, category, "GLOBAL") for e in entries[:5]]
         all_new_articles.extend([p for p in processed_entries if p])
+        time.sleep(2)
 
     # 2. Fetch Search-based Niche Categories
     print("--- Fetching Search-based Niche Categories (Country: GLOBAL) ---")
     for category, query in SEARCH_CATEGORIES.items():
         try:
-            # URL-encode the query by replacing spaces with '+'
-            encoded_query = query.replace(" ", "+")
+            # URL-encode the query using quote_plus for proper formatting
+            encoded_query = quote_plus(query)
             # Using "US" as the reference country for these global searches
             country_code = "US"
             search_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-{country_code}&gl={country_code}&ceid={country_code}:en"
@@ -784,6 +786,7 @@ def smart_ingest_all_categories():
             
             processed_entries = [process_rss_entry(e, category, "GLOBAL") for e in entries[:5]]
             all_new_articles.extend([p for p in processed_entries if p])
+            time.sleep(2)
         except Exception as e:
             print(f"   ⚠️ Niche category fetch failed for '{category}': {e}")
 
