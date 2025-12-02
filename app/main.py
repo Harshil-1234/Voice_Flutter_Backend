@@ -559,7 +559,7 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
 
 def _fetch_pending_by_category(client, per_category_limit: int = 2):
     out = {}
-    all_categories = list(RSS_TOPIC_IDS.keys())
+    all_categories = list(RSS_TOPIC_IDS.keys()) + list(SEARCH_CATEGORIES.keys())
     for c in all_categories:
         try:
             res = (
