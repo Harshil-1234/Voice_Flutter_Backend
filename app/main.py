@@ -1196,6 +1196,58 @@ app.add_middleware(
 )
 
 
+from fastapi import Depends, Header
+
+# --- START AUTH HELPERS ---
+
+# Dependency to get user from JWT in Authorization header
+def _get_authenticated_user(authorization: str = Header(...)):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization scheme")
+    
+    token = authorization.split(" ")[1]
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+        
+    try:
+        # Use the standard client (with anon key) to validate the user's JWT
+        client = supabase_client()
+        user_response = client.auth.get_user(token)
+        return user_response.user
+    except Exception as e:
+        print(f"Authentication error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token or user not found")
+
+# --- END AUTH HELPERS ---
+
+@app.delete("/users/me", status_code=204)
+def delete_user(user = Depends(_get_authenticated_user)):
+    """
+    Deletes the currently authenticated user's account.
+    This is a protected endpoint that requires a valid JWT.
+    It uses the service_role key to perform the admin deletion.
+    """
+    if not user or not user.id:
+        raise HTTPException(status_code=400, detail="Could not identify user to delete")
+    
+    try:
+        # Create a new client with service_role key for admin operations
+        admin_client = supabase_client()
+        
+        print(f"🛡️ Admin action: Deleting user with ID: {user.id}")
+        
+        # Perform the deletion
+        admin_client.auth.admin.delete_user(user.id)
+        
+        print(f"✅ Successfully deleted user with ID: {user.id}")
+        
+        # Return a 204 No Content response, which is appropriate for a successful DELETE
+        return
+
+    except Exception as e:
+        print(f"❌ Error deleting user {user.id}: {e}")
+        raise HTTPException(status_code=500, detail="An error occurred while deleting the account")
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
