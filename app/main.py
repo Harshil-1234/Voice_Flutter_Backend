@@ -974,7 +974,7 @@ def fetch_recent_summarized_articles() -> List[dict]:
             .eq("quiz_generated", False) # Only fetch articles not yet processed
             .in_("category", relevant_categories)
             .order("created_at", desc=True)
-            .limit(50)  # Fetch up to 50 articles
+            .limit(150)  # Fetch up to 150 articles
             .execute()
         )
         return result.data or []
@@ -1022,7 +1022,7 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> List[dict]:
             "- correct_option (Integer 0-3)\n"
             "- explanation (String: Explain why each statement is correct/incorrect. Link to static syllabus.)\n"
             "- topic (String: e.g., Polity, Economy, IR)\n"
-            "- difficulty (String: Medium/Hard)\n"
+            "- difficulty (String: 'easy', 'medium', or 'hard' - LOWERCASE ONLY)\n"
             "- source_article_title (String: Exact title from input)\n\n"
             "If NO articles match the criteria, return an empty 'questions' array."
         )
@@ -1139,8 +1139,8 @@ def insert_quiz_questions(questions: List[dict]) -> int:
                 "options": json.dumps(q.get("options", [])),
                 "correct_answer": q.get("correct_option", 0),
                 "explanation": q.get("explanation", ""),
-                "topic": q.get("topic", "General"),
-                "difficulty": q.get("difficulty", "medium"),
+                "topic": q.get("topic", "General").title(),
+                "difficulty": q.get("difficulty", "medium").lower(),
                 "source_article_id": q.get("source_article_title", ""),
                 "is_active": True,
                 "created_at": datetime.now().isoformat(),
