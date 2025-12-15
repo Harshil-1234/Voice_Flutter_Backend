@@ -941,11 +941,20 @@ def smart_ingest_all_categories():
 
 
 def fetch_recent_summarized_articles() -> List[dict]:
-    """Fetch summarized articles from the last 24 hours."""
+    """
+    Fetch up to 100 summarized articles from the last 24 hours,
+    filtered for UPSC-relevant categories.
+    """
     client = supabase_client()
     
     # Calculate timestamp for 24 hours ago
     twenty_four_hours_ago = (datetime.now() - timedelta(hours=24)).isoformat()
+    
+    # Categories relevant for UPSC quiz generation
+    relevant_categories = [
+        "politics", "world", "business", "science", "technology", 
+        "environment", "general", "ai", "crypto", "space", "education"
+    ]
     
     try:
         result = (
@@ -953,7 +962,9 @@ def fetch_recent_summarized_articles() -> List[dict]:
             .select("*")
             .eq("summarized", True)
             .gte("created_at", twenty_four_hours_ago)
+            .in_("category", relevant_categories)  # Filter for serious categories
             .order("created_at", desc=True)
+            .limit(100)  # Fetch up to 100 articles
             .execute()
         )
         return result.data or []
@@ -976,40 +987,41 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> List[dict]:
             "Content-Type": "application/json",
         }
         
-        # System prompt for UPSC-style question generation
+        # Strict system prompt for high-quality UPSC question generation
         system_prompt = (
-            "You are an expert UPSC current affairs question generator. "
-            "Create high-quality multiple-choice questions based on recent news summaries. "
-            "Each question must have:\n"
-            "- Clear, concise question text in UPSC style\n"
-            "- 4 plausible options (A, B, C, D)\n"
-            "- Correct option index (0-3)\n"
-            "- Brief explanation of the correct answer\n"
-            "- Appropriate difficulty level (easy, medium, hard)\n"
-            "- Relevant topic category (Politics, Economy, Environment, International Relations, Science & Technology, etc.)\n"
-            "\nFormat the response as a JSON array of objects with these fields:\n"
+            "You are a senior UPSC Civil Services Exam setter. Your task is to extract high-value "
+            "Current Affairs questions from news summaries. "
+            "STRICT RULES:\n"
+            "1. SYLLABUS CHECK: Only generate questions if the news links to GS Paper 1, 2, 3, or 4 "
+            "(Polity, Economy, Environment, Sci-Tech, IR, Social Issues). "
+            "IGNORE articles about sports scores, movie releases, local crime, or celebrity gossip.\n"
+            "2. QUESTION FORMAT: Prioritize 'Statement Based' questions. "
+            "(e.g., 'Consider the following statements about [Topic]... Which are correct?').\n"
+            "3. DIFFICULTY: Make options confusing and close (e.g., '1 only', '1 and 2 only'). Avoid obvious answers.\n"
+            "4. EXPLANATION: Provide a detailed explanation linking the current event to the static concept.\n"
+            "5. OUTPUT: If an article is not relevant to UPSC, do NOT generate a question for it.\n"
+            "\nFormat the response as a JSON object with a 'questions' array. Each object in the array must have these fields:\n"
             "- question_text: string\n"
             "- options: array of 4 strings\n"
             "- correct_option: integer (0-3)\n"
             "- explanation: string\n"
-            "- difficulty: string\n"
-            "- topic: string\n"
-            "- source_article_title: string (for reference)\n"
+            "- difficulty: string (e.g., 'medium', 'hard')\n"
+            "- topic: string (e.g., 'Polity', 'Economy')\n"
+            "- source_article_title: string (The title of the source article from the context)\n"
         )
         
-        # Prepare article summaries for context
+        # Prepare article summaries for context for the current batch
         article_contexts = []
-        for i, article in enumerate(articles[:30], 1):  # Limit to 30 articles
-            context = f"Article {i}: {article.get('title', '')}\n"
+        for i, article in enumerate(articles, 1): # Process all articles in the batch
+            context = f"Article {i} (Source Title: {article.get('title', '')})\n"
             context += f"Summary: {article.get('summary', '')}\n"
             context += f"Category: {article.get('category', '')}\n"
             article_contexts.append(context)
         
         user_content = (
-            "Generate 30 UPSC-style current affairs questions based on these recent news summaries. "
-            "Ensure questions are diverse across different topics and difficulty levels. "
-            "Make options plausible but distinct, with only one correct answer. "
-            "Return ONLY valid JSON array format.\n\n"
+            "Generate UPSC-style current affairs questions based on the provided news summaries. "
+            "Follow all rules and the JSON format specified in the system prompt. "
+            "Return ONLY a valid JSON object with a 'questions' array.\n\n"
             "Recent News Summaries:\n" + "\n".join(article_contexts)
         )
         
@@ -1020,7 +1032,7 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> List[dict]:
                 {"role": "user", "content": user_content}
             ],
             "temperature": 0.3,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "response_format": {"type": "json_object"}
         }
         
@@ -1148,42 +1160,64 @@ def insert_quiz_questions(questions: List[dict]) -> int:
 
 
 def generate_daily_quiz_questions():
-    """Main function to generate daily UPSC-style quiz questions."""
+    """Main function to generate daily UPSC-style quiz questions with batching and rate limiting."""
     print("Starting daily quiz question generation...")
     
-    # Fetch recent summarized articles
+    # Step 1: Fetch up to 100 recent, relevant articles
     articles = fetch_recent_summarized_articles()
-    print(f"Found {len(articles)} summarized articles from last 24 hours")
+    print(f"Found {len(articles)} summarized articles for potential quiz generation.")
     
     if not articles:
-        print("No summarized articles found for quiz generation")
+        print("No summarized articles found for quiz generation.")
         return
     
-    # Check for existing questions to avoid duplicates
+    # Step 2: Filter out articles that already have questions
     article_titles = [article.get('title', '') for article in articles]
     existing_titles = check_existing_questions(article_titles)
     
-    # Filter out articles that already have questions
     new_articles = [a for a in articles if a.get('title', '') not in existing_titles]
     
     if not new_articles:
-        print("All articles already have questions generated")
+        print("All relevant articles from the last 24 hours already have questions.")
         return
     
-    print(f"Generating questions for {len(new_articles)} new articles")
+    print(f"Generating questions for {len(new_articles)} new articles...")
+
+    # Step 3: Process articles in batches to generate questions
+    all_questions = []
+    batch_size = 20
+    max_questions = 60 # Stop generating after reaching this many questions
+
+    for i in range(0, len(new_articles), batch_size):
+        if len(all_questions) >= max_questions:
+            print(f"Reached question limit ({max_questions}). Halting generation.")
+            break
+
+        batch = new_articles[i:i + batch_size]
+        print(f"Processing batch {i//batch_size + 1}: {len(batch)} articles.")
+        
+        # Generate questions for the current batch
+        generated_questions = call_groq_generate_quiz_questions(batch)
+        
+        if generated_questions:
+            all_questions.extend(generated_questions)
+            print(f"Generated {len(generated_questions)} questions in this batch. Total: {len(all_questions)}")
+        else:
+            print("No questions generated in this batch.")
+
+        # Crucial: Add a delay between API calls to respect rate limits
+        if i + batch_size < len(new_articles):
+            print("Waiting 5 seconds before next API call...")
+            time.sleep(5)
+
+    print(f"Total generated questions: {len(all_questions)}")
     
-    # Generate quiz questions using Groq in two batches to increase pool size
-    half = max(1, len(new_articles) // 2)
-    batch_a = new_articles[:half]
-    batch_b = new_articles[half:]
-    questions_a = call_groq_generate_quiz_questions(batch_a)
-    questions_b = call_groq_generate_quiz_questions(batch_b)
-    questions = (questions_a or []) + (questions_b or [])
-    print(f"Generated {len(questions)} quiz questions across two calls")
-    
-    # Insert questions into database
-    inserted_count = insert_quiz_questions(questions)
-    print(f"Daily quiz generation complete. Inserted {inserted_count} new questions")
+    # Step 4: Insert the collected questions into the database
+    if all_questions:
+        inserted_count = insert_quiz_questions(all_questions)
+        print(f"Daily quiz generation complete. Inserted {inserted_count} new questions.")
+    else:
+        print("Daily quiz generation complete. No new questions were inserted.")
 
 
 app = FastAPI()

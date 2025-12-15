@@ -108,7 +108,7 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
             "Return ONLY a valid JSON object:\n"
             "- question: string (The riddle text)\n"
             "- answer: string (One word, lowercase, singular form if possible)\n"
-            "- explanation: string (A brief, fun sentence explaining the clues)"
+            "- explanation: string (A clear, plain-English breakdown that explicitly connects the metaphors in the riddle to the answer)"
         )
         
         # Generate up to 5 attempts to find a unique riddle with 1-word answer
