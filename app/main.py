@@ -710,8 +710,15 @@ def process_rss_entry(entry: dict, category: str, country: str) -> Optional[dict
         if not link:
             return None
 
-        # Extract clean description from summary HTML
-        soup = BeautifulSoup(entry.get("summary", ""), "html.parser")
+        # Extract clean description from summary HTML, removing related coverage links.
+        summary_html = entry.get("summary", "")
+        soup = BeautifulSoup(summary_html, "html.parser")
+
+        # The related links are usually at the end in a list. Decompose them.
+        for tag in soup.find_all(['ul', 'ol', 'table']):
+            tag.decompose()
+            
+        # The main description is what's left.
         description = soup.get_text(separator="\n", strip=True)
 
         # Attempt to decode Google News redirect to the real publisher URL (no network calls)
@@ -888,17 +895,23 @@ def smart_ingest_all_categories():
             article_data["content"] = ""
             print(f"📹 Detected video, skipping summarization: {article_data.get('title')}")
         else:
-            # Store full content and decide if summarization is needed
-            final_content = (text if text and len(text) > 500 else (article_data.get("description") or ""))
-            article_data["content"] = final_content
-            
-            if final_content and len(final_content) >= 600:
+            # If we got full text from scraping, store it and queue for summarization
+            if text and len(text) >= 600:
+                article_data["content"] = text
                 article_data["summarization_needed"] = True
                 print(f"📝 Article queued for summarization: {article_data.get('title')}")
+            # If scraping failed or text is too short, fall back to the pre-cleaned description
             else:
-                article_data["summarization_needed"] = False
-                article_data["summary"] = article_data.get("description") # Fallback for short content
-                print(f"📝 Text too short, using description as summary: {article_data.get('title')}")
+                cleaned_description = article_data.get("description") or ""
+                article_data["content"] = cleaned_description # Store description as main content
+                article_data["summary"] = cleaned_description # Use it directly as the summary
+                article_data["summarization_needed"] = False # DO NOT summarize the description
+                article_data["summarized"] = True if cleaned_description else False # Mark as summarized if description exists
+                
+                if text:
+                     print(f"📝 Text too short ({len(text)} chars), using description as summary: {article_data.get('title')}")
+                else:
+                     print(f"📝 Scraping failed, using description as summary: {article_data.get('title')}")
 
         # Immediately upsert the article to the database
         try:
@@ -942,34 +955,31 @@ def smart_ingest_all_categories():
 
 def fetch_recent_summarized_articles() -> List[dict]:
     """
-    Fetch up to 100 summarized articles from the last 24 hours,
-    filtered for UPSC-relevant categories.
+    Fetch up to 50 summarized articles that have not yet been used for a quiz.
+    - Fetches articles where summarized is TRUE and quiz_generated is FALSE.
+    - Filters for UPSC-relevant categories.
     """
     client = supabase_client()
     
-    # Calculate timestamp for 24 hours ago
-    twenty_four_hours_ago = (datetime.now() - timedelta(hours=24)).isoformat()
-    
     # Categories relevant for UPSC quiz generation
     relevant_categories = [
-        "politics", "world", "business", "science", "technology", 
-        "environment", "general", "ai", "crypto", "space", "education"
+        "politics", "world", "business", "science", "environment", "general"
     ]
     
     try:
         result = (
             client.table("articles")
-            .select("*")
+            .select("title, summary, category") # Select only needed columns
             .eq("summarized", True)
-            .gte("created_at", twenty_four_hours_ago)
-            .in_("category", relevant_categories)  # Filter for serious categories
+            .eq("quiz_generated", False) # Only fetch articles not yet processed
+            .in_("category", relevant_categories)
             .order("created_at", desc=True)
-            .limit(100)  # Fetch up to 100 articles
+            .limit(50)  # Fetch up to 50 articles
             .execute()
         )
         return result.data or []
     except Exception as e:
-        print(f"Error fetching summarized articles: {e}")
+        print(f"Error fetching summarized articles for quiz: {e}")
         return []
 
 
@@ -989,40 +999,48 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> List[dict]:
         
         # Strict system prompt for high-quality UPSC question generation
         system_prompt = (
-            "You are a senior UPSC Civil Services Exam setter. Your task is to extract high-value "
-            "Current Affairs questions from news summaries. "
-            "STRICT RULES:\n"
-            "1. SYLLABUS CHECK: Only generate questions if the news links to GS Paper 1, 2, 3, or 4 "
-            "(Polity, Economy, Environment, Sci-Tech, IR, Social Issues). "
-            "IGNORE articles about sports scores, movie releases, local crime, or celebrity gossip.\n"
-            "2. QUESTION FORMAT: Prioritize 'Statement Based' questions. "
-            "(e.g., 'Consider the following statements about [Topic]... Which are correct?').\n"
-            "3. DIFFICULTY: Make options confusing and close (e.g., '1 only', '1 and 2 only'). Avoid obvious answers.\n"
-            "4. EXPLANATION: Provide a detailed explanation linking the current event to the static concept.\n"
-            "5. OUTPUT: If an article is not relevant to UPSC, do NOT generate a question for it.\n"
-            "\nFormat the response as a JSON object with a 'questions' array. Each object in the array must have these fields:\n"
-            "- question_text: string\n"
-            "- options: array of 4 strings\n"
-            "- correct_option: integer (0-3)\n"
-            "- explanation: string\n"
-            "- difficulty: string (e.g., 'medium', 'hard')\n"
-            "- topic: string (e.g., 'Polity', 'Economy')\n"
-            "- source_article_title: string (The title of the source article from the context)\n"
+            "You are a Senior Question Setter for the UPSC Civil Services Exam (Prelims). "
+            "Your task is to analyze news summaries and create high-quality, statement-based MCQs.\n\n"
+            
+            "### PHASE 1: STRICT FILTERING (CRITICAL)\n"
+            "Before generating a question, check the article against these rules. If it fails, SKIP IT.\n"
+            "1. **India Relevance:** The topic MUST be about India (Govt schemes, Supreme Court, Economy) OR a major Global Event impacting India (G20, Climate Change, WTO, major wars).\n"
+            "2. **Reject Local Foreign News:** DO NOT generate questions on domestic policies of other nations (e.g., 'Spain's rental laws', 'UK's NHS funding', 'US internal elections').\n"
+            "3. **Reject Triviality:** DO NOT generate questions on Sports scores, Cinema, Crime, or Political party statements.\n\n"
+            
+            "### PHASE 2: QUESTION CONSTRUCTION (UPSC STYLE)\n"
+            "If the article passes Phase 1, create a question using the **'Statement Format'**:\n"
+            "1. **Stem:** 'Consider the following statements regarding [Topic]:'\n"
+            "2. **Statements:** Create 2 or 3 statements. One should be factual (what happened), one should be conceptual (static syllabus link) or a trick (swap a Ministry name or number).\n"
+            "3. **Options:** Use standard UPSC options: 'A) 1 only', 'B) 2 only', 'C) Both 1 and 2', 'D) Neither 1 nor 2'.\n"
+            "4. **No Direct GK:** Avoid simple questions like 'Who is the president of X?'. Make it analytical.\n\n"
+            
+            "### OUTPUT FORMAT\n"
+            "Return a JSON object containing a 'questions' array. Each object must have:\n"
+            "- question_text (String)\n"
+            "- options (Array of 4 strings)\n"
+            "- correct_option (Integer 0-3)\n"
+            "- explanation (String: Explain why each statement is correct/incorrect. Link to static syllabus.)\n"
+            "- topic (String: e.g., Polity, Economy, IR)\n"
+            "- difficulty (String: Medium/Hard)\n"
+            "- source_article_title (String: Exact title from input)\n\n"
+            "If NO articles match the criteria, return an empty 'questions' array."
         )
         
         # Prepare article summaries for context for the current batch
         article_contexts = []
-        for i, article in enumerate(articles, 1): # Process all articles in the batch
-            context = f"Article {i} (Source Title: {article.get('title', '')})\n"
-            context += f"Summary: {article.get('summary', '')}\n"
-            context += f"Category: {article.get('category', '')}\n"
+        for article in articles:
+            # Pass a clean identifier for the model to return
+            context = f"source_article_title: {article.get('title', '')}\n"
+            context += f"summary: {article.get('summary', '')}\n"
             article_contexts.append(context)
-        
+
         user_content = (
-            "Generate UPSC-style current affairs questions based on the provided news summaries. "
-            "Follow all rules and the JSON format specified in the system prompt. "
-            "Return ONLY a valid JSON object with a 'questions' array.\n\n"
-            "Recent News Summaries:\n" + "\n".join(article_contexts)
+            "Analyze the following news summaries. Apply the STRICT FILTERING rules from the system prompt.\n"
+            "Generate 'Statement-Based' UPSC MCQs only for valid India-centric or Major Global topics.\n"
+            "Ignore articles about Sports, Entertainment, or minor foreign domestic affairs.\n"
+            "Return the result as a valid JSON object.\n\n"
+            "News Summaries:\n" + "\n".join(article_contexts)
         )
         
         payload = {
@@ -1160,64 +1178,70 @@ def insert_quiz_questions(questions: List[dict]) -> int:
 
 
 def generate_daily_quiz_questions():
-    """Main function to generate daily UPSC-style quiz questions with batching and rate limiting."""
-    print("Starting daily quiz question generation...")
+    """
+    Main function to generate daily UPSC-style quiz questions. It fetches
+    unprocessed articles, generates questions, and then marks all processed
+    articles as `quiz_generated = TRUE` to prevent re-processing.
+    """
+    print("🚀 Starting daily quiz question generation...")
     
-    # Step 1: Fetch up to 100 recent, relevant articles
-    articles = fetch_recent_summarized_articles()
-    print(f"Found {len(articles)} summarized articles for potential quiz generation.")
+    # Step 1: Fetch articles that haven't been processed for quiz generation yet.
+    articles_to_process = fetch_recent_summarized_articles()
     
-    if not articles:
-        print("No summarized articles found for quiz generation.")
+    if not articles_to_process:
+        print("✅ No new summarized articles found for quiz generation.")
         return
-    
-    # Step 2: Filter out articles that already have questions
-    article_titles = [article.get('title', '') for article in articles]
-    existing_titles = check_existing_questions(article_titles)
-    
-    new_articles = [a for a in articles if a.get('title', '') not in existing_titles]
-    
-    if not new_articles:
-        print("All relevant articles from the last 24 hours already have questions.")
-        return
-    
-    print(f"Generating questions for {len(new_articles)} new articles...")
+        
+    article_titles_to_update = [a.get('title') for a in articles_to_process if a.get('title')]
+    print(f"ℹ️ Found {len(articles_to_process)} articles to process for quiz generation.")
 
-    # Step 3: Process articles in batches to generate questions
+    # Step 2: Process articles in batches to generate questions
     all_questions = []
-    batch_size = 20
-    max_questions = 60 # Stop generating after reaching this many questions
+    batch_size = 10 # Smaller batch size for better reliability
+    max_questions = 20 # Daily target for new questions
 
-    for i in range(0, len(new_articles), batch_size):
+    for i in range(0, len(articles_to_process), batch_size):
         if len(all_questions) >= max_questions:
-            print(f"Reached question limit ({max_questions}). Halting generation.")
+            print(f"✅ Reached question limit ({max_questions}). Halting generation.")
             break
 
-        batch = new_articles[i:i + batch_size]
-        print(f"Processing batch {i//batch_size + 1}: {len(batch)} articles.")
+        batch = articles_to_process[i:i + batch_size]
+        print(f"Processing batch {i//batch_size + 1}: {len(batch)} articles...")
         
-        # Generate questions for the current batch
         generated_questions = call_groq_generate_quiz_questions(batch)
         
         if generated_questions:
             all_questions.extend(generated_questions)
-            print(f"Generated {len(generated_questions)} questions in this batch. Total: {len(all_questions)}")
+            print(f"👍 Generated {len(generated_questions)} questions in this batch. Total: {len(all_questions)}")
         else:
-            print("No questions generated in this batch.")
+            print("🤔 No relevant questions generated in this batch.")
 
-        # Crucial: Add a delay between API calls to respect rate limits
-        if i + batch_size < len(new_articles):
-            print("Waiting 5 seconds before next API call...")
-            time.sleep(5)
+        # Add a delay between API calls to respect rate limits
+        if i + batch_size < len(articles_to_process):
+            print("⏳ Waiting 3 seconds before next batch...")
+            time.sleep(3)
 
     print(f"Total generated questions: {len(all_questions)}")
     
-    # Step 4: Insert the collected questions into the database
+    # Step 3: Insert the collected questions into the database
     if all_questions:
         inserted_count = insert_quiz_questions(all_questions)
-        print(f"Daily quiz generation complete. Inserted {inserted_count} new questions.")
+        print(f"✅ Daily quiz generation complete. Inserted {inserted_count} new questions.")
     else:
-        print("Daily quiz generation complete. No new questions were inserted.")
+        print("✅ Daily quiz generation complete. No new questions were inserted.")
+        
+    # Step 4: Mark all processed articles as quiz_generated = TRUE
+    if article_titles_to_update:
+        try:
+            print(f"🔔 Updating {len(article_titles_to_update)} articles to mark them as processed...")
+            client = supabase_client()
+            client.table("articles").update({
+                "quiz_generated": True,
+                "updated_at": "now()"
+            }).in_("title", article_titles_to_update).execute()
+            print("✅ Successfully marked articles as processed.")
+        except Exception as e:
+            print(f"❌ Error marking articles as processed: {e}")
 
 
 app = FastAPI()
