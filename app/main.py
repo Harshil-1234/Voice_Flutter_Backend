@@ -686,6 +686,16 @@ def summarize_pending_round_robin(per_category_limit: int = 2, max_cycles: int =
 
 # --- START NEW INGESTION LOGIC ---
 
+def sanitize_text(text: Optional[str]) -> Optional[str]:
+    """
+    Sanitizes text by checking for emptiness, whitespace-only, and minimum length.
+    Returns None if text is invalid, otherwise returns the original stripped text.
+    """
+    if not text or not text.strip() or len(text.strip()) < 30:
+        return None
+    return text.strip()
+
+
 def fetch_rss_feed(category: str, country_code: str) -> List[dict]:
     """Fetches and parses a Google News RSS feed."""
     topic_id = RSS_TOPIC_IDS.get(category.lower())
@@ -865,63 +875,78 @@ def smart_ingest_all_categories():
     def process_and_scrape(article: dict):
         """
         Fetches full content, resolves final URL, and saves the initial article
-        data to Supabase. It flags the article if it needs summarization later.
+        data to Supabase. It implements strict data integrity checks.
         """
         client = supabase_client()
         url = article["url"]
-        
+
         try:
-            text, real_url, is_video, image_url = fetch_article_content(url)
+            scraped_text, real_url, is_video, image_url = fetch_article_content(url)
         except Exception as e:
             print(f"⚠️ Error during fetch_article_content for {url}: {e}")
-            text, real_url, is_video, image_url = None, url, False, None
+            scraped_text, real_url, is_video, image_url = None, url, False, None
 
-        # Prepare a dictionary with the data we intend to save
+        # --- Start Refactored Logic ---
+        
+        # 1. Sanitize scraped text and RSS description
+        content = sanitize_text(scraped_text)
+        desc = sanitize_text(article.get("description"))
+
+        # 2. CRITICAL CHECK: If both content and description are invalid, abort.
+        if content is None and desc is None:
+            print(f"⏭️ Skipping article (no content): {article.get('title', 'No Title')[:80]}")
+            return # DO NOT SAVE
+
         article_data = article.copy()
 
-        # Update article URL to resolved URL and clean it
+        # Update URL and image
         if real_url:
             article_data["url"] = real_url.split('?')[0]
-        
-        # Store extracted image
         if image_url:
             article_data["image_url"] = image_url
-
-        # Handle video content
+        
+        # Handle videos separately
         if is_video:
             article_data["is_video"] = True
+            article_data["content"] = None # No content for videos
+            article_data["summary"] = desc # Use sanitized description if available
+            article_data["summarized"] = desc is not None
             article_data["summarization_needed"] = False
-            article_data["summary"] = article_data.get("description")
-            article_data["content"] = ""
-            print(f"📹 Detected video, skipping summarization: {article_data.get('title')}")
+            print(f"📹 Detected video, saving with description as summary: {article.get('title')}")
         else:
-            # If we got full text from scraping, store it and queue for summarization
-            if text and len(text) >= 600:
-                article_data["content"] = text
-                article_data["summarization_needed"] = True
-                print(f"📝 Article queued for summarization: {article_data.get('title')}")
-            # If scraping failed or text is too short, fall back to the pre-cleaned description
-            else:
-                cleaned_description = article_data.get("description") or ""
-                article_data["content"] = cleaned_description # Store description as main content
-                article_data["summary"] = cleaned_description # Use it directly as the summary
-                article_data["summarization_needed"] = False # DO NOT summarize the description
-                article_data["summarized"] = True if cleaned_description else False # Mark as summarized if description exists
-                
-                if text:
-                     print(f"📝 Text too short ({len(text)} chars), using description as summary: {article_data.get('title')}")
-                else:
-                     print(f"📝 Scraping failed, using description as summary: {article_data.get('title')}")
+            # 3. Flag Logic for regular articles
+            summary = None
+            summarization_needed = False
+
+            # Scenario A: Good content exists
+            if content and len(content) > 600:
+                summarization_needed = True
+                article_data["content"] = content
+                print(f"📝 Article has good content, queued for summarization: {article.get('title')}")
+            
+            # Scenario B: Short content or fallback to description
+            elif desc:
+                summary = desc # Fallback to description as summary
+                # Keep content if it exists, even if short. Otherwise, use desc.
+                article_data["content"] = content if content else desc
+                print(f"📝 Using description as summary (content short or missing): {article.get('title')}")
+            else: # Only short content, no desc
+                article_data["content"] = content
+
+
+            # Final flag assignment
+            article_data["summary"] = summary
+            article_data["summarized"] = summary is not None
+            article_data["summarization_needed"] = summarization_needed
+
+        # --- End Refactored Logic ---
 
         # Immediately upsert the article to the database
         try:
-            # From supabase-schema.sql, these are the valid columns.
-            # url_hash is generated by the DB, so we don't send it.
-            # Fields like 'original_rss_link' are excluded.
             row_to_insert = {
                 "url": article_data.get("url"),
                 "title": article_data.get("title"),
-                "description": article_data.get("description"),
+                "description": article_data.get("description"), # Keep original description
                 "content": article_data.get("content"),
                 "source": article_data.get("source"),
                 "image_url": article_data.get("image_url"),
@@ -931,18 +956,15 @@ def smart_ingest_all_categories():
                 "published_at": article_data.get("published_at"),
                 "summary": article_data.get("summary"),
                 "summarized": article_data.get("summarized", False),
-                "summarization_needed": article_data.get("summarization_needed", True),
+                "summarization_needed": article_data.get("summarization_needed", False),
             }
 
-            # Filter out keys with None values to avoid inserting NULLs unnecessarily
             row_to_insert = {k: v for k, v in row_to_insert.items() if v is not None}
             
-            # Using on_conflict='title' as url_hash is generated and cannot be in ON CONFLICT.
-            # This matches the behavior of other insert operations in this file.
             client.table("articles").upsert(row_to_insert, on_conflict="title").execute()
-            print(f"✅ Saved initial data for: {article_data.get('title')[:60]}")
+            print(f"✅ Saved initial data for: {article_data.get('title', 'No Title')[:60]}")
         except Exception as e:
-            print(f"❌ DB insert/update failed for {article_data.get('title')}: {e}")
+            print(f"❌ DB insert/update failed for {article_data.get('title', 'No Title')}: {e}")
 
     # Run the scraping and saving process in parallel for each unique article
     with ThreadPoolExecutor(max_workers=8) as executor:
