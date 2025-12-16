@@ -975,10 +975,11 @@ def smart_ingest_all_categories():
 # --- END NEW INGESTION LOGIC ---
 
 
-def fetch_recent_summarized_articles() -> List[dict]:
+def fetch_recent_summarized_articles(limit: int = 50) -> List[dict]:
     """
-    Fetch up to 50 summarized articles that have not yet been used for a quiz.
+    Fetch a batch of summarized articles that have not yet been used for a quiz.
     - Fetches articles where summarized is TRUE and quiz_generated is FALSE.
+    - Orders by newest first to get the most recent content.
     - Filters for UPSC-relevant categories.
     """
     client = supabase_client()
@@ -996,7 +997,7 @@ def fetch_recent_summarized_articles() -> List[dict]:
             .eq("quiz_generated", False) # Only fetch articles not yet processed
             .in_("category", relevant_categories)
             .order("created_at", desc=True)
-            .limit(150)  # Fetch up to 150 articles
+            .limit(limit)
             .execute()
         )
         return result.data or []
@@ -1201,69 +1202,74 @@ def insert_quiz_questions(questions: List[dict]) -> int:
 
 def generate_daily_quiz_questions():
     """
-    Main function to generate daily UPSC-style quiz questions. It fetches
-    unprocessed articles, generates questions, and then marks all processed
-    articles as `quiz_generated = TRUE` to prevent re-processing.
+    Main function to generate daily UPSC-style quiz questions using a 'Fill the Bucket' loop.
+    It iteratively fetches batches of unprocessed articles and generates questions until
+    a target number is met or a safety limit is reached.
     """
-    print("🚀 Starting daily quiz question generation...")
+    print("🚀 Starting 'Fill the Bucket' daily quiz generation...")
+    client = supabase_client()
+
+    target_questions = 60
+    total_generated = 0
+    max_articles_to_scan = 600
+    articles_scanned = 0
     
-    # Step 1: Fetch articles that haven't been processed for quiz generation yet.
-    articles_to_process = fetch_recent_summarized_articles()
-    
-    if not articles_to_process:
-        print("✅ No new summarized articles found for quiz generation.")
-        return
+    # Use a set to keep track of titles processed in this run to avoid reprocessing
+    processed_titles_in_run = set()
+
+    while total_generated < target_questions and articles_scanned < max_articles_to_scan:
+        print(f"--- Iteration: {total_generated}/{target_questions} questions generated, {articles_scanned}/{max_articles_to_scan} articles scanned ---")
         
-    article_titles_to_update = [a.get('title') for a in articles_to_process if a.get('title')]
-    print(f"ℹ️ Found {len(articles_to_process)} articles to process for quiz generation.")
-
-    # Step 2: Process articles in batches to generate questions
-    all_questions = []
-    batch_size = 20 # Smaller batch size for better reliability
-    max_questions = 50 # Daily target for new questions
-
-    for i in range(0, len(articles_to_process), batch_size):
-        if len(all_questions) >= max_questions:
-            print(f"✅ Reached question limit ({max_questions}). Halting generation.")
+        # 1. Fetch a new batch of unprocessed articles
+        articles_batch = fetch_recent_summarized_articles(limit=50)
+        
+        # Filter out any articles we might have already seen in this session (edge case)
+        articles_to_process = [a for a in articles_batch if a.get('title') not in processed_titles_in_run]
+        
+        if not articles_to_process:
+            print("✅ No more unprocessed articles in the database. Halting.")
             break
+            
+        titles_in_batch = [a.get('title') for a in articles_to_process if a.get('title')]
+        articles_scanned += len(articles_to_process)
+        processed_titles_in_run.update(titles_in_batch)
 
-        batch = articles_to_process[i:i + batch_size]
-        print(f"Processing batch {i//batch_size + 1}: {len(batch)} articles...")
+        print(f"ℹ️ Fetched {len(articles_to_process)} new articles to process...")
+
+        # 2. Generate questions from the batch (in smaller sub-batches for Groq)
+        groq_batch_size = 20
+        generated_questions_in_batch = []
+        for i in range(0, len(articles_to_process), groq_batch_size):
+            sub_batch = articles_to_process[i:i + groq_batch_size]
+            generated = call_groq_generate_quiz_questions(sub_batch)
+            if generated:
+                generated_questions_in_batch.extend(generated)
         
-        generated_questions = call_groq_generate_quiz_questions(batch)
-        
-        if generated_questions:
-            all_questions.extend(generated_questions)
-            print(f"👍 Generated {len(generated_questions)} questions in this batch. Total: {len(all_questions)}")
+        # 3. Insert new questions into DB
+        if generated_questions_in_batch:
+            inserted_count = insert_quiz_questions(generated_questions_in_batch)
+            total_generated += inserted_count
+            print(f"👍 Generated and inserted {inserted_count} new questions. Total so far: {total_generated}")
         else:
             print("🤔 No relevant questions generated in this batch.")
 
-        # Add a delay between API calls to respect rate limits
-        if i + batch_size < len(articles_to_process):
-            print("⏳ Waiting 3 seconds before next batch...")
+        # 4. Mark the fetched articles as processed immediately
+        if titles_in_batch:
+            try:
+                print(f"🔔 Marking {len(titles_in_batch)} articles as processed...")
+                client.table("articles").update({
+                    "quiz_generated": True,
+                    "updated_at": "now()"
+                }).in_("title", titles_in_batch).execute()
+            except Exception as e:
+                print(f"❌ Error marking articles as processed: {e}")
+
+        # 5. Sleep if we are going to continue
+        if total_generated < target_questions and articles_scanned < max_articles_to_scan and articles_to_process:
+            print("⏳ Waiting 3 seconds before next iteration...")
             time.sleep(3)
 
-    print(f"Total generated questions: {len(all_questions)}")
-    
-    # Step 3: Insert the collected questions into the database
-    if all_questions:
-        inserted_count = insert_quiz_questions(all_questions)
-        print(f"✅ Daily quiz generation complete. Inserted {inserted_count} new questions.")
-    else:
-        print("✅ Daily quiz generation complete. No new questions were inserted.")
-        
-    # Step 4: Mark all processed articles as quiz_generated = TRUE
-    if article_titles_to_update:
-        try:
-            print(f"🔔 Updating {len(article_titles_to_update)} articles to mark them as processed...")
-            client = supabase_client()
-            client.table("articles").update({
-                "quiz_generated": True,
-                "updated_at": "now()"
-            }).in_("title", article_titles_to_update).execute()
-            print("✅ Successfully marked articles as processed.")
-        except Exception as e:
-            print(f"❌ Error marking articles as processed: {e}")
+    print(f"🏁 Daily quiz generation complete. Total questions generated: {total_generated}")
 
 
 app = FastAPI()
