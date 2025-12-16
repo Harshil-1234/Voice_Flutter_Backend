@@ -1197,8 +1197,8 @@ def generate_daily_quiz_questions():
 
     # Step 2: Process articles in batches to generate questions
     all_questions = []
-    batch_size = 10 # Smaller batch size for better reliability
-    max_questions = 20 # Daily target for new questions
+    batch_size = 20 # Smaller batch size for better reliability
+    max_questions = 50 # Daily target for new questions
 
     for i in range(0, len(articles_to_process), batch_size):
         if len(all_questions) >= max_questions:
