@@ -1401,8 +1401,53 @@ def get_category_news(
 scheduler = BackgroundScheduler(timezone="UTC")
 
 
+def heal_database_flags():
+    """
+    Corrects inconsistent article flags in the database on startup.
+    Sets summarized = TRUE and summarization_needed = FALSE for articles
+    that have a valid summary but are incorrectly flagged.
+    """
+    print("🩹 [DB HEALING] Starting database flag healing process...")
+    try:
+        client = supabase_client()
+        
+        # Fetch articles that have a summary but are marked as not summarized
+        fetch_res = client.table("articles").select("id, summary").not_.is_("summary", "null").eq("summarized", False).execute()
+        
+        if not fetch_res.data:
+            print("🩹 [DB HEALING] No articles with inconsistent flags found. Nothing to do.")
+            return
+
+        # Filter in Python for summaries with more than 20 characters
+        ids_to_fix = [
+            item["id"] for item in fetch_res.data 
+            if item.get("summary") and len(item["summary"]) > 20
+        ]
+
+        if not ids_to_fix:
+            print("🩹 [DB HEALING] Found candidates, but none met the length > 20 criteria. Nothing to fix.")
+            return
+
+        # Perform the bulk update on the identified IDs
+        print(f"🩹 [DB HEALING] Found {len(ids_to_fix)} articles with inconsistent flags. Fixing now...")
+        update_res = client.table("articles").update({
+            "summarized": True,
+            "summarization_needed": False,
+            "updated_at": "now()"
+        }).in_("id", ids_to_fix).execute()
+        
+        fixed_count = len(update_res.data)
+        print(f"✅ [DB HEALING] Successfully fixed flags for {fixed_count} articles.")
+
+    except Exception as e:
+        print(f"❌ [DB HEALING] An error occurred during database healing: {e}")
+
+
 @app.on_event("startup")
 def schedule_jobs():
+    # Heal inconsistent DB flags on startup
+    heal_database_flags()
+
     # Run news ingestion immediately on startup, then every 15 minutes
     scheduler.add_job(smart_ingest_all_categories, "interval", minutes=15, id="ingest_news", replace_existing=True)
     
