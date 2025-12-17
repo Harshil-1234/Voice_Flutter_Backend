@@ -2584,14 +2584,37 @@ def _randomize_question_options(question: dict) -> dict:
         
         if not isinstance(options, list) or correct_index >= len(options):
             return question
+        # 1. CLEAN PREFIXES (Remove 'A) ', 'b. ', '1)', etc. at start)
+        cleaned_options: List[str] = []
+        for opt in options:
+            try:
+                # Ensure we are working with a string
+                opt_str = opt if isinstance(opt, str) else str(opt)
+            except Exception:
+                opt_str = ""
 
-        correct_option_text = options[correct_index]
-        
-        random.shuffle(options)
-        
-        new_correct_index = options.index(correct_option_text)
-        
-        question["options"] = json.dumps(options)
+            # Regex: optional leading whitespace, then A-D or a-d or 1-4, followed by ) or ., then optional whitespace
+            cleaned = re.sub(r'^\s*[A-Da-d1-4][\)\.]\s*', '', opt_str).strip()
+            cleaned_options.append(cleaned)
+
+        # Track the correct option text after cleaning
+        try:
+            correct_option_text = cleaned_options[correct_index]
+        except Exception:
+            # If indexing fails, fall back to original behaviour
+            correct_option_text = options[correct_index] if correct_index < len(options) else None
+
+        # 2. SHUFFLE cleaned options
+        random.shuffle(cleaned_options)
+
+        # 3. RE-INDEX: find where the correct option landed
+        if correct_option_text is not None and correct_option_text in cleaned_options:
+            new_correct_index = cleaned_options.index(correct_option_text)
+        else:
+            # If we couldn't determine the correct option text, default to 0
+            new_correct_index = 0
+
+        question["options"] = json.dumps(cleaned_options)
         question["correct_answer"] = new_correct_index
         return question
     except (json.JSONDecodeError, ValueError, IndexError) as e:
