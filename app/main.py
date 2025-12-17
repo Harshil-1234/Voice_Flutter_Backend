@@ -1413,40 +1413,26 @@ def heal_database_flags():
     Sets summarized = TRUE and summarization_needed = FALSE for articles
     that have a valid summary but are incorrectly flagged.
     """
-    print("🩹 [DB HEALING] Starting database flag healing process...")
+    print("🩹 [DB HEALING] Triggering server-side healing via RPC 'heal_article_flags'...")
     try:
         client = supabase_client()
-        
-        # Fetch articles that have a summary but are marked as not summarized
-        fetch_res = client.table("articles").select("id, summary").not_.is_("summary", "null").eq("summarized", False).execute()
-        
-        if not fetch_res.data:
-            print("🩹 [DB HEALING] No articles with inconsistent flags found. Nothing to do.")
-            return
+        # Call the Postgres function (RPC) which performs the healing server-side
+        res = client.rpc('heal_article_flags', {}).execute()
 
-        # Filter in Python for summaries with more than 20 characters
-        ids_to_fix = [
-            item["id"] for item in fetch_res.data 
-            if item.get("summary") and len(item["summary"]) > 20
-        ]
-
-        if not ids_to_fix:
-            print("🩹 [DB HEALING] Found candidates, but none met the length > 20 criteria. Nothing to fix.")
-            return
-
-        # Perform the bulk update on the identified IDs
-        print(f"🩹 [DB HEALING] Found {len(ids_to_fix)} articles with inconsistent flags. Fixing now...")
-        update_res = client.table("articles").update({
-            "summarized": True,
-            "summarization_needed": False,
-            "updated_at": "now()"
-        }).in_("id", ids_to_fix).execute()
-        
-        fixed_count = len(update_res.data)
-        print(f"✅ [DB HEALING] Successfully fixed flags for {fixed_count} articles.")
+        # Basic success/failure logging. The supabase client response may include `error` or `data` attributes.
+        if getattr(res, 'error', None):
+            print(f"❌ [DB HEALING] RPC returned an error: {res.error}")
+        else:
+            print("✅ [DB HEALING] Database healing triggered successfully.")
+            # Optionally log returned data if present
+            if getattr(res, 'data', None):
+                try:
+                    print(f"🩹 [DB HEALING] RPC result: {res.data}")
+                except Exception:
+                    pass
 
     except Exception as e:
-        print(f"❌ [DB HEALING] An error occurred during database healing: {e}")
+        print(f"❌ [DB HEALING] An error occurred while calling heal_article_flags RPC: {e}")
 
 
 @app.on_event("startup")
