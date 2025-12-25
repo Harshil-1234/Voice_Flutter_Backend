@@ -1022,32 +1022,45 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> List[dict]:
         
         # Strict system prompt for high-quality UPSC question generation
         system_prompt = (
-            "You are a Senior Question Setter for the UPSC Civil Services Exam (Prelims). "
-            "Your task is to analyze news summaries and create high-quality, statement-based MCQs.\n\n"
+            "You are the Chief Question Setter for the UPSC Civil Services Exam (Prelims). "
+            "Your task is to convert news summaries into high-quality MCQs using the two standard UPSC formats.\n\n"
             
-            "### PHASE 1: STRICT FILTERING (CRITICAL)\n"
-            "Before generating a question, check the article against these rules. If it fails, SKIP IT.\n"
-            "1. **India Relevance:** The topic MUST be about India (Govt schemes, Supreme Court, Economy) OR a major Global Event impacting India (G20, Climate Change, WTO, major wars).\n"
-            "2. **Reject Local Foreign News:** DO NOT generate questions on domestic policies of other nations (e.g., 'Spain's rental laws', 'UK's NHS funding', 'US internal elections').\n"
-            "3. **Reject Triviality:** DO NOT generate questions on Sports scores, Cinema, Crime, or Political party statements.\n\n"
+            "### PHASE 1: THE GATEKEEPER (STRICT FILTERING)\n"
+            "Analyze every article. If it fails these rules, SKIP IT (do not generate a question):\n"
+            "1. **India-Centric:** The topic MUST be about India (Policy, Economy, Constitution) OR Global events impacting India.\n"
+            "2. **REJECT IRRELEVANCE:** No Sports scores, Cinema, Crime, or Political Party statements.\n"
+            "3. **REJECT LOCAL FOREIGN NEWS:** No domestic laws of USA, UK, Spain, etc.\n\n"
             
-            "### PHASE 2: QUESTION CONSTRUCTION (UPSC STYLE)\n"
-            "If the article passes Phase 1, create a question using the **'Statement Format'**:\n"
-            "1. **Stem:** 'Consider the following statements regarding [Topic]:'\n"
-            "2. **Statements:** Create 2 or 3 statements. One should be factual (what happened), one should be conceptual (static syllabus link) or a trick (swap a Ministry name or number).\n"
-            "3. **Options:** Use standard UPSC options: 'A) 1 only', 'B) 2 only', 'C) Both 1 and 2', 'D) Neither 1 nor 2'.\n"
-            "4. **No Direct GK:** Avoid simple questions like 'Who is the president of X?'. Make it analytical.\n\n"
+            "### PHASE 2: QUESTION CONSTRUCTION (USE MIXED FORMATS)\n"
+            "Choose the format that fits the news best:\n\n"
             
-            "### OUTPUT FORMAT\n"
-            "Return a JSON object containing a 'questions' array. Each object must have:\n"
-            "- question_text (String)\n"
-            "- options (Array of 4 strings)\n"
-            "- correct_option (Integer 0-3)\n"
-            "- explanation (String: Explain why each statement is correct/incorrect. Link to static syllabus.)\n"
+            "**FORMAT A: STATEMENT BASED (Preferred for Policy/Economy/Science)**\n"
+            "1. **Question Text:** MUST include the statements inside the text.\n"
+            "   - Example: 'Consider the following statements regarding [Topic]:\\n1. [Statement 1]\\n2. [Statement 2]\\nWhich of the statements given above is/are correct?'\n"
+            "2. **Options:** Use ONLY standard codes: ['1 only', '2 only', 'Both 1 and 2', 'Neither 1 nor 2'].\n"
+            "3. **Explanation:** Analyze the statements. 'Statement 1 is correct because... Statement 2 is incorrect because...'\n\n"
+            
+            "**FORMAT B: DIRECT QUESTION (Preferred for Places/Species/Terms)**\n"
+            "1. **Question Text:** A direct query. 'Which organization released the [Report Name]?'\n"
+            "2. **Options:** Four distinct factual answers. ['World Bank', 'IMF', 'WEF', 'WTO'].\n"
+            "3. **Explanation:** STATE the correct answer explicitly by name. 'The World Bank released this report...' (NEVER say 'Option A is correct').\n\n"
+            
+            "### PHASE 3: SHUFFLE-PROOFING RULES (CRITICAL)\n"
+            "The app shuffles options randomly. Therefore:\n"
+            "1. **NEVER** put the long statements inside the `options` array. Put them in `question_text`.\n"
+            "2. **NEVER** refer to 'Option A', 'Option B', 'The first option' in your explanation.\n"
+            "3. **NEVER** add prefixes like 'A)', '1.', '(a)' inside the `options` strings.\n\n"
+            
+            "### OUTPUT JSON FORMAT\n"
+            "Return a JSON object containing a 'questions' array. Each item:\n"
+            "- question_text (String: Includes the numbered statements if Format A)\n"
+            "- options (Array of 4 strings: Clean text only)\n"
+            "- correct_option (Integer 0-3: Index of the correct string in the options array)\n"
+            "- explanation (String: Logic-based analysis)\n"
             "- topic (String: e.g., Polity, Economy, IR)\n"
-            "- difficulty (String: 'easy', 'medium', or 'hard' - LOWERCASE ONLY)\n"
-            "- source_article_title (String: Exact title from input)\n\n"
-            "If NO articles match the criteria, return an empty 'questions' array."
+            "- difficulty (String: 'easy', 'medium', or 'hard' - LOWERCASE)\n"
+            "- source_article_title (String: COPY EXACTLY from input. Do not paraphrase.)\n"
+
         )
         
         # Prepare article summaries for context for the current batch
@@ -1101,33 +1114,15 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> List[dict]:
                     questions = questions_data.get("questions", [])
                     if isinstance(questions, list):
                         return questions
-                    else:
-                        print("Invalid response format: questions not found as array")
-                        return []
-                except json.JSONDecodeError as e:
-                    print(f"JSON parse error: {e}")
-                    print(f"Response content: {content[:200]}")
+                    # If model returned a different shape, return empty list for safety
                     return []
-                    
-            elif resp.status_code == 429 and attempt < retries:
-                wait_s = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
-                attempt += 1
-                print(f"Groq rate limit reached (429). Retrying in {wait_s}s (attempt {attempt}/{retries}).")
-                time.sleep(wait_s)
-                continue
-            else:
-                print(f"Groq quiz generation error {resp.status_code}: {resp.text[:200]}")
-                break
-                
+                except Exception as e:
+                    print(f"Groq parse/format error: {e}")
+                    return []
+            # End of request loop
     except Exception as e:
         print(f"Groq quiz generation exception: {e}")
-    
     return []
-
-
-def check_existing_questions(source_article_titles: List[str]) -> set:
-    """Check which articles already have questions to avoid duplicates."""
-    client = supabase_client()
     
     try:
         # Get unique article titles that already have questions
@@ -1211,7 +1206,7 @@ def generate_daily_quiz_questions():
 
     target_questions = 60
     total_generated = 0
-    max_articles_to_scan = 600
+    max_articles_to_scan = 1000
     articles_scanned = 0
     
     # Use a set to keep track of titles processed in this run to avoid reprocessing
@@ -1219,17 +1214,17 @@ def generate_daily_quiz_questions():
 
     while total_generated < target_questions and articles_scanned < max_articles_to_scan:
         print(f"--- Iteration: {total_generated}/{target_questions} questions generated, {articles_scanned}/{max_articles_to_scan} articles scanned ---")
-        
-        # 1. Fetch a new batch of unprocessed articles
-        articles_batch = fetch_recent_summarized_articles(limit=50)
-        
+
+        # 1. Fetch a new batch of unprocessed articles (increased batch size)
+        articles_batch = fetch_recent_summarized_articles(limit=100)
+
         # Filter out any articles we might have already seen in this session (edge case)
         articles_to_process = [a for a in articles_batch if a.get('title') not in processed_titles_in_run]
-        
+
         if not articles_to_process:
             print("✅ No more unprocessed articles in the database. Halting.")
             break
-            
+
         titles_in_batch = [a.get('title') for a in articles_to_process if a.get('title')]
         articles_scanned += len(articles_to_process)
         processed_titles_in_run.update(titles_in_batch)
@@ -1244,7 +1239,7 @@ def generate_daily_quiz_questions():
             generated = call_groq_generate_quiz_questions(sub_batch)
             if generated:
                 generated_questions_in_batch.extend(generated)
-        
+
         # 3. Insert new questions into DB
         if generated_questions_in_batch:
             inserted_count = insert_quiz_questions(generated_questions_in_batch)
@@ -2568,27 +2563,34 @@ def _randomize_question_options(question: dict) -> dict:
         options = json.loads(question.get("options", "[]"))
         correct_index = question.get("correct_answer", 0)
         
-        if not isinstance(options, list) or correct_index >= len(options):
+        if not isinstance(options, list) or not options:
             return question
-        # 1. CLEAN PREFIXES (Remove 'A) ', 'b. ', '1)', etc. at start)
+
+        # Normalize correct_index to int and clamp
+        try:
+            correct_index = int(correct_index or 0)
+        except Exception:
+            correct_index = 0
+        if correct_index < 0 or correct_index >= len(options):
+            correct_index = 0
+
+        # 1. CLEAN PREFIXES (Remove 'A) ', 'b. ', '1)', '(a)', 'A-' etc. at start)
         cleaned_options: List[str] = []
         for opt in options:
             try:
-                # Ensure we are working with a string
                 opt_str = opt if isinstance(opt, str) else str(opt)
             except Exception:
                 opt_str = ""
 
-            # Regex: optional leading whitespace, then A-D or a-d or 1-4, followed by ) or ., then optional whitespace
-            cleaned = re.sub(r'^\s*[A-Da-d1-4][\)\.]\s*', '', opt_str).strip()
+            # Regex to remove "A)", "1.", "(a)", "A-" from start (as requested)
+            cleaned = re.sub(r'^[\s\(]*[A-Da-d1-4][\)\.\-]\s*', '', opt_str).strip()
             cleaned_options.append(cleaned)
 
         # Track the correct option text after cleaning
         try:
             correct_option_text = cleaned_options[correct_index]
         except Exception:
-            # If indexing fails, fall back to original behaviour
-            correct_option_text = options[correct_index] if correct_index < len(options) else None
+            correct_option_text = None
 
         # 2. SHUFFLE cleaned options
         random.shuffle(cleaned_options)
@@ -2597,8 +2599,8 @@ def _randomize_question_options(question: dict) -> dict:
         if correct_option_text is not None and correct_option_text in cleaned_options:
             new_correct_index = cleaned_options.index(correct_option_text)
         else:
-            # If we couldn't determine the correct option text, default to 0
-            new_correct_index = 0
+            # fallback: keep same index if within bounds, otherwise 0
+            new_correct_index = min(correct_index, len(cleaned_options) - 1)
 
         question["options"] = json.dumps(cleaned_options)
         question["correct_answer"] = new_correct_index
