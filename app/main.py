@@ -684,6 +684,75 @@ def summarize_pending_round_robin(per_category_limit: int = 2, max_cycles: int =
 
     print(f"✅ Round‑robin summarization complete: cycles={cycles}, updated={total_updated}")
 
+def clean_existing_quiz_options():
+    print("🧹 Starting one-time cleanup of Quiz Options...")
+    client = supabase_client()
+    
+    # 1. Fetch all questions
+    # We page through them to avoid timeouts if you have thousands
+    page = 0
+    page_size = 100
+    total_cleaned = 0
+    
+    while True:
+        try:
+            start = page * page_size
+            end = start + page_size - 1
+            
+            res = client.table("quiz_questions").select("id, options").range(start, end).execute()
+            questions = res.data or []
+            
+            if not questions:
+                break # Done
+            
+            print(f"Processing batch {page + 1} ({len(questions)} questions)...")
+            
+            for q in questions:
+                q_id = q['id']
+                raw_options = q['options']
+                
+                # Parse JSON if it's a string, otherwise use as list
+                if isinstance(raw_options, str):
+                    try:
+                        options_list = json.loads(raw_options)
+                    except:
+                        print(f"⚠️ Skipping invalid JSON for {q_id}")
+                        continue
+                elif isinstance(raw_options, list):
+                    options_list = raw_options
+                else:
+                    continue
+
+                # 2. Clean the Prefixes (The Magic Part)
+                # Regex looks for: Start -> (Optional Space) -> (Letter/Number) -> (Dot/Bracket) -> (Space)
+                # Examples handled: "A) Text", "1. Text", "(a) Text", "A. Text"
+                new_options = []
+                changed = False
+                
+                for opt in options_list:
+                    # Clean the string
+                    cleaned = re.sub(r'^[\s\(]*[A-Za-z0-9][\)\.\-]\s+', '', opt).strip()
+                    new_options.append(cleaned)
+                    
+                    if cleaned != opt:
+                        changed = True
+                
+                # 3. Update DB only if changes were made
+                if changed:
+                    # Save back as JSON string to be safe
+                    client.table("quiz_questions").update({
+                        "options": json.dumps(new_options) 
+                    }).eq("id", q_id).execute()
+                    total_cleaned += 1
+            
+            page += 1
+            
+        except Exception as e:
+            print(f"❌ Error in cleanup loop: {e}")
+            break
+            
+    print(f"✅ Cleanup Complete. Fixed {total_cleaned} questions.")
+
 # --- START NEW INGESTION LOGIC ---
 
 def sanitize_text(text: Optional[str]) -> Optional[str]:
@@ -1473,6 +1542,10 @@ def schedule_jobs():
     # Kick off initial runs asynchronously
     try:
         import threading
+        
+        # Start the one-time quiz option cleanup
+        threading.Thread(target=clean_existing_quiz_options, daemon=True).start()
+        
         # Start news ingestion
         threading.Thread(target=smart_ingest_all_categories, daemon=True).start()
         
