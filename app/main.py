@@ -1091,79 +1091,75 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> List[dict]:
         
         # Strict system prompt for high-quality UPSC question generation
         system_prompt = (
-            "You are the Chief Question Setter for the UPSC Civil Services Exam (Prelims). "
-            "Your task is to convert news summaries into high-quality MCQs using the two standard UPSC formats.\n\n"
+            "You are the Head Examiner for the UPSC Civil Services Preliminary Exam. "
+            "Your reputation depends on creating flawless, syllabus-linked Current Affairs questions.\n\n"
             
-            "### PHASE 1: THE GATEKEEPER (STRICT FILTERING)\n"
-            "Analyze every article. If it fails these rules, SKIP IT (do not generate a question):\n"
-            "1. **India-Centric:** The topic MUST be about India (Policy, Economy, Constitution) OR Global events impacting India.\n"
-            "2. **REJECT IRRELEVANCE:** No Sports scores, Cinema, Crime, or Political Party statements.\n"
-            "3. **REJECT LOCAL FOREIGN NEWS:** No domestic laws of USA, UK, Spain, etc.\n\n"
+            "### PHASE 1: THE FILTER (DO NOT GENERATE GARBAGE)\n"
+            "Analyze the news summary. If it falls into these categories, **SKIP IT** (return nothing for that article):\n"
+            "1. **Irrelevant Foreign News:** Domestic politics of UK/USA/Pakistan (e.g., 'Nadhim Zahawi defecting'). ONLY cover international news if it involves India, UN, WTO, G20, or Climate Change.\n"
+            "2. **Entertainment/Sports:** No movie awards, cricket scores, or celebrity news.\n"
+            "3. **Local/Trivial:** No local accidents, minor crimes, or political party allegations.\n\n"
             
-            "### PHASE 2: QUESTION CONSTRUCTION (USE MIXED FORMATS)\n"
-            "Choose the format that fits the news best:\n\n"
+            "### PHASE 2: THE CONSTRUCTION (UPSC STANDARD)\n"
+            "If the article is relevant (e.g., Indian Policy, Economy, Science, Environment), create a question using the **Statement Format**:\n"
+            "1. **Question Stem:** 'Consider the following statements regarding [Topic]:'\n"
+            "2. **Drafting Statements (The most important part):**\n"
+            "   - Create 2 distinct statements.\n"
+            "   - **Statement 1:** Factual (What happened? e.g., 'The Centre launched Scheme X...').\n"
+            "   - **Statement 2:** Conceptual/Static (Link to syllabus. e.g., 'This scheme falls under the Ministry of Y...').\n"
+            "   - **HOW TO MAKE A STATEMENT WRONG:** Do **NOT** just add 'not'. You MUST swap a specific entity. (e.g., Change 'Ministry of Finance' to 'RBI'. Change '2025' to '2030'. Change 'Constitutional Body' to 'Statutory Body').\n"
+            "   - **LOGIC CHECK:** Statement 1 and Statement 2 MUST NOT contradict each other.\n\n"
             
-            "**FORMAT A: STATEMENT BASED (Preferred for Policy/Economy/Science)**\n"
-            "1. **Question Text:** MUST include the statements inside the text.\n"
-            "   - Example: 'Consider the following statements regarding [Topic]:\\n1. [Statement 1]\\n2. [Statement 2]\\nWhich of the statements given above is/are correct?'\n"
-            "2. **Options:** Use ONLY standard codes: ['1 only', '2 only', 'Both 1 and 2', 'Neither 1 nor 2'].\n"
-            "3. **Explanation:** Analyze the statements. 'Statement 1 is correct because... Statement 2 is incorrect because...'\n\n"
+            "### PHASE 3: THE OPTIONS (STRICT FORMAT)\n"
+            "Use ONLY this standard set of options. Do not invent others.\n"
+            "1. '1 only'\n"
+            "2. '2 only'\n"
+            "3. 'Both 1 and 2'\n"
+            "4. 'Neither 1 nor 2'\n\n"
             
-            "**FORMAT B: DIRECT QUESTION (Preferred for Places/Species/Terms)**\n"
-            "1. **Question Text:** A direct query. 'Which organization released the [Report Name]?'\n"
-            "2. **Options:** Four distinct factual answers. ['World Bank', 'IMF', 'WEF', 'WTO'].\n"
-            "3. **Explanation:** STATE the correct answer explicitly by name. 'The World Bank released this report...' (NEVER say 'Option A is correct').\n\n"
-            
-            "### PHASE 3: SHUFFLE-PROOFING RULES (CRITICAL)\n"
-            "The app shuffles options randomly. Therefore:\n"
-            "1. **NEVER** put the long statements inside the `options` array. Put them in `question_text`.\n"
-            "2. **NEVER** refer to 'Option A', 'Option B', 'The first option' in your explanation.\n"
-            "3. **NEVER** add prefixes like 'A)', '1.', '(a)' inside the `options` strings.\n\n"
-            
-            "### OUTPUT JSON FORMAT\n"
-            "Return a JSON object containing a 'questions' array. Each item:\n"
-            "- question_text (String: Includes the numbered statements if Format A)\n"
-            "- options (Array of 4 strings: Clean text only)\n"
-            "- correct_option (Integer 0-3: Index of the correct string in the options array)\n"
-            "- explanation (String: Logic-based analysis)\n"
-            "- topic (String: e.g., Polity, Economy, IR)\n"
-            "- difficulty (String: 'easy', 'medium', or 'hard' - LOWERCASE)\n"
-            "- source_article_title (String: COPY EXACTLY from input. Do not paraphrase.)\n"
-
+            "### OUTPUT FORMAT (JSON)\n"
+            "Return a JSON object with a 'questions' array. Each item:\n"
+            "- question_text (String: Includes the numbered statements)\n"
+            "- options (Array of 4 strings: EXACTLY as defined above)\n"
+            "- correct_option (Integer 0-3: The index of the correct option based on the truth of your statements)\n"
+            "- explanation (String: Start with 'Statement 1 is [correct/incorrect] because...'. Then 'Statement 2 is [correct/incorrect] because...'. Cite the static concept.)\n"
+            "- topic (String: e.g., Polity, Economy, Environment)\n"
+            "- difficulty (String: 'medium')\n"
+            "- source_article_title (String: COPY EXACTLY from input)\n"
         )
-        
-        # Prepare article summaries for context for the current batch
+
+        # Prepare article summaries
         article_contexts = []
         for article in articles:
-            # Pass a clean identifier for the model to return
             context = f"source_article_title: {article.get('title', '')}\n"
             context += f"summary: {article.get('summary', '')}\n"
             article_contexts.append(context)
 
         user_content = (
-            "Analyze the following news summaries. Apply the STRICT FILTERING rules from the system prompt.\n"
-            "Generate 'Statement-Based' UPSC MCQs only for valid India-centric or Major Global topics.\n"
-            "Ignore articles about Sports, Entertainment, or minor foreign domestic affairs.\n"
-            "Return the result as a valid JSON object.\n\n"
+            "Analyze these news summaries. Apply the STRICT FILTERING rules.\n"
+            "If an article is about UK/US domestic politics or Entertainment, SKIP IT.\n"
+            "For valid Indian/Global topics, generate high-quality UPSC MCQs.\n"
+            "Ensure Statement 1 and 2 are logically distinct.\n"
+            "Return valid JSON.\n\n"
             "News Summaries:\n" + "\n".join(article_contexts)
         )
-        
+
         payload = {
             "model": "llama-3.1-8b-instant",
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
             ],
-            "temperature": 0.3,
+            "temperature": 0.3, # Keep low for logic adherence
             "max_tokens": 8192,
             "response_format": {"type": "json_object"}
         }
-        
+
         # Exponential backoff for rate limit handling
         retries = 3
         backoffs = [10, 20, 30]
         attempt = 0
-        
+
         while True:
             resp = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -1171,26 +1167,34 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> List[dict]:
                 headers=headers,
                 timeout=120,
             )
-            
+
             if resp.status_code == 200:
                 data = resp.json()
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                
+
                 try:
                     # Parse the JSON response
                     questions_data = json.loads(content)
-                    # The response should be a JSON object with a questions array
                     questions = questions_data.get("questions", [])
                     if isinstance(questions, list):
                         return questions
-                    # If model returned a different shape, return empty list for safety
                     return []
                 except Exception as e:
-                    print(f"Groq parse/format error: {e}")
+                    print(f"Groq parse error: {e}")
                     return []
-            # End of request loop
+
+            elif resp.status_code == 429 and attempt < retries:
+                wait_s = backoffs[attempt]
+                attempt += 1
+                time.sleep(wait_s)
+                continue
+            else:
+                print(f"Groq error {resp.status_code}: {resp.text[:200]}")
+                break
+                
     except Exception as e:
-        print(f"Groq quiz generation exception: {e}")
+        print(f"Groq generation exception: {e}")
+    
     return []
     
     try:
