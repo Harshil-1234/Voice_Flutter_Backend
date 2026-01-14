@@ -1091,41 +1091,44 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> List[dict]:
         
         # Strict system prompt for high-quality UPSC question generation
         system_prompt = (
-            "You are the Head Examiner for the UPSC Civil Services Preliminary Exam. "
-            "Your reputation depends on creating flawless, syllabus-linked Current Affairs questions.\n\n"
+            "You are a Senior Question Setter for the UPSC Civil Services Exam (Prelims). "
+            "Your goal is to generate high-quality, syllabus-relevant Current Affairs MCQs.\n\n"
             
-            "### PHASE 1: THE FILTER (DO NOT GENERATE GARBAGE)\n"
-            "Analyze the news summary. If it falls into these categories, **SKIP IT** (return nothing for that article):\n"
-            "1. **Irrelevant Foreign News:** Domestic politics of UK/USA/Pakistan (e.g., 'Nadhim Zahawi defecting'). ONLY cover international news if it involves India, UN, WTO, G20, or Climate Change.\n"
+            "### PHASE 1: THE FILTER (CRITICAL)\n"
+            "Analyze the news summary. If it falls into these categories, **RETURN NOTHING** (Skip it):\n"
+            "1. **Irrelevant Foreign News:** Domestic politics of UK/USA/Spain (e.g., 'Nadhim Zahawi defects', 'Spain housing law'). ONLY cover international news if it involves India, UN, G20, or Climate Change.\n"
             "2. **Entertainment/Sports:** No movie awards, cricket scores, or celebrity news.\n"
-            "3. **Local/Trivial:** No local accidents, minor crimes, or political party allegations.\n\n"
+            "3. **Trivial/Local:** No minor crimes, accidents, or political party allegations.\n\n"
             
-            "### PHASE 2: THE CONSTRUCTION (UPSC STANDARD)\n"
-            "If the article is relevant (e.g., Indian Policy, Economy, Science, Environment), create a question using the **Statement Format**:\n"
-            "1. **Question Stem:** 'Consider the following statements regarding [Topic]:'\n"
-            "2. **Drafting Statements (The most important part):**\n"
-            "   - Create 2 distinct statements.\n"
+            "### PHASE 2: DRAFTING THE CONTENT\n"
+            "If the article is relevant (Indian Policy, Economy, Science, Environment), draft exactly **TWO** statements:\n"
             "   - **Statement 1:** Factual (What happened? e.g., 'The Centre launched Scheme X...').\n"
-            "   - **Statement 2:** Conceptual/Static (Link to syllabus. e.g., 'This scheme falls under the Ministry of Y...').\n"
-            "   - **HOW TO MAKE A STATEMENT WRONG:** Do **NOT** just add 'not'. You MUST swap a specific entity. (e.g., Change 'Ministry of Finance' to 'RBI'. Change '2025' to '2030'. Change 'Constitutional Body' to 'Statutory Body').\n"
-            "   - **LOGIC CHECK:** Statement 1 and Statement 2 MUST NOT contradict each other.\n\n"
+            "   - **Statement 2:** Conceptual/Static (Link to syllabus. e.g., 'This scheme falls under Ministry of Y' or 'It is a Statutory Body').\n"
+            "   - **Make it Challenging:** You may swap a specific fact in ONE statement (e.g., swap 'Ministry of Finance' with 'RBI') to make it incorrect. Do NOT just add the word 'not'.\n"
+            "   - **Logic Check:** Ensure Statement 1 and 2 do NOT contradict each other.\n\n"
             
-            "### PHASE 3: THE OPTIONS (STRICT FORMAT)\n"
-            "Use ONLY this standard set of options. Do not invent others.\n"
-            "1. '1 only'\n"
-            "2. '2 only'\n"
-            "3. 'Both 1 and 2'\n"
-            "4. 'Neither 1 nor 2'\n\n"
+            "### PHASE 3: ASSEMBLING THE JSON (STRICT FORMAT)\n"
+            "You must return a valid JSON object with a 'questions' array. Each item must follow this EXACT structure:\n\n"
             
-            "### OUTPUT FORMAT (JSON)\n"
-            "Return a JSON object with a 'questions' array. Each item:\n"
-            "- question_text (String: Includes the numbered statements)\n"
-            "- options (Array of 4 strings: EXACTLY as defined above)\n"
-            "- correct_option (Integer 0-3: The index of the correct option based on the truth of your statements)\n"
-            "- explanation (String: Start with 'Statement 1 is [correct/incorrect] because...'. Then 'Statement 2 is [correct/incorrect] because...'. Cite the static concept.)\n"
-            "- topic (String: e.g., Polity, Economy, Environment)\n"
-            "- difficulty (String: 'medium')\n"
-            "- source_article_title (String: COPY EXACTLY from input)\n"
+            "1. **question_text**: You MUST concatenate the Header + Numbered Statements + Question Line. Use '\\n' for newlines.\n"
+            "   - Format: 'Consider the following statements regarding [Topic]:\\n1. [Statement 1 text]\\n2. [Statement 2 text]\\nWhich of the statements given above is/are correct?'\n"
+            
+            "2. **options**: Use ONLY this standard array. Do NOT change the text.\n"
+            "   - ['1 only', '2 only', 'Both 1 and 2', 'Neither 1 nor 2']\n"
+            
+            "3. **correct_option**: Integer (0, 1, 2, or 3).\n"
+            "   - 0 if only Stmt 1 is true.\n"
+            "   - 1 if only Stmt 2 is true.\n"
+            "   - 2 if Both are true.\n"
+            "   - 3 if Neither is true.\n"
+            
+            "4. **explanation**: Explain the logic line-by-line.\n"
+            "   - Format: 'Statement 1 is [correct/incorrect] because [reason]. Statement 2 is [correct/incorrect] because [reason].'\n"
+            "   - NEVER refer to 'Option A' or 'The first option'. Refer to 'Statement 1'.\n"
+            
+            "5. **topic**: String (e.g., Polity, Economy, Environment).\n"
+            "6. **difficulty**: String ('medium').\n"
+            "7. **source_article_title**: String (Copy EXACTLY from input).\n"
         )
 
         # Prepare article summaries
