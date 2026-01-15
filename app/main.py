@@ -1080,141 +1080,124 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> List[dict]:
     Generate UPSC-style quiz questions from summarized articles using Groq API.
     Returns a list of question objects with all required fields.
     """
+    # New behavior: call Groq once per article, send title + first 1500 chars of summary,
+    # expect a single JSON object per response, and only keep results where is_relevant==True.
     if not GROQ_API_KEY or not articles:
         return []
-    
-    try:
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        
-        # Strict system prompt for high-quality UPSC question generation
-        system_prompt = (
-            "You are a Senior Question Setter for the UPSC Civil Services Exam (Prelims). "
-            "Your goal is to generate high-quality, syllabus-relevant Current Affairs MCQs.\n\n"
-            
-            "### PHASE 1: THE FILTER (CRITICAL)\n"
-            "Analyze the news summary. If it falls into these categories, **RETURN NOTHING** (Skip it):\n"
-            "1. **Irrelevant Foreign News:** Domestic politics of UK/USA/Spain (e.g., 'Nadhim Zahawi defects', 'Spain housing law'). ONLY cover international news if it involves India, UN, G20, or Climate Change.\n"
-            "2. **Entertainment/Sports:** No movie awards, cricket scores, or celebrity news.\n"
-            "3. **Trivial/Local:** No minor crimes, accidents, or political party allegations.\n\n"
-            
-            "### PHASE 2: DRAFTING THE CONTENT\n"
-            "If the article is relevant (Indian Policy, Economy, Science, Environment), draft exactly **TWO** statements:\n"
-            "   - **Statement 1:** Factual (What happened? e.g., 'The Centre launched Scheme X...').\n"
-            "   - **Statement 2:** Conceptual/Static (Link to syllabus. e.g., 'This scheme falls under Ministry of Y' or 'It is a Statutory Body').\n"
-            "   - **Make it Challenging:** You may swap a specific fact in ONE statement (e.g., swap 'Ministry of Finance' with 'RBI') to make it incorrect. Do NOT just add the word 'not'.\n"
-            "   - **Logic Check:** Ensure Statement 1 and 2 do NOT contradict each other.\n\n"
-            
-            "### PHASE 3: ASSEMBLING THE JSON (STRICT FORMAT)\n"
-            "You must return a valid JSON object with a 'questions' array. Each item must follow this EXACT structure:\n\n"
-            
-            "1. **question_text**: You MUST concatenate the Header + Numbered Statements + Question Line. Use '\\n' for newlines.\n"
-            "   - Format: 'Consider the following statements regarding [Topic]:\\n1. [Statement 1 text]\\n2. [Statement 2 text]\\nWhich of the statements given above is/are correct?'\n"
-            
-            "2. **options**: Use ONLY this standard array. Do NOT change the text.\n"
-            "   - ['1 only', '2 only', 'Both 1 and 2', 'Neither 1 nor 2']\n"
-            
-            "3. **correct_option**: Integer (0, 1, 2, or 3).\n"
-            "   - 0 if only Stmt 1 is true.\n"
-            "   - 1 if only Stmt 2 is true.\n"
-            "   - 2 if Both are true.\n"
-            "   - 3 if Neither is true.\n"
-            
-            "4. **explanation**: Explain the logic line-by-line.\n"
-            "   - Format: 'Statement 1 is [correct/incorrect] because [reason]. Statement 2 is [correct/incorrect] because [reason].'\n"
-            "   - NEVER refer to 'Option A' or 'The first option'. Refer to 'Statement 1'.\n"
-            
-            "5. **topic**: String (e.g., Polity, Economy, Environment).\n"
-            "6. **difficulty**: String ('medium').\n"
-            "7. **source_article_title**: String (Copy EXACTLY from input).\n"
-        )
 
-        # Prepare article summaries
-        article_contexts = []
-        for article in articles:
-            context = f"source_article_title: {article.get('title', '')}\n"
-            context += f"summary: {article.get('summary', '')}\n"
-            article_contexts.append(context)
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-        user_content = (
-            "Analyze these news summaries. Apply the STRICT FILTERING rules.\n"
-            "If an article is about UK/US domestic politics or Entertainment, SKIP IT.\n"
-            "For valid Indian/Global topics, generate high-quality UPSC MCQs.\n"
-            "Ensure Statement 1 and 2 are logically distinct.\n"
-            "Return valid JSON.\n\n"
-            "News Summaries:\n" + "\n".join(article_contexts)
-        )
+    # New system prompt (single-article)
+    system_prompt = (
+        "You are a Senior Question Setter for the UPSC Civil Services Exam (Prelims). "
+        "Your task is to analyze a single news article and generate a high-quality, syllabus-relevant MCQ.\n\n"
+        "### PHASE 1: RELEVANCE FILTER\n"
+        "Analyze the news. Return 'is_relevant': false IF:\n"
+        "1. Political/Partisan (Rallies, allegations).\n"
+        "2. Irrelevant Foreign News (US/UK domestic issues) UNLESS involving India/UN/Climate.\n"
+        "3. Trivial/Sports/Entertainment (Cricket scores, movie awards).\n"
+        "4. Corporate (Stock prices, quarterly results).\n\n"
+        "### PHASE 2: FORMAT SELECTION (If Relevant)\n"
+        "Select the best format:\n"
+        "**TYPE A: Standard Statements** (2-3 statements). Logic: Swap facts/ministries to create traps.\n"
+        "**TYPE B: Pair Matching** (3 pairs, e.g., Place:Country). Logic: Mismatch 1-2 pairs.\n"
+        "**TYPE C: Direct/Term** (Fact-based). Logic: 4 confusing options.\n\n"
+        "### PHASE 3: JSON OUTPUT\n"
+        "Return a SINGLE JSON object:\n"
+        "{\n"
+        "  \"is_relevant\": boolean,\n"
+        "  \"topic\": \"String (Polity/Economy/Env/SciTech/IR)\",\n"
+        "  \"question_type\": \"String\",\n"
+        "  \"question_text\": \"String (Full question with numbered lines/pairs)\",\n"
+        "  \"options\": [\"A\", \"B\", \"C\", \"D\"],\n"
+        "  \"correct_option_index\": Integer (0-3),\n"
+        "  \"explanation\": \"String (Explain why wrong options are wrong)\"\n"
+        "}"
+    )
 
-        payload = {
-            "model": "llama-3.1-8b-instant",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            "temperature": 0.3, # Keep low for logic adherence
-            "max_tokens": 8192,
-            "response_format": {"type": "json_object"}
-        }
+    results: List[dict] = []
 
-        # Exponential backoff for rate limit handling
-        retries = 3
-        backoffs = [10, 20, 30]
-        attempt = 0
+    # Per-article request loop
+    for idx, article in enumerate(articles):
+        try:
+            title = article.get("title", "") or ""
+            summary = (article.get("summary") or "")[:1500]
 
-        while True:
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=120,
-            )
+            user_content = f"Title: {title}\nSummary: {summary}"
 
-            if resp.status_code == 200:
-                data = resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            payload = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0.25,
+                "max_tokens": 1024,
+                "response_format": {"type": "json_object"},
+            }
 
-                try:
-                    # Parse the JSON response
-                    questions_data = json.loads(content)
-                    questions = questions_data.get("questions", [])
-                    if isinstance(questions, list):
-                        return questions
-                    return []
-                except Exception as e:
-                    print(f"Groq parse error: {e}")
-                    return []
+            # Basic retry/backoff for per-article call
+            retries = 3
+            backoffs = [5, 10, 20]
+            attempt = 0
 
-            elif resp.status_code == 429 and attempt < retries:
-                wait_s = backoffs[attempt]
-                attempt += 1
-                time.sleep(wait_s)
-                continue
-            else:
-                print(f"Groq error {resp.status_code}: {resp.text[:200]}")
-                break
-                
-    except Exception as e:
-        print(f"Groq generation exception: {e}")
-    
-    return []
-    
-    try:
-        # Get unique article titles that already have questions
-        result = (
-            client.table("quiz_questions")
-            .select("source_article_id")
-            .in_("source_article_id", source_article_titles)
-            .execute()
-        )
-        
-        existing_titles = {q.get("source_article_id") for q in result.data if q.get("source_article_id")}
-        return existing_titles
-        
-    except Exception as e:
-        print(f"Error checking existing questions: {e}")
-        return set()
+            while True:
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    json=payload,
+                    headers=headers,
+                    timeout=120,
+                )
+
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+                        # Expect a single JSON object
+                        parsed = json.loads(content)
+                        if not isinstance(parsed, dict):
+                            print(f"Groq response for '{title[:60]}' is not a JSON object. Skipping.")
+                            break
+
+                        # If the model explicitly says it's not relevant, skip
+                        if parsed.get("is_relevant") is False:
+                            print(f"Skipped (not relevant): {title}")
+                            break
+
+                        # Only keep relevant items
+                        if parsed.get("is_relevant") is True:
+                            # Ensure the returned dict contains expected fields; inject source_article_title
+                            parsed["source_article_title"] = title
+                            results.append(parsed)
+                        break
+
+                    except Exception as e:
+                        print(f"Groq parse error for '{title[:60]}': {e}")
+                        break
+
+                elif resp.status_code == 429 and attempt < retries:
+                    wait_s = backoffs[attempt]
+                    attempt += 1
+                    print(f"Rate limited on Groq call for '{title[:60]}', retrying in {wait_s}s...")
+                    time.sleep(wait_s)
+                    continue
+                else:
+                    print(f"Groq error {resp.status_code} for '{title[:60]}': {resp.text[:200]}")
+                    break
+
+            # Sleep 4 seconds between requests to respect TPM limit
+            time.sleep(4)
+
+        except Exception as e:
+            print(f"Exception processing article '{article.get('title','')[:60]}': {e}")
+            # Continue to next article on any exception
+            continue
+
+    return results
 
 
 def insert_quiz_questions(questions: List[dict]) -> int:
@@ -1228,13 +1211,17 @@ def insert_quiz_questions(questions: List[dict]) -> int:
     rows = []
     for q in questions:
         try:
+            # Map the new JSON fields to DB columns. The model now returns:
+            # - 'correct_option_index' (int 0-3)
+            # - 'options' (list)
+            # - 'source_article_title' should be present (injected by caller)
             row = {
                 "question_text": q.get("question_text", ""),
                 "options": json.dumps(q.get("options", [])),
-                "correct_answer": q.get("correct_option", 0),
+                "correct_answer": q.get("correct_option_index", q.get("correct_option", 0)),
                 "explanation": q.get("explanation", ""),
-                "topic": q.get("topic", "General").title(),
-                "difficulty": q.get("difficulty", "medium").lower(),
+                "topic": (q.get("topic") or "General").title(),
+                "difficulty": (q.get("difficulty") or "medium").lower(),
                 "source_article_id": q.get("source_article_title", ""),
                 "is_active": True,
                 "created_at": datetime.now().isoformat(),
@@ -1242,9 +1229,13 @@ def insert_quiz_questions(questions: List[dict]) -> int:
             }
             
             # Validate required fields
-            if (row["question_text"] and row["options"] and 
-                len(json.loads(row["options"])) == 4 and 
-                row["explanation"] and row["topic"]):
+            # Validate required fields: text, 4 options, explanation and topic
+            try:
+                options_list = json.loads(row["options"])
+            except Exception:
+                options_list = []
+
+            if (row["question_text"] and options_list and len(options_list) == 4 and row["explanation"] and row["topic"]):
                 rows.append(row)
                 
         except Exception as e:
