@@ -1215,9 +1215,23 @@ def insert_quiz_questions(questions: List[dict]) -> int:
             # - 'correct_option_index' (int 0-3)
             # - 'options' (list)
             # - 'source_article_title' should be present (injected by caller)
+            
+            # Clean prefixes from options (A), B), 1., etc.)
+            raw_options = q.get("options", [])
+            cleaned_options = []
+            if isinstance(raw_options, list):
+                for opt in raw_options:
+                    try:
+                        opt_str = opt if isinstance(opt, str) else str(opt)
+                        # Remove prefixes like "A)", "1.", "(a)", "B-", etc. from the start
+                        cleaned = re.sub(r'^[\s\(]*[A-Da-d1-4][\)\.\-]\s*', '', opt_str).strip()
+                        cleaned_options.append(cleaned)
+                    except Exception:
+                        cleaned_options.append(opt)
+            
             row = {
                 "question_text": q.get("question_text", ""),
-                "options": json.dumps(q.get("options", [])),
+                "options": json.dumps(cleaned_options),
                 "correct_answer": q.get("correct_option_index", q.get("correct_option", 0)),
                 "explanation": q.get("explanation", ""),
                 "topic": (q.get("topic") or "General").title(),
@@ -1228,7 +1242,6 @@ def insert_quiz_questions(questions: List[dict]) -> int:
                 "updated_at": datetime.now().isoformat()
             }
             
-            # Validate required fields
             # Validate required fields: text, 4 options, explanation and topic
             try:
                 options_list = json.loads(row["options"])
