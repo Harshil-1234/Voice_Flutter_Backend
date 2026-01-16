@@ -20,10 +20,10 @@ from pydantic import BaseModel
 from pathlib import Path as PPath
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from transformers import pipeline
 import trafilatura
 from googlenewsdecoder import new_decoderv1
 from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
+from LocalLLMService import get_local_llm_service
 
 
 
@@ -49,7 +49,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # Default batch size set to 20 per requirements
 SUMMARIZE_BATCH_SIZE = int(os.getenv("SUMMARIZE_BATCH_SIZE", "20"))
 
-summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+# Initialize LocalLLMService (Gemma-2-2b-it)
+try:
+    llm_service = get_local_llm_service()
+except Exception as e:
+    print(f"⚠️ Warning: Failed to initialize LocalLLMService: {e}")
+    llm_service = None
 
 # --- NEW RSS INGESTION CONFIG ---
 RSS_TOPIC_IDS = {
@@ -336,75 +341,55 @@ def fetch_article_content(url: str) -> Tuple[Optional[str], str, bool, Optional[
 
 def summarize_text_if_possible(content, titles=None):
     """
-    Summarize text using BART if length is sufficient.
-    - If `content` is a single string → returns a single summary (string or None).
-    - If `content` is a list of strings → returns a list of summaries aligned with input.
+    Summarize text using LocalLLMService (Gemma-2-2b-it).
+    Returns summary + UPSC relevance + tags.
+    - If `content` is a single string → returns a single Dict or None.
+    - If `content` is a list of strings → returns a list of Dicts aligned with input.
     Titles are optional, mainly used for debugging/logging.
-    Skips articles with less than 600 characters as they are not proper news articles.
-    Truncates input text to 2000 characters for performance.
+    No longer skips short articles; sends everything to the local model.
     """
+    if not llm_service:
+        print("⚠️ LocalLLMService not available. Returning None.")
+        return None if isinstance(content, str) else [None] * len(content)
+    
     try:
-        # Truncate content before summarization
-        if isinstance(content, str):
-            content = content[:2000]
-        elif isinstance(content, list):
-            content = [c[:2000] for c in content]
-
         # Case 1: Single string
         if isinstance(content, str):
-            # Skip articles shorter than 100 characters - not proper news articles
-            if not content or len(content) < 100:
+            if not content or not content.strip():
                 return None
-            if len(content.split()) < 30:
-                return None
-
-            summary = summarizer(
-                content,
-                max_length=100,
-                min_length=30,
-                do_sample=False,
-                num_beams=6,
-                no_repeat_ngram_size=3,
-                length_penalty=1.0,
-                early_stopping=True
-            )
-            return summary[0]["summary_text"]
-
+            
+            result = llm_service.analyze_article(content)
+            if result:
+                return result
+            return None
+        
         # Case 2: List of strings
         elif isinstance(content, list):
             results = []
             for idx, text in enumerate(content):
-                # Skip articles shorter than 100 characters - not proper news articles
-                if not text or len(text) < 100:
+                if not text or not text.strip():
                     results.append(None)
                     if titles and idx < len(titles):
-                        print(f"⏭️ Skipped short article (len={len(text) if text else 0}): {titles[idx][:80]}")
+                        print(f"⏭️ Skipped empty article: {titles[idx][:80]}")
                     continue
-                if len(text.split()) < 30:
+                
+                result = llm_service.analyze_article(text)
+                if result:
+                    results.append(result)
+                    # Log summary for debug
+                    if titles and idx < len(titles):
+                        summary = result.get("summary", "")[:80].replace("\n", " ")
+                        relevant = result.get("upsc_relevant", False)
+                        tags = result.get("tags", [])
+                        print(f"✅ Analyzed: {titles[idx][:60]} → Relevant: {relevant}, Tags: {tags}")
+                else:
                     results.append(None)
-                    continue
-                summary = summarizer(
-                    text,
-                    max_length=100,
-                    min_length=30,
-                    do_sample=False,
-                    num_beams=6,
-                    no_repeat_ngram_size=3,
-                    length_penalty=1.0,
-                    early_stopping=True
-                )
-                results.append(summary[0]["summary_text"])
-
-                # optional: log which title got summarized
-                if titles and idx < len(titles):
-                    snippet = summary[0]["summary_text"][:120].replace("\n", " ")
-                    print(f"✅ Summarized: {titles[idx]} → {snippet}...")
-
+            
             return results
-
+        
         else:
             return None
-
+    
     except Exception as e:
         print(f"Summarization error: {e}")
         if isinstance(content, str):
@@ -500,8 +485,8 @@ def call_groq_summarize(titles: List[str], texts: List[str]) -> List[str]:
 
 def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
     """
-    Summarize articles in batches using Groq or local model.
-    Saves each summary individually to Supabase.
+    Summarize articles in batches using LocalLLMService.
+    Saves each summary individually to Supabase along with UPSC tags.
     Returns (num_batches, num_summarized).
     """
     to_sum = []
@@ -510,14 +495,14 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
         # Use the 'content' field which now holds the full text
         full_text = a.get("content", "")
 
-        # Only add articles with at least 600 characters for summarization
-        if full_text and len(full_text) >= 600:
+        # Process all articles (no 600-char minimum anymore)
+        if full_text and full_text.strip():
             to_sum.append((a, title, full_text))
-        elif full_text:
-            print(f"⏭️ Skipping short article for summarization (len={len(full_text)}): {title[:80]}")
+        elif not full_text:
+            print(f"⏭️ Skipping empty article: {title[:80]}")
 
     if not to_sum:
-        print("⚠️ No articles with sufficient text available for summarization.")
+        print("⚠️ No articles with text available for summarization.")
         return (0, 0)
 
     batch_size = 20
@@ -535,21 +520,39 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
         batches += 1
 
         # Align summaries and update Supabase per-article
-        for (article, title, _), summary_text in zip(batch, summaries):
-            if not summary_text:
+        for (article, title, _), result in zip(batch, summaries):
+            if not result:
                 continue
 
             try:
-                url_hash = md5_lower(article["url"])
-                client.table("articles").update({
+                # Extract fields from LocalLLMService result
+                summary_text = result.get("summary", "")
+                upsc_relevant = result.get("upsc_relevant", False)
+                tags = result.get("tags")  # List or None
+                
+                if not summary_text:
+                    continue
+                
+                # Build update dict
+                update_dict = {
                     "summary": summary_text,
                     "summarized": True,
                     "summarization_needed": False,
                     "updated_at": "now()"
-                }).eq("url_hash", url_hash).execute()
+                }
+                
+                # Add UPSC-specific fields if they exist in DB
+                if upsc_relevant is not None:
+                    update_dict["upsc_relevant"] = upsc_relevant
+                if tags is not None:
+                    update_dict["tags"] = json.dumps(tags)
+                
+                url_hash = md5_lower(article["url"])
+                client.table("articles").update(update_dict).eq("url_hash", url_hash).execute()
 
                 summarized_count += 1
-                print(f"✅ Saved summary for: {title[:80]}")
+                tag_str = ", ".join(tags) if tags else "N/A"
+                print(f"✅ Saved summary for: {title[:80]} | Relevant: {upsc_relevant} | Tags: {tag_str}")
             except Exception as e:
                 print(f"⚠️ Error saving summary for {title[:80]}: {e}")
 
@@ -607,19 +610,19 @@ def _prepare_texts(items):
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(build_text, items))
 
-    # Filter out articles with less than 600 characters for BART
+    # No longer filter by 600 characters - LocalLLMService processes everything
     filtered_items = []
     filtered_titles = []
     filtered_texts = []
     
     for item, txt in zip(items, results):
-        if txt and len(txt) >= 600:
+        if txt and txt.strip():
             filtered_items.append(item)
             filtered_titles.append(item.get("title") or "")
             filtered_texts.append(txt)
         else:
             title = item.get("title") or ""
-            print(f"⏭️ Skipping short article for summarization (len={len(txt) if txt else 0}): {title[:80]}")
+            print(f"⏭️ Skipping empty article: {title[:80]}")
     
     return filtered_titles, filtered_texts, filtered_items
 
@@ -651,33 +654,37 @@ def summarize_pending_round_robin(per_category_limit: int = 2, max_cycles: int =
         # Prepare texts (returns filtered items)
         titles, texts, filtered_items = _prepare_texts(combined)
 
-        # Mark short articles (that were filtered out) as not needing summarization
-        filtered_ids = {item.get("id") for item in filtered_items}
-        for item in combined:
-            if item.get("id") not in filtered_ids:
-                # This article was filtered out (too short), mark it as not needing summarization
-                try:
-                    client.table("articles").update({
-                        "summarization_needed": False,
-                        "updated_at": "now()"
-                    }).eq("id", item["id"]).execute()
-                except Exception as e:
-                    print(f"⚠️ Error marking short article as not needing summarization: {e}")
+        # With LocalLLMService, we process everything, so no need to mark short articles
+        # All articles in combined should be in filtered_items
 
-        # Summarize in one go (model batches over all categories)
+        # Summarize in one go (model processes all texts)
         summaries = summarize_text_if_possible(texts, titles) or []
 
         # Persist results (use filtered_items which aligns with summaries)
-        for item, summary_text in zip(filtered_items, summaries):
-            if not summary_text:
+        for item, result in zip(filtered_items, summaries):
+            if not result:
                 continue
             try:
-                client.table("articles").update({
+                summary_text = result.get("summary", "")
+                upsc_relevant = result.get("upsc_relevant", False)
+                tags = result.get("tags")
+                
+                if not summary_text:
+                    continue
+                
+                update_dict = {
                     "summary": summary_text,
                     "summarized": True,
                     "summarization_needed": False,
                     "updated_at": "now()"
-                }).eq("id", item["id"]).execute()
+                }
+                
+                if upsc_relevant is not None:
+                    update_dict["upsc_relevant"] = upsc_relevant
+                if tags is not None:
+                    update_dict["tags"] = json.dumps(tags)
+                
+                client.table("articles").update(update_dict).eq("id", item["id"]).execute()
                 total_updated += 1
             except Exception as e:
                 print(f"Save summary error for id={item.get('id')}: {e}")
@@ -983,24 +990,25 @@ def smart_ingest_all_categories():
             article_data["summarization_needed"] = False
             print(f"📹 Detected video, saving with description as summary: {article.get('title')}")
         else:
-            # 3. Flag Logic for regular articles
+            # 3. Flag Logic for regular articles (with LocalLLMService, no 600-char minimum)
             summary = None
             summarization_needed = False
 
-            # Scenario A: Good content exists
-            if content and len(content) > 600:
+            # If we have any content, queue for summarization
+            if content:
                 summarization_needed = True
                 article_data["content"] = content
-                print(f"📝 Article has good content, queued for summarization: {article.get('title')}")
+                print(f"📝 Article has content, queued for LocalLLM summarization: {article.get('title')}")
             
-            # Scenario B: Short content or fallback to description
+            # If no content but have description, use it
             elif desc:
                 summary = desc # Fallback to description as summary
-                # Keep content if it exists, even if short. Otherwise, use desc.
-                article_data["content"] = content if content else desc
-                print(f"📝 Using description as summary (content short or missing): {article.get('title')}")
-            else: # Only short content, no desc
-                article_data["content"] = content
+                article_data["content"] = desc
+                print(f"📝 Using description as summary (content missing): {article.get('title')}")
+            else:
+                # No content and no description - nothing to work with
+                print(f"⏭️ Skipping article (no content or description): {article.get('title')}")
+                return
 
 
             # Final flag assignment
