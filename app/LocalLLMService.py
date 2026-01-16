@@ -68,11 +68,15 @@ class LocalLLMService:
         """Download and load the Gemma-2-2b-it GGUF model."""
         try:
             logger.info(f"Loading {MODEL_FILENAME} from {HF_REPO_ID}...")
+            logger.info(f"Cache directory: {CACHE_DIR}")
+            logger.info(f"Threads: {N_THREADS}, GPU layers: {N_GPU_LAYERS}, Context: {CONTEXT_SIZE}")
             
             # Ensure cache directory exists
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            logger.info(f"✅ Cache directory ready: {CACHE_DIR}")
             
             # Download model from Hugging Face if not cached
+            logger.info(f"Starting model download from HuggingFace...")
             model_path = hf_hub_download(
                 repo_id=HF_REPO_ID,
                 filename=MODEL_FILENAME,
@@ -80,9 +84,11 @@ class LocalLLMService:
                 resume_download=True
             )
             
-            logger.info(f"✅ Model downloaded to: {model_path}")
+            logger.info(f"✅ Model file ready at: {model_path}")
+            logger.info(f"   File size: {os.path.getsize(model_path) / 1024 / 1024:.1f} MB")
             
             # Load model with llama-cpp-python
+            logger.info(f"Initializing llama-cpp-python with model...")
             self.model = Llama(
                 model_path=model_path,
                 n_gpu_layers=N_GPU_LAYERS,  # CPU only
@@ -92,15 +98,27 @@ class LocalLLMService:
             )
             
             logger.info(
-                f"✅ Model loaded successfully. "
-                f"Context: {CONTEXT_SIZE}, GPU layers: {N_GPU_LAYERS}, "
-                f"Threads: {N_THREADS}"
+                f"✅ Model loaded successfully! "
+                f"Ready for inference."
             )
         
+        except ImportError as e:
+            logger.error(f"❌ ImportError: {e}")
+            logger.error("This likely means llama-cpp-python is not installed.")
+            logger.error("Install with: pip install llama-cpp-python")
+            raise RuntimeError(
+                f"llama-cpp-python import failed: {e}\n"
+                "Install with: pip install llama-cpp-python"
+            ) from e
+        
         except Exception as e:
-            logger.error(f"❌ Error loading model: {e}")
+            logger.error(f"❌ Error loading model: {type(e).__name__}: {e}")
+            import traceback
+            logger.error("Full traceback:")
+            logger.error(traceback.format_exc())
             raise RuntimeError(
                 f"Failed to load Gemma-2-2b-it model: {e}\n"
+                f"Error type: {type(e).__name__}\n"
                 "Make sure you have llama-cpp-python installed:\n"
                 "pip install llama-cpp-python"
             ) from e

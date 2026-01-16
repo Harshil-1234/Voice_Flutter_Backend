@@ -52,8 +52,15 @@ SUMMARIZE_BATCH_SIZE = int(os.getenv("SUMMARIZE_BATCH_SIZE", "20"))
 # Initialize LocalLLMService (Gemma-2-2b-it)
 try:
     llm_service = get_local_llm_service()
+    print("✅ LocalLLMService initialized successfully")
 except Exception as e:
-    print(f"⚠️ Warning: Failed to initialize LocalLLMService: {e}")
+    print(f"❌ CRITICAL ERROR: Failed to initialize LocalLLMService")
+    print(f"Error type: {type(e).__name__}")
+    print(f"Error message: {e}")
+    import traceback
+    print("Full traceback:")
+    traceback.print_exc()
+    print("⚠️ WARNING: Falling back to None - articles will NOT be summarized!")
     llm_service = None
 
 # --- NEW RSS INGESTION CONFIG ---
@@ -349,7 +356,9 @@ def summarize_text_if_possible(content, titles=None):
     No longer skips short articles; sends everything to the local model.
     """
     if not llm_service:
-        print("⚠️ LocalLLMService not available. Returning None.")
+        print("❌ CRITICAL: LocalLLMService is None - model not loaded!")
+        print("   Check startup logs for initialization errors.")
+        print("   Skipping summarization for this batch.")
         return None if isinstance(content, str) else [None] * len(content)
     
     try:
