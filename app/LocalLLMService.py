@@ -35,8 +35,8 @@ from huggingface_hub import hf_hub_download
 logger = logging.getLogger(__name__)
 
 # Model configuration
-HF_REPO_ID = "second-state/Gemma-2-2b-it-GGUF"
-MODEL_FILENAME = "Gemma-2-2b-it-Q4_K_M.gguf"
+HF_REPO_ID = "bartowski/gemma-2-2b-it-GGUF"
+MODEL_FILENAME = "gemma-2-2b-it-Q4_K_M.gguf"
 CACHE_DIR = Path.home() / ".cache" / "llm_models"
 CONTEXT_SIZE = 4096
 N_GPU_LAYERS = 0  # CPU only
