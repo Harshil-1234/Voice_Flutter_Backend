@@ -170,7 +170,10 @@ class LocalLLMService:
             "1. Write a 80-word concise summary.\n"
             "2. Determine boolean 'upsc_relevant' based on strict criteria above.\n"
             "3. If True, add tags (e.g., ['GS-2', 'Polity']). If False, set tags: null.\n"
-            "4. Return ONLY valid JSON: {'summary': '...', 'upsc_relevant': bool, 'tags': [...]}"
+            "4. Return ONLY valid JSON. **IMPORTANT: Use DOUBLE QUOTES (\") for all keys and strings.** Do not use single quotes.\n"
+            "   ✅ GOOD: {\"summary\": \"India's economy...\", \"upsc_relevant\": true}\n"
+            "   ❌ BAD: {'summary': 'India's economy...', 'upsc_relevant': True}\n\n"
+
         )
         
         try:
