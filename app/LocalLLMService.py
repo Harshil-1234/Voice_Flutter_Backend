@@ -255,12 +255,15 @@ class LocalLLMService:
     
     @staticmethod
     def _validate_result(result: Dict) -> bool:
-        """Validate result has required keys."""
-        required_keys = {"summary", "upsc_relevant", "tags"}
+        """
+        Validate result has required keys and correct types.
+        Automatically sets missing 'tags' to None if not provided.
+        """
+        required_keys = {"summary", "upsc_relevant"}
         if not isinstance(result, dict):
             return False
         
-        # Check all required keys exist
+        # Check all required keys exist (tags is optional, defaults to None)
         if not all(k in result for k in required_keys):
             return False
         
@@ -269,9 +272,14 @@ class LocalLLMService:
             return False
         if not isinstance(result.get("upsc_relevant"), bool):
             return False
-        tags = result.get("tags")
-        if tags is not None and not isinstance(tags, list):
-            return False
+        
+        # Tags validation: if missing, set to None; if present, must be list or None
+        if "tags" not in result:
+            result["tags"] = None
+        else:
+            tags = result.get("tags")
+            if tags is not None and not isinstance(tags, list):
+                return False
         
         return True
     
