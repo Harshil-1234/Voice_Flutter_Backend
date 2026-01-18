@@ -214,73 +214,40 @@ class LocalLLMService:
     @staticmethod
     def _parse_json_response(response_text: str) -> Dict:
         """
-        Extract and parse JSON from response text.
+        Extract and parse JSON from response text using regex-based extraction.
         
         Handles:
         1. Markdown code blocks (```json ... ```)
-        2. Python-style dictionaries with single quotes
-        3. Standard JSON with double quotes
-        4. Regex extraction of {...} blocks as fallback
+        2. Surrounding text before/after JSON
+        3. Python-style dictionaries with single quotes
+        4. Standard JSON with double quotes
         
         Returns:
             Parsed dictionary or empty dict if parsing fails
         """
-        if not response_text or not response_text.strip():
-            logger.warning("Empty response text provided to _parse_json_response.")
+        # 1. Regex to find the JSON object (starts with { and ends with })
+        # This handles Markdown wrappers, "Here is your JSON:", etc. automatically.
+        match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        
+        if not match:
+            logger.warning(f"No JSON object found in response: {response_text[:100]}...")
             return {}
-        
-        # Step 1: Strip Markdown code blocks
-        cleaned_text = response_text.strip()
-        
-        # Remove ```json ... ``` or ``` ... ```
-        if "```" in cleaned_text:
-            # Match ```json...``` or ```...```
-            match = re.search(r'```(?:json)?\s*(.*?)\s*```', cleaned_text, re.DOTALL)
-            if match:
-                cleaned_text = match.group(1).strip()
-        
-        # Step 2: Try standard JSON parsing (handles double quotes)
+
+        json_str = match.group(0)
+
+        # 2. Try standard JSON parse (Double Quotes)
         try:
-            return json.loads(cleaned_text)
-        except json.JSONDecodeError as e:
-            logger.debug(f"Standard JSON parsing failed: {e}")
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
         
-        # Step 3: Try ast.literal_eval (handles single quotes and Python-style dicts)
+        # 3. Try Python literal eval (Single Quotes - Common with Gemma)
         try:
-            result = ast.literal_eval(cleaned_text)
-            if isinstance(result, dict):
-                return result
-        except (ValueError, SyntaxError) as e:
-            logger.debug(f"ast.literal_eval failed: {e}")
-        
-        # Step 4: Fallback - regex extract {...} block and retry
-        try:
-            # Find the first { and last } and extract that substring
-            match = re.search(r'\{.*\}', cleaned_text, re.DOTALL)
-            if match:
-                extracted = match.group(0).strip()
-                
-                # Try JSON parsing on extracted block
-                try:
-                    return json.loads(extracted)
-                except json.JSONDecodeError:
-                    pass
-                
-                # Try ast.literal_eval on extracted block
-                try:
-                    result = ast.literal_eval(extracted)
-                    if isinstance(result, dict):
-                        return result
-                except (ValueError, SyntaxError):
-                    pass
-        except Exception as e:
-            logger.debug(f"Regex extraction fallback failed: {e}")
-        
-        # All parsing attempts failed
-        logger.warning(
-            f"Could not parse JSON from response. "
-            f"Text (first 300 chars): {response_text[:300]}"
-        )
+            return ast.literal_eval(json_str)
+        except (ValueError, SyntaxError):
+            pass
+            
+        logger.warning(f"Parsing failed for extracted string: {json_str[:100]}...")
         return {}
     
     @staticmethod
