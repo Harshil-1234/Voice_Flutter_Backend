@@ -42,7 +42,7 @@ MODEL_FILENAME = "gemma-2-2b-it-Q4_K_M.gguf"
 CACHE_DIR = Path.home() / ".cache" / "llm_models"
 CONTEXT_SIZE = 4096
 N_GPU_LAYERS = 0  # CPU only
-N_THREADS = 4  # Adjust based on your CPU core count
+N_THREADS = 2  # Adjust based on your CPU core count
 
 
 class LocalLLMService:
@@ -142,7 +142,7 @@ class LocalLLMService:
         
         Returns:
             Dict with keys:
-            - summary (str): 60-word concise summary
+            - summary (str): 80-word concise summary
             - upsc_relevant (bool): True if relevant to UPSC Civil Services
             - tags (List[str] | None): UPSC tags if relevant, else None
         
@@ -162,15 +162,15 @@ class LocalLLMService:
         text = text[:max_length]
         
         system_prompt = (
-            "You are a UPSC Exam Expert. Analyze this news article.\n\n"
-            "Your task:\n"
-            "1. Write a 60-word concise summary (factual, no opinions).\n"
-            "2. Evaluate relevance to UPSC Civil Services Syllabus (GS-1, GS-2, GS-3, GS-4).\n"
-            "3. Return ONLY valid JSON (no other text):\n"
-            "{'summary': '...', 'upsc_relevant': bool, 'tags': ['GS-x', 'Topic']}\n\n"
-            "If irrelevant (Sports, Entertainment, Local Crime, Partisan Politics), "
-            "set upsc_relevant: false and tags: null.\n"
-            "If relevant, set upsc_relevant: true and tags: list of applicable tags."
+            "You are a strict UPSC Civil Services Exam Gatekeeper. Analyze this news article.\n\n"
+            "Criteria for 'upsc_relevant':\n"
+            "✅ TRUE ONLY IF: It involves National Policy (Govt Schemes), Supreme Court Rulings, Economy (RBI/GDP), International Relations (G20/UN), or Science/Environment (ISRO/Climate).\n"
+            "❌ FALSE IF: It is Local Crime, Accidents, Sports results, Celebrity/Movie news, or partisan political rallies.\n\n"
+            "Your Task:\n"
+            "1. Write a 80-word concise summary.\n"
+            "2. Determine boolean 'upsc_relevant' based on strict criteria above.\n"
+            "3. If True, add tags (e.g., ['GS-2', 'Polity']). If False, set tags: null.\n"
+            "4. Return ONLY valid JSON: {'summary': '...', 'upsc_relevant': bool, 'tags': [...]}"
         )
         
         try:
