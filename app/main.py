@@ -409,86 +409,15 @@ def summarize_text_if_possible(content, titles=None):
 
 def call_groq_summarize(titles: List[str], texts: List[str]) -> List[str]:
     """
-    Summarize multiple articles in one Groq API call. Returns a list of concise
-    2–3 sentence paragraphs in the same order as inputs. If Groq is unavailable,
-    returns empty list.
+    DEPRECATED: This function is no longer used.
+    All summarization is now handled by LocalLLMService (Gemma-2-2b-it).
+    
+    This function remains for backward compatibility but should NOT be called.
+    Returns empty list immediately to prevent any accidental Groq API usage.
     """
-    if not GROQ_API_KEY:
-        return []
-    try:
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        # System prompt: concise 2–3 sentence paragraphs, no bullet points
-        system_prompt = (
-            "You are a concise summarization assistant. Summarize news articles into clear 2–3 sentence paragraphs. "
-            "No bullet points. Return ONLY the summary text, never include the original article content."
-        )
-
-        # Build a single user message containing all articles, separated by a delimiter
-        # Ask model to return one paragraph per article, in order, separated by the same delimiter
-        delimiter = "\n\n===\n\n"
-        parts: List[str] = []
-        for idx, (t, x) in enumerate(zip(titles, texts), start=1):
-            safe_t = t or ""
-            safe_x = x or ""
-            parts.append(f"Article {idx}:\nTitle: {safe_t}\nContent: {safe_x[:2000]}") # Truncate input
-        user_instruction = (
-            "Summarize the following news articles. Return exactly one paragraph per article, "
-            "in the same order, separated by the delimiter '" + delimiter.strip() + "'. "
-            "Each summary must be 2–3 sentences (50–60 words). Do not use bullet points. "
-            "IMPORTANT: Return ONLY the summary, not the original article content."
-        )
-        user_content = user_instruction + "\n\n" + delimiter.join(parts)
-
-        payload = {
-            "model": "llama-3.1-8b-instant",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": 0.2,
-            # Scale max tokens with batch size to stay within limits
-            "max_tokens": max(1024, min(4096, max(1, len(titles)) * 80)),
-        }
-
-        # Exponential backoff for rate limit handling (429)
-        retries = 3
-        backoffs = [10, 20, 30]
-        attempt = 0
-        while True:
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=60,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                msg = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                if not msg:
-                    return []
-                result = msg.strip()
-                # Split by delimiter into summaries; if counts mismatch, best-effort alignment
-                chunks = [c.strip() for c in result.split(delimiter) if c.strip()]
-                # Ensure length matches inputs; pad or trim if needed
-                if len(chunks) < len(titles):
-                    chunks.extend([""] * (len(titles) - len(chunks)))
-                elif len(chunks) > len(titles):
-                    chunks = chunks[: len(titles)]
-                return chunks
-            elif resp.status_code == 429 and attempt < retries:
-                wait_s = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
-                attempt += 1
-                print(f"Groq rate limit reached (429). Retrying in {wait_s}s (attempt {attempt}/{retries}).")
-                time.sleep(wait_s)
-                continue
-            else:
-                print(f"Groq summarize error {resp.status_code}: {resp.text[:200]}")
-                break
-    except Exception as e:
-        print(f"Groq summarize exception: {e}")
+    print("⚠️ WARNING: call_groq_summarize() called but is DISABLED!")
+    print("   Summarization is now exclusively using LocalLLMService (Gemma-2-2b-it).")
+    print("   Returning empty list to prevent Groq API usage.")
     return []
 
 

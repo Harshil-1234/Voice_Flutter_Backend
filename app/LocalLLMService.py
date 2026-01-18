@@ -139,17 +139,22 @@ class LocalLLMService:
         """
         Analyze article text for summary, UPSC relevance, and tags.
         
+        Implements "Enhance Mode" for short articles:
+        - Tier 3 (< 30 words): Reject as garbage (headline-only)
+        - Tier 1 (30-300 words): Enhance mode - rewrite as professional brief
+        - Tier 2 (> 300 words): Full analysis - UPSC relevance + summary + tags
+        
         Args:
             text: Article content to analyze
             max_length: Truncate input to this length (characters)
         
         Returns:
             Dict with keys:
-            - summary (str): 80-word concise summary
+            - summary (str): Enhanced brief or concise summary
             - upsc_relevant (bool): True if relevant to UPSC Civil Services
             - tags (List[str] | None): UPSC tags if relevant, else None
         
-        Returns empty dict on error.
+        Returns empty dict on error or for garbage content (< 30 words).
         """
         if not text or not text.strip():
             logger.warning("Empty text provided to analyze_article.")
@@ -164,23 +169,48 @@ class LocalLLMService:
         # Truncate text to save tokens
         text = text[:max_length]
         
-        system_prompt = (
-            "You are a strict UPSC Civil Services Exam Gatekeeper. Analyze this news article.\n\n"
-            "Criteria for 'upsc_relevant':\n"
-            "✅ TRUE ONLY IF: It involves National Policy (Govt Schemes), Supreme Court Rulings, Economy (RBI/GDP), International Relations (G20/UN), or Science/Environment (ISRO/Climate).\n"
-            "❌ FALSE IF: It is Local Crime, Accidents, Sports results, Celebrity/Movie news, or partisan political rallies.\n\n"
-            "Your Task:\n"
-            "1. Write a 80-word concise summary.\n"
-            "2. Determine boolean 'upsc_relevant' based on strict criteria above.\n"
-            "3. If True, add tags (e.g., ['GS-2', 'Polity']). If False, set tags: null.\n"
-            "4. Return ONLY valid JSON. **IMPORTANT: Use DOUBLE QUOTES (\") for all keys and strings.** Do not use single quotes.\n"
-            "   ✅ GOOD: {\"summary\": \"India's economy...\", \"upsc_relevant\": true}\n"
-            "   ❌ BAD: {'summary': 'India's economy...', 'upsc_relevant': True}\n\n"
-
-        )
+        # Count words to determine processing tier
+        word_count = len(text.split())
+        logger.info(f"Article word count: {word_count}")
+        
+        # TIER 3: Garbage (< 30 words) - Reject
+        if word_count < 30:
+            logger.warning(f"Article too short ({word_count} words). Rejecting as garbage.")
+            return {}
+        
+        # TIER 1: Short/Snippet (30-300 words) - Enhance Mode
+        if 30 <= word_count <= 300:
+            logger.info(f"Short article ({word_count} words). Using Enhance Mode.")
+            system_prompt = (
+                "You are a News Editor. The input is a short news snippet. Your task:\n\n"
+                "1. Rewrite it into a smooth, professional news brief (80-120 words).\n"
+                "2. Remove any HTML artifacts, 'read more' text, or formatting noise.\n"
+                "3. Do NOT just repeat the headline. Make it sound like a complete story.\n"
+                "4. Evaluate if it's relevant to UPSC Civil Services (National Policy, Court Rulings, Economy, International Relations, Science/Environment).\n"
+                "5. Return ONLY valid JSON with DOUBLE QUOTES:\n"
+                "   {\"summary\": \"...\", \"upsc_relevant\": true/false, \"tags\": [\"GS-x\", \"Topic\"] or null}\n\n"
+                "IMPORTANT: Use DOUBLE QUOTES (\") for all keys and values. No single quotes."
+            )
+        
+        # TIER 2: Full Article (> 300 words) - Full Analysis
+        else:
+            logger.info(f"Full article ({word_count} words). Using UPSC Analysis Mode.")
+            system_prompt = (
+                "You are a strict UPSC Civil Services Exam Gatekeeper. Analyze this news article.\n\n"
+                "Criteria for 'upsc_relevant':\n"
+                "✅ TRUE ONLY IF: It involves National Policy (Govt Schemes), Supreme Court Rulings, Economy (RBI/GDP), International Relations (G20/UN), or Science/Environment (ISRO/Climate).\n"
+                "❌ FALSE IF: It is Local Crime, Accidents, Sports results, Celebrity/Movie news, or partisan political rallies.\n\n"
+                "Your Task:\n"
+                "1. Write a 80-word concise summary.\n"
+                "2. Determine boolean 'upsc_relevant' based on strict criteria above.\n"
+                "3. If True, add tags (e.g., ['GS-2', 'Polity']). If False, set tags: null.\n"
+                "4. Return ONLY valid JSON. **IMPORTANT: Use DOUBLE QUOTES (\") for all keys and strings.** Do not use single quotes.\n"
+                "   ✅ GOOD: {\"summary\": \"India's economy...\", \"upsc_relevant\": true}\n"
+                "   ❌ BAD: {'summary': 'India's economy...', 'upsc_relevant': True}\n\n"
+            )
         
         try:
-            # FIX: Combine System + User into one prompt block to avoid "System role not supported" error
+            # Combine System + User into one prompt block
             combined_prompt = f"{system_prompt}\n\nArticle Text:\n{text}"
             
             # CRITICAL FIX: Lock ensures only one thread accesses the model at a time
