@@ -42,8 +42,8 @@ MODEL_FILENAME = "gemma-2-2b-it-Q4_K_M.gguf"
 CACHE_DIR = Path.home() / ".cache" / "llm_models"
 CONTEXT_SIZE = 2048
 N_GPU_LAYERS = 0  # CPU only
-N_THREADS = 4  # Adjust based on your CPU core count
-
+N_THREADS = 2  # Adjust based on your CPU core count
+n_batch=512
 
 class LocalLLMService:
     """Encapsulates local LLM inference via llama-cpp-python for article analysis."""
@@ -190,7 +190,7 @@ class LocalLLMService:
                 ],
                 temperature=0.3,
                 top_p=0.9,
-                max_tokens=512
+                max_tokens=1024
             )
             
             # Extract response text
@@ -224,6 +224,7 @@ class LocalLLMService:
         2. Surrounding text before/after JSON
         3. Python-style dictionaries with single quotes
         4. Standard JSON with double quotes
+        5. Truncated JSON (attempts to repair by closing braces)
         
         Returns:
             Parsed dictionary or empty dict if parsing fails
@@ -236,7 +237,13 @@ class LocalLLMService:
             logger.warning(f"No JSON object found in response: {response_text[:100]}...")
             return {}
 
-        json_str = match.group(0)
+        json_str = match.group(0).strip()
+
+        # Heuristic: If it doesn't end with '}', try closing it
+        # This handles truncated JSON from token limits
+        if not json_str.endswith("}"):
+            json_str += "}"
+            logger.debug("Attempted to repair truncated JSON by adding closing brace")
 
         # 2. Try standard JSON parse (Double Quotes)
         try:
