@@ -42,7 +42,7 @@ MODEL_FILENAME = "gemma-2-2b-it-Q4_K_M.gguf"
 CACHE_DIR = Path.home() / ".cache" / "llm_models"
 CONTEXT_SIZE = 4096
 N_GPU_LAYERS = 0  # CPU only
-N_THREADS = 2  # Adjust based on your CPU core count
+N_THREADS = 4  # Adjust based on your CPU core count
 
 
 class LocalLLMService:
