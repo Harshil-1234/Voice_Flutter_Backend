@@ -171,22 +171,16 @@ class LocalLLMService:
             "If relevant, set upsc_relevant: true and tags: list of applicable tags."
         )
         
-        user_message = f"Analyze this news:\n\n{text}"
-        
         try:
-            # Construct prompt for chat completion
-            prompt = f"{system_prompt}\n\nUser: {user_message}\n\nAssistant:"
+            # FIX: Combine System + User into one prompt block to avoid "System role not supported" error
+            combined_prompt = f"{system_prompt}\n\nArticle Text:\n{text}"
             
-            # Call llama-cpp-python for inference
+            # Call llama-cpp-python for inference using ONLY 'user' role
             response = self.model.create_chat_completion(
                 messages=[
                     {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
                         "role": "user",
-                        "content": user_message
+                        "content": combined_prompt
                     }
                 ],
                 temperature=0.3,
