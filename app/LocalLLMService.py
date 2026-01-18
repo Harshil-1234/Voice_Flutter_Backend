@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Dict, Optional
 from pathlib import Path
 
@@ -62,6 +63,7 @@ class LocalLLMService:
         if self._initialized:
             return
         
+        self.lock = threading.Lock()
         self._initialized = True
         self.model = None
         self._load_model()
@@ -181,19 +183,21 @@ class LocalLLMService:
             # FIX: Combine System + User into one prompt block to avoid "System role not supported" error
             combined_prompt = f"{system_prompt}\n\nArticle Text:\n{text}"
             
-            # Call llama-cpp-python for inference using ONLY 'user' role
-            response = self.model.create_chat_completion(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": combined_prompt
-                    }
-                ],
-                temperature=0.2,   # Low temp = Strict JSON, less hallucination
-                top_p=0.95,        # Slightly higher than 0.9 to allow natural summaries
-                max_tokens=1024,   # CRITICAL: Increased from 512 to prevent JSON cutoff
-                repeat_penalty=1.1 # Prevents the AI from repeating sentences
-            )
+            # CRITICAL FIX: Lock ensures only one thread accesses the model at a time
+            # This prevents segmentation faults from concurrent C++ inference calls
+            with self.lock:
+                response = self.model.create_chat_completion(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": combined_prompt
+                        }
+                    ],
+                    temperature=0.2,   # Low temp = Strict JSON, less hallucination
+                    top_p=0.95,        # Slightly higher than 0.9 to allow natural summaries
+                    max_tokens=1024,   # CRITICAL: Increased from 512 to prevent JSON cutoff
+                    repeat_penalty=1.1 # Prevents the AI from repeating sentences
+                )
             
             # Extract response text
             response_text = response["choices"][0]["message"]["content"].strip()
