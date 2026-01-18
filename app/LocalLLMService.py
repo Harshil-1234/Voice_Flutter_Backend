@@ -40,10 +40,10 @@ logger = logging.getLogger(__name__)
 HF_REPO_ID = "bartowski/gemma-2-2b-it-GGUF"
 MODEL_FILENAME = "gemma-2-2b-it-Q4_K_M.gguf"
 CACHE_DIR = Path.home() / ".cache" / "llm_models"
-CONTEXT_SIZE = 2048
-N_GPU_LAYERS = 0  # CPU only
-N_THREADS = 2  # Adjust based on your CPU core count
-n_batch=512
+CONTEXT_SIZE = 4096      # Gemma supports up to 8k, but 4k is safe and covers long articles
+N_GPU_LAYERS = 0         # CPU only
+N_THREADS = 3            # Leave 1 vCPU free for the API/Database
+N_BATCH = 512            # Process prompt in smaller chunks to prevent RAM spikes
 
 class LocalLLMService:
     """Encapsulates local LLM inference via llama-cpp-python for article analysis."""
@@ -93,10 +93,11 @@ class LocalLLMService:
             logger.info(f"Initializing llama-cpp-python with model...")
             self.model = Llama(
                 model_path=model_path,
-                n_gpu_layers=N_GPU_LAYERS,  # CPU only
+                n_gpu_layers=N_GPU_LAYERS,
                 n_ctx=CONTEXT_SIZE,
                 n_threads=N_THREADS,
-                verbose=False  # Set to True for debug logs
+                n_batch=N_BATCH,    # Crucial for stability
+                verbose=False       # Set to True only if debugging crashes
             )
             
             logger.info(
@@ -188,9 +189,10 @@ class LocalLLMService:
                         "content": combined_prompt
                     }
                 ],
-                temperature=0.3,
-                top_p=0.9,
-                max_tokens=1024
+                temperature=0.2,   # Low temp = Strict JSON, less hallucination
+                top_p=0.95,        # Slightly higher than 0.9 to allow natural summaries
+                max_tokens=1024,   # CRITICAL: Increased from 512 to prevent JSON cutoff
+                repeat_penalty=1.1 # Prevents the AI from repeating sentences
             )
             
             # Extract response text
