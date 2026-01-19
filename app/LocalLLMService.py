@@ -25,15 +25,14 @@ import threading
 from typing import Dict, Optional
 from pathlib import Path
 
-try:
-    from llama_cpp import Llama
-except ImportError:
-    raise ImportError(
-        "llama-cpp-python is not installed. "
-        "Install with: pip install llama-cpp-python"
-    )
+"""
+LocalLLMService: Manages local LLM inference via llama-cpp-python for text analysis.
+"""
 
-from huggingface_hub import hf_hub_download
+import logging
+import threading
+from typing import Dict
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -41,225 +40,189 @@ logger = logging.getLogger(__name__)
 HF_REPO_ID = "bartowski/gemma-2-2b-it-GGUF"
 MODEL_FILENAME = "gemma-2-2b-it-Q4_K_M.gguf"
 CACHE_DIR = Path.home() / ".cache" / "llm_models"
-# Gemma supports up to 8k, but 4k is safe and covers long articles
 CONTEXT_SIZE = 4096
-N_GPU_LAYERS = 0         # CPU only
-N_THREADS = 3            # Leave 1 vCPU free for the API/Database
-N_BATCH = 512            # Process prompt in smaller chunks to prevent RAM spikes
+N_GPU_LAYERS = 0
+N_THREADS = 3
+N_BATCH = 512
 
 
 class LocalLLMService:
     """Encapsulates local LLM inference via llama-cpp-python for article analysis."""
 
-    _instance = None  # Singleton instance
+    _instance = None
 
     def __new__(cls):
-        """Implement singleton pattern."""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            """
-            LocalLLMService: Manages local LLM inference via llama-cpp-python for text analysis.
-            """
+            cls._instance._initialized = False
+        return cls._instance
 
-            import ast
-            import json
-            import logging
-            import os
-            import re
-            import threading
-            from typing import Dict, Optional
-            from pathlib import Path
+    def __init__(self):
+        if self._initialized:
+            return
+        self.lock = threading.Lock()
+        self._initialized = True
+        self.model = None
+        self._load_model()
 
-            try:
-                from llama_cpp import Llama
-            except ImportError:
-                raise ImportError(
-                    "llama-cpp-python is not installed. Install with: pip install llama-cpp-python"
-                )
-
+    def _load_model(self):
+        try:
+            # Local import to avoid failing module import if llama-cpp-python is not installed
+            from llama_cpp import Llama
             from huggingface_hub import hf_hub_download
 
-            logger = logging.getLogger(__name__)
+            logger.info(f"Loading {MODEL_FILENAME} from {HF_REPO_ID}...")
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            model_path = hf_hub_download(
+                repo_id=HF_REPO_ID, filename=MODEL_FILENAME, cache_dir=str(CACHE_DIR), resume_download=True
+            )
 
-            # Model configuration
-            HF_REPO_ID = "bartowski/gemma-2-2b-it-GGUF"
-            MODEL_FILENAME = "gemma-2-2b-it-Q4_K_M.gguf"
-            CACHE_DIR = Path.home() / ".cache" / "llm_models"
-            CONTEXT_SIZE = 4096
-            N_GPU_LAYERS = 0
-            N_THREADS = 3
-            N_BATCH = 512
+            self.model = Llama(
+                model_path=model_path,
+                n_gpu_layers=N_GPU_LAYERS,
+                n_ctx=CONTEXT_SIZE,
+                n_threads=N_THREADS,
+                n_batch=N_BATCH,
+                verbose=False,
+            )
+            logger.info("Model loaded successfully.")
+        except ImportError as e:
+            logger.error("llama-cpp-python is not installed or could not be imported.")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            raise
 
+    def _check_model_loaded(self):
+        if self.model is None:
+            raise RuntimeError("Model not loaded. Check logs for loading errors.")
 
-            class LocalLLMService:
-                """Encapsulates local LLM inference via llama-cpp-python for article analysis."""
+    def analyze_article(self, text: str, max_length: int = 2048) -> Dict:
+        """Analyze article and return dict with keys: summary, upsc_relevant, tags."""
+        if not text or not text.strip():
+            logger.warning("Empty text provided to analyze_article.")
+            return {"summary": "", "upsc_relevant": False, "tags": None}
 
-                _instance = None
+        self._check_model_loaded()
+        text = text[:max_length]
+        word_count = len(text.split())
+        logger.info(f"Article word count: {word_count}")
 
-                def __new__(cls):
-                    if cls._instance is None:
-                        cls._instance = super().__new__(cls)
-                        cls._instance._initialized = False
-                    return cls._instance
+        if word_count < 30:
+            logger.warning(f"Article too short ({word_count} words). Rejecting as garbage.")
+            return {}
 
-                def __init__(self):
-                    if self._initialized:
-                        return
-                    self.lock = threading.Lock()
-                    self._initialized = True
-                    self.model = None
-                    self._load_model()
+        # Use the UPSC Analysis prompt for all non-garbage articles.
+        system_prompt = (
+            "You are a senior editor for a news app that serves both general readers and UPSC aspirants. Your goal is to provide balanced summaries and filter news for UPSC relevance based on direct impact on India.\n\n"
+            "### 1. EVALUATION CRITERIA (UPSC_RELEVANT)\n"
+            "TRUE ONLY IF: The news involves National Policy (Govt Schemes), Supreme Court/Judicial Rulings, Indian Economy (RBI/GDP/Budget), International Relations (specifically involving India or impacting India's strategic interests), Science/Environment (ISRO/Climate/Pollution), Internal Security (Defense/Terrorism in India), or Governance.\n"
+            "FALSE IF: It is local crime, accidents, sports, celebrity news, partisan political rallies, or internal affairs of foreign countries that have NO direct strategic, economic, or diplomatic consequence for India.\n\n"
+            "### 2. TAGGING DICTIONARY\n"
+            "If 'upsc_relevant' is true, you MUST use ONLY these tags from this fixed list: Papers: [\"GS-1\", \"GS-2\", \"GS-3\", \"GS-4\"] and Categories: [\"Polity\", \"Economy\", \"IR\", \"Environment\", \"Science\", \"Security\", \"Geography\", \"History\", \"Society\", \"Ethics\"]\n"
+            "If 'upsc_relevant' is false, return 'TAGS' as NONE.\n\n"
+            "### MANDATORY TASKS\n"
+            "1. summary: Write a 80-word concise summary.\n"
+            "2. UPSC_RELEVANT: TRUE or FALSE.\n"
+            "3. TAGS: Comma-separated tags from the Tagging Dictionary, or NONE.\n\n"
+            "### OUTPUT FORMAT (Strictly Follow This):\n"
+            "SUMMARY: [Write the 80-word summary here]\n"
+            "UPSC_RELEVANT: [TRUE or FALSE]\n"
+            "TAGS: [Tag1, Tag2, Tag3] (or NONE)\n\n"
+            "Return ONLY the text in the format above; do NOT return JSON or code fences."
+        )
 
-                def _load_model(self):
-                    try:
-                        logger.info(f"Loading {MODEL_FILENAME} from {HF_REPO_ID}...")
-                        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                        model_path = hf_hub_download(
-                            repo_id=HF_REPO_ID, filename=MODEL_FILENAME, cache_dir=str(CACHE_DIR), resume_download=True
-                        )
-                        self.model = Llama(
-                            model_path=model_path,
-                            n_gpu_layers=N_GPU_LAYERS,
-                            n_ctx=CONTEXT_SIZE,
-                            n_threads=N_THREADS,
-                            n_batch=N_BATCH,
-                            verbose=False,
-                        )
-                        logger.info("Model loaded successfully.")
-                    except Exception as e:
-                        logger.error(f"Failed to load model: {e}")
-                        raise
+        try:
+            combined_prompt = f"{system_prompt}\n\nArticle Text:\n{text}"
+            with self.lock:
+                response = self.model.create_chat_completion(
+                    messages=[{"role": "user", "content": combined_prompt}],
+                    temperature=0.2,
+                    top_p=0.95,
+                    max_tokens=1024,
+                    repeat_penalty=1.1,
+                )
 
-                def _check_model_loaded(self):
-                    if self.model is None:
-                        raise RuntimeError("Model not loaded. Check logs for loading errors.")
+            response_text = response["choices"][0]["message"]["content"].strip()
+            if not response_text:
+                logger.warning("Empty response from model.")
+                return {}
 
-                def analyze_article(self, text: str, max_length: int = 2048) -> Dict:
-                    """Analyze article and return dict with keys: summary, upsc_relevant, tags."""
-                    if not text or not text.strip():
-                        logger.warning("Empty text provided to analyze_article.")
-                        return {"summary": "", "upsc_relevant": False, "tags": None}
+            result = self._parse_custom_format(response_text)
+            if self._validate_result(result):
+                return result
+            else:
+                logger.warning(f"Invalid response structure: {result}")
+                return {}
 
-                    self._check_model_loaded()
-                    text = text[:max_length]
-                    word_count = len(text.split())
-                    logger.info(f"Article word count: {word_count}")
+        except Exception as e:
+            logger.error(f"Error during analyze_article: {e}")
+            return {}
 
-                    if word_count < 30:
-                        logger.warning(f"Article too short ({word_count} words). Rejecting as garbage.")
-                        return {}
+    @staticmethod
+    def _parse_custom_format(text: str) -> Dict:
+        result = {"summary": "", "upsc_relevant": False, "tags": []}
+        lines = text.split('\n')
+        current_section = None
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if line.upper().startswith("SUMMARY:"):
+                current_section = "summary"
+                result["summary"] = line.split("SUMMARY:", 1)[1].strip()
+            elif line.upper().startswith("UPSC_RELEVANT:"):
+                val = line.split("UPSC_RELEVANT:", 1)[1].strip().upper()
+                result["upsc_relevant"] = (val == "TRUE")
+            elif line.upper().startswith("TAGS:"):
+                tags_str = line.split("TAGS:", 1)[1].strip()
+                if tags_str and "NONE" not in tags_str.upper():
+                    result["tags"] = [t.strip() for t in tags_str.split(",") if t.strip()]
+            elif current_section == "summary":
+                result["summary"] += " " + line
 
-                    # Use the UPSC Analysis prompt for all non-garbage articles.
-                    logger.info(f"Full article ({word_count} words). Using UPSC Analysis Mode.")
-                    system_prompt = (
-                        "You are a senior editor for a news app that serves both general readers and UPSC aspirants. Your goal is to provide balanced summaries and filter news for UPSC relevance based on direct impact on India.\n\n"
-                        "### 1. EVALUATION CRITERIA (UPSC_RELEVANT)\n"
-                        "TRUE ONLY IF: The news involves National Policy (Govt Schemes), Supreme Court/Judicial Rulings, Indian Economy (RBI/GDP/Budget), International Relations (specifically involving India or impacting India's strategic interests), Science/Environment (ISRO/Climate/Pollution), Internal Security (Defense/Terrorism in India), or Governance.\n"
-                        "FALSE IF: It is local crime, accidents, sports, celebrity news, partisan political rallies, or internal affairs of foreign countries that have NO direct strategic, economic, or diplomatic consequence for India.\n\n"
-                        "### 2. TAGGING DICTIONARY\n"
-                        "If 'upsc_relevant' is true, you MUST use ONLY these tags from this fixed list: Papers: [\"GS-1\", \"GS-2\", \"GS-3\", \"GS-4\"] and Categories: [\"Polity\", \"Economy\", \"IR\", \"Environment\", \"Science\", \"Security\", \"Geography\", \"History\", \"Society\", \"Ethics\"]\n"
-                        "If 'upsc_relevant' is false, return 'TAGS' as NONE.\n\n"
-                        "### MANDATORY TASKS\n"
-                        "1. summary: Write a 80-word concise summary.\n"
-                        "2. UPSC_RELEVANT: TRUE or FALSE.\n"
-                        "3. TAGS: Comma-separated tags from the Tagging Dictionary, or NONE.\n\n"
-                        "### OUTPUT FORMAT (Strictly Follow This):\n"
-                        "SUMMARY: [Write the 80-word summary here]\n"
-                        "UPSC_RELEVANT: [TRUE or FALSE]\n"
-                        "TAGS: [Tag1, Tag2, Tag3] (or NONE)\n\n"
-                        "Return ONLY the text in the format above; do NOT return JSON or code fences."
-                    )
+        if not result["summary"]:
+            return {}
+        return result
 
-                    try:
-                        combined_prompt = f"{system_prompt}\n\nArticle Text:\n{text}"
-                        with self.lock:
-                            response = self.model.create_chat_completion(
-                                messages=[{"role": "user", "content": combined_prompt}],
-                                temperature=0.2,
-                                top_p=0.95,
-                                max_tokens=1024,
-                                repeat_penalty=1.1,
-                            )
+    @staticmethod
+    def _validate_result(result: Dict) -> bool:
+        required_keys = {"summary", "upsc_relevant"}
+        if not isinstance(result, dict):
+            return False
+        if not all(k in result for k in required_keys):
+            return False
+        if not isinstance(result.get("summary"), str):
+            return False
+        if not isinstance(result.get("upsc_relevant"), bool):
+            return False
+        if "tags" not in result:
+            result["tags"] = None
+        else:
+            tags = result.get("tags")
+            if tags is not None and not isinstance(tags, list):
+                return False
+        return True
 
-                        response_text = response["choices"][0]["message"]["content"].strip()
-                        if not response_text:
-                            logger.warning("Empty response from model.")
-                            return {}
-
-                        result = self._parse_custom_format(response_text)
-                        if self._validate_result(result):
-                            return result
-                        else:
-                            logger.warning(f"Invalid response structure: {result}")
-                            return {}
-
-                    except Exception as e:
-                        logger.error(f"Error during analyze_article: {e}")
-                        return {}
-
-                @staticmethod
-                def _parse_custom_format(text: str) -> Dict:
-                    result = {"summary": "", "upsc_relevant": False, "tags": []}
-                    lines = text.split('\n')
-                    current_section = None
-                    for line in lines:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if line.upper().startswith("SUMMARY:"):
-                            current_section = "summary"
-                            result["summary"] = line.split("SUMMARY:", 1)[1].strip()
-                        elif line.upper().startswith("UPSC_RELEVANT:"):
-                            val = line.split("UPSC_RELEVANT:", 1)[1].strip().upper()
-                            result["upsc_relevant"] = (val == "TRUE")
-                        elif line.upper().startswith("TAGS:"):
-                            tags_str = line.split("TAGS:", 1)[1].strip()
-                            if tags_str and "NONE" not in tags_str.upper():
-                                result["tags"] = [t.strip() for t in tags_str.split(",") if t.strip()]
-                        elif current_section == "summary":
-                            result["summary"] += " " + line
-
-                    if not result["summary"]:
-                        return {}
-                    return result
-
-                @staticmethod
-                def _validate_result(result: Dict) -> bool:
-                    required_keys = {"summary", "upsc_relevant"}
-                    if not isinstance(result, dict):
-                        return False
-                    if not all(k in result for k in required_keys):
-                        return False
-                    if not isinstance(result.get("summary"), str):
-                        return False
-                    if not isinstance(result.get("upsc_relevant"), bool):
-                        return False
-                    if "tags" not in result:
-                        result["tags"] = None
-                    else:
-                        tags = result.get("tags")
-                        if tags is not None and not isinstance(tags, list):
-                            return False
-                    return True
-
-                def cleanup(self):
-                    if self.model:
-                        del self.model
-                        self.model = None
-                        logger.info("Model cleaned up.")
+    def cleanup(self):
+        if self.model:
+            del self.model
+            self.model = None
+            logger.info("Model cleaned up.")
 
 
-            # Convenience functions
-            _service = None
+# Convenience functions
+_service = None
 
 
-            def get_local_llm_service() -> LocalLLMService:
-                global _service
-                if _service is None:
-                    _service = LocalLLMService()
-                return _service
+def get_local_llm_service() -> LocalLLMService:
+    global _service
+    if _service is None:
+        _service = LocalLLMService()
+    return _service
 
 
-            def analyze_article(text: str) -> Dict:
-                service = get_local_llm_service()
-                return service.analyze_article(text)
+def analyze_article(text: str) -> Dict:
+    service = get_local_llm_service()
+    return service.analyze_article(text)
+
