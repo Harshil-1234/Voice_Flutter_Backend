@@ -149,40 +149,26 @@ class LocalLLMService:
                         logger.warning(f"Article too short ({word_count} words). Rejecting as garbage.")
                         return {}
 
-                    if 30 <= word_count <= 300:
-                        logger.info(f"Short article ({word_count} words). Using Enhance Mode.")
-                        system_prompt = (
-                            "You are a News Editor. The input is a short news snippet. Your task:\n\n"
-                            "1. Rewrite it into a smooth, professional news brief (60 words).\n"
-                            "2. Remove any HTML artifacts, 'read more' text, or formatting noise.\n"
-                            "3. Do NOT just repeat the headline. Make it sound like a complete story.\n"
-                            "4. Evaluate if it's relevant to UPSC Civil Services (National Policy, Court Rulings, Economy, International Relations, Science/Environment).\n\n"
-                            "### OUTPUT FORMAT (Strictly Follow This):\n"
-                            "SUMMARY: [Write the 60-word summary here]\n"
-                            "UPSC_RELEVANT: [TRUE or FALSE]\n"
-                            "TAGS: [Tag1, Tag2, Tag3] (or NONE)\n\n"
-                            "Return ONLY the text in the format above; do NOT return JSON or code fences."
-                        )
-                    else:
-                        logger.info(f"Full article ({word_count} words). Using UPSC Analysis Mode.")
-                        system_prompt = (
-                            "You are a senior editor for a news app that serves both general readers and UPSC aspirants. Your goal is to provide balanced summaries and filter news for UPSC relevance based on direct impact on India.\n\n"
-                            "### 1. EVALUATION CRITERIA (UPSC_RELEVANT)\n"
-                            "TRUE ONLY IF: The news involves National Policy (Govt Schemes), Supreme Court/Judicial Rulings, Indian Economy (RBI/GDP/Budget), International Relations (specifically involving India or impacting India's strategic interests), Science/Environment (ISRO/Climate/Pollution), Internal Security (Defense/Terrorism in India), or Governance.\n"
-                            "FALSE IF: It is local crime, accidents, sports, celebrity news, partisan political rallies, or internal affairs of foreign countries that have NO direct strategic, economic, or diplomatic consequence for India.\n\n"
-                            "### 2. TAGGING DICTIONARY\n"
-                            "If 'upsc_relevant' is true, you MUST use ONLY these tags from this fixed list: Papers: [\"GS-1\", \"GS-2\", \"GS-3\", \"GS-4\"] and Categories: [\"Polity\", \"Economy\", \"IR\", \"Environment\", \"Science\", \"Security\", \"Geography\", \"History\", \"Society\", \"Ethics\"]\n"
-                            "If 'upsc_relevant' is false, return 'TAGS' as NONE.\n\n"
-                            "### MANDATORY TASKS\n"
-                            "1. summary: Write a 80-word concise summary.\n"
-                            "2. UPSC_RELEVANT: TRUE or FALSE.\n"
-                            "3. TAGS: Comma-separated tags from the Tagging Dictionary, or NONE.\n\n"
-                            "### OUTPUT FORMAT (Strictly Follow This):\n"
-                            "SUMMARY: [Write the 80-word summary here]\n"
-                            "UPSC_RELEVANT: [TRUE or FALSE]\n"
-                            "TAGS: [Tag1, Tag2, Tag3] (or NONE)\n\n"
-                            "Return ONLY the text in the format above; do NOT return JSON or code fences."
-                        )
+                    # Use the UPSC Analysis prompt for all non-garbage articles.
+                    logger.info(f"Full article ({word_count} words). Using UPSC Analysis Mode.")
+                    system_prompt = (
+                        "You are a senior editor for a news app that serves both general readers and UPSC aspirants. Your goal is to provide balanced summaries and filter news for UPSC relevance based on direct impact on India.\n\n"
+                        "### 1. EVALUATION CRITERIA (UPSC_RELEVANT)\n"
+                        "TRUE ONLY IF: The news involves National Policy (Govt Schemes), Supreme Court/Judicial Rulings, Indian Economy (RBI/GDP/Budget), International Relations (specifically involving India or impacting India's strategic interests), Science/Environment (ISRO/Climate/Pollution), Internal Security (Defense/Terrorism in India), or Governance.\n"
+                        "FALSE IF: It is local crime, accidents, sports, celebrity news, partisan political rallies, or internal affairs of foreign countries that have NO direct strategic, economic, or diplomatic consequence for India.\n\n"
+                        "### 2. TAGGING DICTIONARY\n"
+                        "If 'upsc_relevant' is true, you MUST use ONLY these tags from this fixed list: Papers: [\"GS-1\", \"GS-2\", \"GS-3\", \"GS-4\"] and Categories: [\"Polity\", \"Economy\", \"IR\", \"Environment\", \"Science\", \"Security\", \"Geography\", \"History\", \"Society\", \"Ethics\"]\n"
+                        "If 'upsc_relevant' is false, return 'TAGS' as NONE.\n\n"
+                        "### MANDATORY TASKS\n"
+                        "1. summary: Write a 80-word concise summary.\n"
+                        "2. UPSC_RELEVANT: TRUE or FALSE.\n"
+                        "3. TAGS: Comma-separated tags from the Tagging Dictionary, or NONE.\n\n"
+                        "### OUTPUT FORMAT (Strictly Follow This):\n"
+                        "SUMMARY: [Write the 80-word summary here]\n"
+                        "UPSC_RELEVANT: [TRUE or FALSE]\n"
+                        "TAGS: [Tag1, Tag2, Tag3] (or NONE)\n\n"
+                        "Return ONLY the text in the format above; do NOT return JSON or code fences."
+                    )
 
                     try:
                         combined_prompt = f"{system_prompt}\n\nArticle Text:\n{text}"
@@ -276,5 +262,4 @@ class LocalLLMService:
 
             def analyze_article(text: str) -> Dict:
                 service = get_local_llm_service()
-                return service.analyze_article(text)
                 return service.analyze_article(text)
