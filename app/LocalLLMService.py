@@ -223,7 +223,10 @@ class LocalLLMService:
                 3.⁠ ⁠tags: An array of strings from the Tagging Dictionary. If false, return [].
 
                 ### 4. OUTPUT FORMAT (STRICT JSON)
-                Return ONLY a valid JSON object. Do not include markdown code blocks (```json), no preambles, and no conversational text. Use double quotes (") for all keys and strings.
+                Return ONLY a valid JSON object. Do not include markdown code blocks (```json), no preambles, and no conversational text.
+                **IMPORTANT: Use DOUBLE QUOTES (\") for all keys and strings.** Do not use single quotes.\n"
+                "   ✅ GOOD: {\"summary\": \"India's economy...\", \"upsc_relevant\": true}\n"
+                "   ❌ BAD: {'summary': 'India's economy...', 'upsc_relevant': True}\n\n"
                 {
                     "summary": "string",
                     "upsc_relevant": boolean,
