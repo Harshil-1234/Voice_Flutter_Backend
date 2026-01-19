@@ -425,6 +425,7 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
     """
     Summarize articles in batches using LocalLLMService.
     Saves each summary individually to Supabase along with UPSC tags.
+    Only processes articles with content > 600 characters.
     Returns (num_batches, num_summarized).
     """
     to_sum = []
@@ -433,14 +434,16 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
         # Use the 'content' field which now holds the full text
         full_text = a.get("content", "")
 
-        # Process all articles (no 600-char minimum anymore)
-        if full_text and full_text.strip():
+        # GEMMA FILTER: Only take articles with more than 600 characters
+        if full_text and len(full_text.strip()) > 600:
             to_sum.append((a, title, full_text))
+        elif full_text and len(full_text.strip()) <= 600:
+            print(f"⏭️ Rejecting short article ({len(full_text.strip())} chars): {title[:80]}")
         elif not full_text:
             print(f"⏭️ Skipping empty article: {title[:80]}")
 
     if not to_sum:
-        print("⚠️ No articles with text available for summarization.")
+        print("⚠️ No articles with >600 characters available for summarization.")
         return (0, 0)
 
     batch_size = 20
@@ -928,21 +931,33 @@ def smart_ingest_all_categories():
             article_data["summarization_needed"] = False
             print(f"📹 Detected video, saving with description as summary: {article.get('title')}")
         else:
-            # 3. Flag Logic for regular articles (with LocalLLMService, no 600-char minimum)
+            # 3. Flag Logic for regular articles (with LocalLLMService, require 600+ characters)
             summary = None
             summarization_needed = False
 
-            # If we have any content, queue for summarization
+            # If we have content, check if it meets the 600-character minimum for Gemma
             if content:
-                summarization_needed = True
-                article_data["content"] = content
-                print(f"📝 Article has content, queued for LocalLLM summarization: {article.get('title')}")
+                if len(content.strip()) > 600:
+                    # Content is sufficient - queue for summarization
+                    summarization_needed = True
+                    article_data["content"] = content
+                    print(f"📝 Article has {len(content.strip())} chars, queued for LocalLLM summarization: {article.get('title')}")
+                else:
+                    # Content is too short - reject and don't save
+                    print(f"⏭️ Rejecting article ({len(content.strip())} chars < 600): {article.get('title')}")
+                    return
             
-            # If no content but have description, use it
+            # If no content but have description, check its length
             elif desc:
-                summary = desc # Fallback to description as summary
-                article_data["content"] = desc
-                print(f"📝 Using description as summary (content missing): {article.get('title')}")
+                if len(desc.strip()) > 600:
+                    # Description is sufficient - use it
+                    summary = desc
+                    article_data["content"] = desc
+                    print(f"📝 Using long description as summary ({len(desc.strip())} chars): {article.get('title')}")
+                else:
+                    # Description too short - reject and don't save
+                    print(f"⏭️ Rejecting article (description {len(desc.strip())} chars < 600): {article.get('title')}")
+                    return
             else:
                 # No content and no description - nothing to work with
                 print(f"⏭️ Skipping article (no content or description): {article.get('title')}")
