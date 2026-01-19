@@ -469,11 +469,18 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
                 # Extract fields from LocalLLMService result
                 summary_text = result.get("summary", "")
                 upsc_relevant = result.get("upsc_relevant", False)
-                tags = result.get("tags")  # List or None
-                
+                tags = result.get("tags", [])
+
+                # FIX: Force tags to None if not relevant
+                if not upsc_relevant:
+                    tags = None
+                # Also force None if the list is empty (to avoid empty badges in UI)
+                elif isinstance(tags, list) and not tags:
+                    tags = None
+
                 if not summary_text:
                     continue
-                
+
                 # Build update dict
                 update_dict = {
                     "summary": summary_text,
@@ -481,12 +488,15 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
                     "summarization_needed": False,
                     "updated_at": "now()"
                 }
-                
+
                 # Add UPSC-specific fields if they exist in DB
                 if upsc_relevant is not None:
                     update_dict["upsc_relevant"] = upsc_relevant
                 if tags is not None:
                     update_dict["tags"] = json.dumps(tags)
+                else:
+                    # Explicitly set NULL in DB to clear any old tags
+                    update_dict["tags"] = None
                 
                 url_hash = md5_lower(article["url"])
                 client.table("articles").update(update_dict).eq("url_hash", url_hash).execute()
