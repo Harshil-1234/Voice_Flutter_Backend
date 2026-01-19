@@ -254,7 +254,8 @@ class LocalLLMService:
                     max_tokens=1024,   # CRITICAL: Increased from 512 to prevent JSON cutoff
                     repeat_penalty=1.1  # Prevents the AI from repeating sentences
                 )
-
+            
+            print("LLM Response: ",response)
             # Extract response text
             response_text = response["choices"][0]["message"]["content"].strip(
             )
