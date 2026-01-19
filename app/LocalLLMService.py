@@ -278,53 +278,46 @@ class LocalLLMService:
             return {}
 
     @staticmethod
-    def _parse_json_response(response_text: str) -> Dict:
+    def _parse_json_response(self, response_text: str) -> Dict:
         """
-        Extract and parse JSON from response text using regex-based extraction.
-
-        Handles:
-        1. Markdown code blocks (```json ... ```)
-        2. Surrounding text before/after JSON
-        3. Python-style dictionaries with single quotes
-        4. Standard JSON with double quotes
-        5. Truncated JSON (attempts to repair by closing braces)
-
-        Returns:
-            Parsed dictionary or empty dict if parsing fails
+        Tries to find JSON. If it fails, treats the entire response as a summary.
+        This prevents 'KeyError: summary' in your UI.
         """
-        # 1. Regex to find the JSON object (starts with { and ends with })
-        # This handles Markdown wrappers, "Here is your JSON:", etc. automatically.
+        # 1. Look for a JSON-like structure in the text
         match = re.search(r"\{.*\}", response_text, re.DOTALL)
 
-        if not match:
-            logger.warning(
-                f"No JSON object found in response: {response_text[:100]}...")
-            return {}
+        if match:
+            json_str = match.group(0).strip()
+            
+            # Simple repair for truncated text
+            if not json_str.endswith("}"):
+                json_str += "}"
 
-        json_str = match.group(0).strip()
+            # Try Standard JSON (Double Quotes)
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                pass
 
-        # Heuristic: If it doesn't end with '}', try closing it
-        # This handles truncated JSON from token limits
-        if not json_str.endswith("}"):
-            json_str += "}"
-            logger.debug(
-                "Attempted to repair truncated JSON by adding closing brace")
+            # Try Python Literal (Single Quotes - Common with Gemma-2)
+            try:
+                import ast
+                return ast.literal_eval(json_str)
+            except (ValueError, SyntaxError):
+                pass
 
-        # 2. Try standard JSON parse (Double Quotes)
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            pass
-
-        # 3. Try Python literal eval (Single Quotes - Common with Gemma)
-        try:
-            return ast.literal_eval(json_str)
-        except (ValueError, SyntaxError):
-            pass
-
-        logger.warning(
-            f"Parsing failed for extracted string: {json_str[:100]}...")
-        return {}
+        # 2. FINAL FALLBACK: If we reach here, no JSON was found or parsed.
+        # We treat the entire raw output as a summary to avoid crashing the app.
+        logger.warning("No valid JSON found. Using raw response as summary fallback.")
+        
+        # Remove common markdown fluff if present
+        clean_text = response_text.replace("```json", "").replace("```", "").strip()
+        
+        return {
+            "summary": clean_text,
+            "upsc_relevant": False, # Assume false if it failed to format
+            "tags": []
+        }
 
     @staticmethod
     def _validate_result(result: Dict) -> bool:
