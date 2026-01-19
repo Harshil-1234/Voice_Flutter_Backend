@@ -983,6 +983,14 @@ def smart_ingest_all_categories():
 
         # Immediately upsert the article to the database
         try:
+            # Handle tags: convert empty list or non-relevant to None so DB stores NULL
+            tags = article_data.get("tags")
+            upsc_relevant = article_data.get("upsc_relevant", False)
+            if not upsc_relevant or not tags:
+                tags_processed = None
+            else:
+                tags_processed = tags
+
             row_to_insert = {
                 "url": article_data.get("url"),
                 "title": article_data.get("title"),
@@ -997,9 +1005,12 @@ def smart_ingest_all_categories():
                 "summary": article_data.get("summary"),
                 "summarized": article_data.get("summarized", False),
                 "summarization_needed": article_data.get("summarization_needed", False),
+                # include tags explicitly (may be None to force NULL in DB)
+                "tags": (json.dumps(tags_processed) if tags_processed is not None else None),
             }
 
-            row_to_insert = {k: v for k, v in row_to_insert.items() if v is not None}
+            # Keep all non-None values, but keep 'tags' even if it's None (to write NULL)
+            row_to_insert = {k: v for k, v in row_to_insert.items() if v is not None or k == "tags"}
             
             client.table("articles").upsert(row_to_insert, on_conflict="title").execute()
             print(f"✅ Saved initial data for: {article_data.get('title', 'No Title')[:60]}")
