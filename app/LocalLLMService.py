@@ -259,6 +259,8 @@ class LocalLLMService:
             response_text = response["choices"][0]["message"]["content"].strip(
             )
 
+            print("***** 1st response: ",response_text)
+
             if not response_text:
                 logger.warning("Empty response from model.")
                 return {}
