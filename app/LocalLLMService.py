@@ -203,53 +203,37 @@ class LocalLLMService:
         else:
             logger.info(
                 f"Full article ({word_count} words). Using UPSC Analysis Mode.")
-            system_prompt = """
-                You are a senior editor for a UPSC-focused news platform.
-
-                TASK:
-                Write a concise 80-word summary and evaluate UPSC relevance based ONLY on direct impact on India.
-
-                UPSC RELEVANCE CRITERIA:
-                TRUE ONLY IF the news involves:
-                - National policy or governance
-                - Supreme Court / Constitutional matters
-                - Indian economy (RBI, Budget, GDP, fiscal policy, trade)
-                - International relations involving India
-                - Science or environment policy (ISRO, climate, pollution, energy)
-                - Internal security or defense
-
-                FALSE IF:
-                - Accidents, local crime, celebrities, sports
-                - Internal politics of foreign countries
-                - Human-interest stories without national policy or strategic impact
-
-                TAGS RULES:
-                If upsc_relevant is true:
-                - First tag MUST be one of: "GS-1", "GS-2", "GS-3", "GS-4"
-                - Second tag MUST be one of:
-                ["Polity", "Economy", "IR", "Environment", "Science", "Security", "Geography", "History", "Society", "Ethics"]
-
-                If false:
-                - tags MUST be []
-
-                OUTPUT FORMAT — STRICT:
-                You MUST respond ONLY in this format:
-
-                <json>
-                {
-                "summary": "Write the summary here",
-                "upsc_relevant": false,
-                "tags": []
-                }
-                </json>
-
-                RULES:
-                - Output must start with <json>
-                - Output must end with </json>
-                - Use DOUBLE QUOTES only
-                - No markdown
-                - No explanations
+            system_prompt = (
             """
+                You are a senior editor for a news app that serves both general readers and UPSC aspirants. Your goal is to provide balanced summaries and filter news for UPSC relevance based on direct impact on India.
+
+                ### 1. EVALUATION CRITERIA (UPSC_RELEVANT)
+                •⁠  ⁠TRUE ONLY IF: The news involves National Policy (Govt Schemes), Supreme Court/Judicial Rulings, Indian Economy (RBI/GDP/Budget), International Relations (specifically involving India or impacting India's strategic interests), Science/Environment (ISRO/Climate/Pollution), Internal Security (Defense/Terrorism in India), or Governance.
+                •⁠  ⁠FALSE IF: It is local crime, accidents, sports, celebrity news, partisan political rallies, or internal affairs of foreign countries (e.g., US local policy, UK elections) that have NO direct strategic, economic, or diplomatic consequence for India.
+
+                ### 2. TAGGING DICTIONARY
+                If 'upsc_relevant' is true, you MUST use ONLY these tags from this fixed list:
+                •⁠  ⁠Papers: ["GS-1", "GS-2", "GS-3", "GS-4"]
+                •⁠  ⁠Categories: ["Polity", "Economy", "IR", "Environment", "Science", "Security", "Geography", "History", "Society", "Ethics"]
+                If 'upsc_relevant' is false, return 'tags' as an empty array [].
+
+                ### 3.  MANDATORY TASKS
+                1.⁠ ⁠summary: Write a 80-word concise summary..
+                2.⁠ ⁠upsc_relevant: Set to true or false.
+                3.⁠ ⁠tags: An array of strings from the Tagging Dictionary. If false, return [].
+
+                ### 4. OUTPUT FORMAT (STRICT JSON)
+                Return ONLY a valid JSON object. Do not include markdown code blocks (```json), no preambles, and no conversational text.
+                **IMPORTANT: Use DOUBLE QUOTES (\") for all keys and strings.** Do not use single quotes.\n"
+                "   ✅ GOOD: {\"summary\": \"India's economy...\", \"upsc_relevant\": true}\n"
+                "   ❌ BAD: {'summary': 'India's economy...', 'upsc_relevant': True}\n\n"
+                {
+                    "summary": "string",
+                    "upsc_relevant": boolean,
+                    "tags": ["string"]
+                }
+            """
+            )
 
         try:
             # Combine System + User into one prompt block
@@ -297,21 +281,54 @@ class LocalLLMService:
             return {}
 
     @staticmethod
-    @staticmethod
     def _parse_json_response(response_text: str) -> Dict:
-        try:
-            match = re.search(r"<json>\s*(\{.*?\})\s*</json>", response_text, re.DOTALL)
-            if not match:
-                logger.warning("No <json> wrapper found in response")
-                return {}
+        """
+        Extract and parse JSON from response text using regex-based extraction.
 
-            json_str = match.group(1)
-            return json.loads(json_str)
+        Handles:
+        1. Markdown code blocks (```json ... ```)
+        2. Surrounding text before/after JSON
+        3. Python-style dictionaries with single quotes
+        4. Standard JSON with double quotes
+        5. Truncated JSON (attempts to repair by closing braces)
 
-        except Exception as e:
-            logger.warning(f"JSON parse failed: {e}")
+        Returns:
+            Parsed dictionary or empty dict if parsing fails
+        """
+        # 1. Regex to find the JSON object (starts with { and ends with })
+        # This handles Markdown wrappers, "Here is your JSON:", etc. automatically.
+        match = re.search(r"\{.*\}", response_text, re.DOTALL)
+
+        if not match:
+            print("*****: ",response_text)
+            logger.warning(
+                f"No JSON object found in response: {response_text[:100]}...")
             return {}
 
+        json_str = match.group(0).strip()
+
+        # Heuristic: If it doesn't end with '}', try closing it
+        # This handles truncated JSON from token limits
+        if not json_str.endswith("}"):
+            json_str += "}"
+            logger.debug(
+                "Attempted to repair truncated JSON by adding closing brace")
+
+        # 2. Try standard JSON parse (Double Quotes)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+
+        # 3. Try Python literal eval (Single Quotes - Common with Gemma)
+        try:
+            return ast.literal_eval(json_str)
+        except (ValueError, SyntaxError):
+            pass
+
+        logger.warning(
+            f"Parsing failed for extracted string: {json_str[:100]}...")
+        return {}
 
     @staticmethod
     def _validate_result(result: Dict) -> bool:
