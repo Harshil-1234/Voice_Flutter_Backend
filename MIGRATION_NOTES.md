@@ -2,7 +2,7 @@
 
 ## Changes Made
 
-### 1. **requirements.txt** ✅
+### 1. **requirements.txt** 
 - ❌ Removed: `torch==2.8.0`, `transformers==4.57.1`
 - ✅ Added: `llama-cpp-python==0.2.90`
 - **Rationale**: Reduces dependencies (~1.8GB savings), runs entirely on CPU, supports GGUF quantized models.
