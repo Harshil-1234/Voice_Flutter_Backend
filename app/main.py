@@ -24,6 +24,8 @@ import trafilatura
 from googlenewsdecoder import new_decoderv1
 from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
 from LocalLLMService import get_local_llm_service
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 
 
@@ -62,6 +64,19 @@ except Exception as e:
     traceback.print_exc()
     print("⚠️ WARNING: Falling back to None - articles will NOT be summarized!")
     llm_service = None
+
+# Initialize Firebase Admin SDK
+try:
+    # Use the specific service account file provided by the user
+    FB_SVC_PATH = os.path.join(os.path.dirname(__file__), "readdio-firebase-adminsdk-fbsvc-559cbc2036.json")
+    if os.path.exists(FB_SVC_PATH):
+        cred = credentials.Certificate(FB_SVC_PATH)
+        firebase_admin.initialize_app(cred)
+        print("✅ Firebase Admin SDK initialized successfully")
+    else:
+        print(f"⚠️ Firebase service account not found at {FB_SVC_PATH}. FCM disabled.")
+except Exception as e:
+    print(f"❌ Failed to initialize Firebase Admin SDK: {e}")
 
 # --- NEW RSS INGESTION CONFIG ---
 RSS_TOPIC_IDS = {
@@ -1492,6 +1507,55 @@ def heal_database_flags():
         print(f"❌ [DB HEALING] An error occurred while calling heal_article_flags RPC: {e}")
 
 
+def send_daily_push_notification():
+    """
+    Fetches the top news or daily quiz and sends a push notification to all users
+    via the 'daily_digest' FCM topic.
+    """
+    print(f"🔔 [FCM] Preparing daily push notification at {datetime.now().isoformat()} UTC")
+    
+    try:
+        # 1. Fetch some content for the notification
+        # We'll try to get the latest summarized article first
+        client = supabase_client()
+        res = (
+            client.table("articles")
+            .select("title, summary")
+            .eq("summarized", True)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        
+        title = "Daily Briefing Ready! 📰"
+        body = "Check out today's top stories and stay ahead."
+        
+        if res.data and len(res.data) > 0:
+            article = res.data[0]
+            if article.get("title"):
+                title = "Daily Briefing"
+                body = article["title"]
+        
+        # 2. Construct the message
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            data={
+                "route": "/home",
+            },
+            topic='daily_digest',
+        )
+        
+        # 3. Send the message
+        response = messaging.send(message)
+        print(f"✅ [FCM] Successfully sent daily notification: {response}")
+        
+    except Exception as e:
+        print(f"❌ [FCM] Error sending daily notification: {e}")
+
+
 @app.on_event("startup")
 def schedule_jobs():
     # Heal inconsistent DB flags on startup
@@ -1529,6 +1593,12 @@ def schedule_jobs():
             traceback.print_exc()
     
     scheduler.add_job(scheduled_riddle_generation, "cron", hour=23, minute=59, id="generate_riddle", replace_existing=True, timezone="UTC")
+    
+    # Add Daily News/Quiz push notification jobs (9:00 AM and 7:00 PM IST)
+    # 9:00 AM IST = 03:30 UTC
+    # 7:00 PM IST = 13:30 UTC
+    scheduler.add_job(send_daily_push_notification, "cron", hour=3, minute=30, id="push_notify_morning", replace_existing=True, timezone="UTC")
+    scheduler.add_job(send_daily_push_notification, "cron", hour=13, minute=30, id="push_notify_evening", replace_existing=True, timezone="UTC")
     
     scheduler.start()
     

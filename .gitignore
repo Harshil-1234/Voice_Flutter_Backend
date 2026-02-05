@@ -52,3 +52,7 @@ env/
 .AppleDouble
 .LSOverride
 Thumbs.db
+
+# Firebase Service Account
+readdio-firebase-adminsdk-*.json
+service_account.json
