@@ -161,10 +161,10 @@ def resolve_redirect_url(url: str, timeout: int = 10) -> str:
         response = requests.head(url, allow_redirects=True, timeout=timeout, headers=headers)
         final_url = response.url
         if final_url != url:
-            print(f"🔗 Resolved redirect: {url[:80]}... → {final_url[:80]}...")
+            print(f"🔗 Resolved redirect: {str(url)[:80]}... → {str(final_url)[:80]}...")
         return final_url
     except Exception as e:
-        print(f"⚠️ Redirect resolution failed for {url}: {e}")
+        print(f"⚠️ Redirect resolution failed for {str(url)[:80]}: {e}")
         return url
 
 
@@ -305,8 +305,9 @@ def fetch_article_content(url: str) -> Tuple[Optional[str], str, bool, Optional[
     
     Returns: (extracted_text or None, final_url, is_video, image_url or None)
     """
-    print(f"\n🚀 [fetch_article_content] Starting with Google URL: {url[:80]}")
-    final_url = url
+    safe_url = str(url)
+    print(f"\n🚀 [fetch_article_content] Starting with Google URL: {safe_url[:80]}")
+    final_url = safe_url
     image_url = None
     
     # STEP 1: Decode the Google URL using the googlenewsdecoder library
@@ -326,7 +327,8 @@ def fetch_article_content(url: str) -> Tuple[Optional[str], str, bool, Optional[
         return None, final_url, False, None
 
     # STEP 3: Video Detection (YouTube) - Extract thumbnail instead of scraping
-    if "youtube.com" in final_url.lower() or "youtu.be" in final_url.lower():
+    low_url = final_url.lower()
+    if "youtube.com" in low_url or "youtu.be" in low_url:
         print(f"📹 [fetch_article_content] YouTube video detected: {final_url[:80]}")
         thumbnail = extract_youtube_thumbnail(final_url)
         return None, final_url, True, thumbnail
@@ -370,11 +372,14 @@ def summarize_text_if_possible(content, titles=None):
     Titles are optional, mainly used for debugging/logging.
     No longer skips short articles; sends everything to the local model.
     """
-    if not llm_service:
+    if llm_service is None:
         print("❌ CRITICAL: LocalLLMService is None - model not loaded!")
         print("   Check startup logs for initialization errors.")
         print("   Skipping summarization for this batch.")
-        return None if isinstance(content, str) else [None] * len(content)
+        if isinstance(content, str):
+            return None
+        content_len = len(content) if isinstance(content, list) else 0
+        return [None] * content_len
     
     try:
         # Case 1: Single string
@@ -476,8 +481,9 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
         batches += 1
 
         # Align summaries and update Supabase per-article
-        for (article, title, _), result in zip(batch, summaries):
-            if not result:
+        for article_data, result in zip(batch, summaries):
+            article, title, _ = article_data
+            if result is None:
                 continue
 
             try:
@@ -733,9 +739,12 @@ def sanitize_text(text: Optional[str]) -> Optional[str]:
     Sanitizes text by checking for emptiness, whitespace-only, and minimum length.
     Returns None if text is invalid, otherwise returns the original stripped text.
     """
-    if not text or not text.strip() or len(text.strip()) < 30:
+    if text is None:
         return None
-    return text.strip()
+    s_text = text.strip()
+    if not s_text or len(s_text) < 30:
+        return None
+    return s_text
 
 
 def fetch_rss_feed(category: str, country_code: str) -> List[dict]:
@@ -1507,16 +1516,15 @@ def heal_database_flags():
         print(f"❌ [DB HEALING] An error occurred while calling heal_article_flags RPC: {e}")
 
 
-def send_daily_push_notification():
+def send_daily_news_notification():
     """
-    Fetches the top news or daily quiz and sends a push notification to all users
-    via the 'daily_digest' FCM topic.
+    Fetches the top news article and sends a push notification to users
+    via the 'daily_news' FCM topic.
     """
-    print(f"🔔 [FCM] Preparing daily push notification at {datetime.now().isoformat()} UTC")
+    print(f"🔔 [FCM] Preparing daily NEWS notification at {datetime.now().isoformat()} UTC")
     
     try:
-        # 1. Fetch some content for the notification
-        # We'll try to get the latest summarized article first
+        # 1. Fetch content for the notification
         client = supabase_client()
         res = (
             client.table("articles")
@@ -1545,15 +1553,40 @@ def send_daily_push_notification():
             data={
                 "route": "/home",
             },
-            topic='daily_digest',
+            topic='daily_news',
         )
         
         # 3. Send the message
         response = messaging.send(message)
-        print(f"✅ [FCM] Successfully sent daily notification: {response}")
+        print(f"✅ [FCM] Successfully sent daily NEWS notification: {response}")
         
     except Exception as e:
-        print(f"❌ [FCM] Error sending daily notification: {e}")
+        print(f"❌ [FCM] Error sending daily NEWS notification: {e}")
+
+
+def send_daily_quiz_notification():
+    """
+    Sends a push notification to users via the 'daily_quiz' FCM topic.
+    """
+    print(f"🔔 [FCM] Preparing daily QUIZ notification at {datetime.now().isoformat()} UTC")
+    
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title="Daily Quiz Ready! 🧠",
+                body="Test your knowledge with today's questions.",
+            ),
+            data={
+                "route": "/quiz", 
+            },
+            topic='daily_quiz',
+        )
+        
+        response = messaging.send(message)
+        print(f"✅ [FCM] Successfully sent daily QUIZ notification: {response}")
+        
+    except Exception as e:
+        print(f"❌ [FCM] Error sending daily QUIZ notification: {e}")
 
 
 @app.on_event("startup")
@@ -1594,11 +1627,14 @@ def schedule_jobs():
     
     scheduler.add_job(scheduled_riddle_generation, "cron", hour=23, minute=59, id="generate_riddle", replace_existing=True, timezone="UTC")
     
-    # Add Daily News/Quiz push notification jobs (9:00 AM and 7:00 PM IST)
+    # Add Daily News push notification jobs (9:00 AM and 7:00 PM IST)
     # 9:00 AM IST = 03:30 UTC
     # 7:00 PM IST = 13:30 UTC
-    scheduler.add_job(send_daily_push_notification, "cron", hour=3, minute=30, id="push_notify_morning", replace_existing=True, timezone="UTC")
-    scheduler.add_job(send_daily_push_notification, "cron", hour=13, minute=30, id="push_notify_evening", replace_existing=True, timezone="UTC")
+    scheduler.add_job(send_daily_news_notification, "cron", hour=3, minute=30, id="push_notify_news_morning", replace_existing=True, timezone="UTC")
+    scheduler.add_job(send_daily_news_notification, "cron", hour=13, minute=30, id="push_notify_news_evening", replace_existing=True, timezone="UTC")
+
+    # Add Daily Quiz push notification job (9:30 AM IST = 04:00 UTC)
+    scheduler.add_job(send_daily_quiz_notification, "cron", hour=4, minute=0, id="push_notify_quiz", replace_existing=True, timezone="UTC")
     
     scheduler.start()
     
@@ -1800,11 +1836,13 @@ def ingest_articles(items: List[IncomingArticle]):
     for a in items:
         try:
             summary = None
+            content = a.content
+            title = a.title or "Untitled"
             # Only summarize if content exists and is at least 100 characters
-            if a.content and len(a.content) >= 100:
-                summary = summarize_text_if_possible(a.content, a.title)
-            elif a.content:
-                print(f"⏭️ Skipping short article in ingest (len={len(a.content)}): {a.title[:80]}")
+            if content and len(content) >= 100:
+                summary = summarize_text_if_possible(content, title)
+            elif content:
+                print(f"⏭️ Skipping short article in ingest (len={len(content)}): {title[:80]}")
             # Clean the URL by stripping query parameters to keep DB tidy
             clean_url = (a.url or "").split('?')[0]
             row = {
@@ -2571,7 +2609,7 @@ def _get_excluded_question_ids(client, user_id: Optional[str], quiz_type: str) -
 
 def _shuffle_and_map_questions(items: List[dict]) -> List[dict]:
     """Shuffle list and randomize options per question."""
-    arr = items[:]
+    arr = list(items)
     random.shuffle(arr)
     return [_randomize_question_options(q) for q in arr]
 
