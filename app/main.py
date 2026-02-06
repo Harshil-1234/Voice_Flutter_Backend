@@ -1589,6 +1589,59 @@ def send_daily_quiz_notification():
         print(f"❌ [FCM] Error sending daily QUIZ notification: {e}")
 
 
+
+def send_test_notification():
+    """
+    Sends a TEST push notification 1 minute after server start to verify Firebase connection.
+    This helps the user verify notifications without waiting for scheduled times.
+    """
+    print(f"🔔 [FCM TEST] Preparing TEST notification at {datetime.now().isoformat()} UTC")
+    
+    try:
+        # 1. Fetch a random summarized article for realistic content
+        client = supabase_client()
+        res = (
+            client.table("articles")
+            .select("title, summary")
+            .eq("summarized", True)
+            .limit(10)
+            .execute()
+        )
+        
+        title = "Test Notification 🔔"
+        body = "This is a test message to verify Firebase is working."
+        
+        if res.data and len(res.data) > 0:
+            import random
+            article = random.choice(res.data)
+            if article.get("title"):
+                title = "Daily Round-Up 📰" # Realistic title
+                body = f"Test: {article['title']}"
+        
+        # 2. Construct the message
+        # Sending to 'daily_news' topic as it's the main one
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            data={
+                "route": "/home",
+                "is_test": "true"
+            },
+            topic='daily_news',
+        )
+        
+        # 3. Send the message
+        response = messaging.send(message)
+        print(f"✅ [FCM TEST] Successfully sent TEST notification: {response}")
+        
+    except Exception as e:
+        print(f"❌ [FCM TEST] Error sending TEST notification: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 @app.on_event("startup")
 def schedule_jobs():
     # Heal inconsistent DB flags on startup
@@ -1596,6 +1649,12 @@ def schedule_jobs():
 
     # Run news ingestion immediately on startup, then every 15 minutes
     scheduler.add_job(smart_ingest_all_categories, "interval", minutes=15, id="ingest_news", replace_existing=True)
+    
+    # Schedule TEST notification 1 minute after startup
+    # We use a date trigger for one-time execution shortly in the future
+    run_date = datetime.now() + timedelta(minutes=1)
+    scheduler.add_job(send_test_notification, "date", run_date=run_date, id="test_notification_startup", replace_existing=True)
+
     
     # Add periodic round-robin summarizer (keeps summaries flowing across categories)
     scheduler.add_job(
