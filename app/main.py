@@ -1579,15 +1579,15 @@ def send_daily_news_notification():
                 body = article["title"]
         
         # 2. Construct the message
-        # IMPORTANT: android.channel_id must match the channel created in the Flutter app
+        # IMPORTANT: channel_id must match the channel created in the Flutter app
         # (high_importance_channel) so the notification uses max importance on Android 8+.
+        # Note: channel_id goes inside AndroidNotification, NOT AndroidConfig.
         message = messaging.Message(
             notification=messaging.Notification(
                 title=title,
                 body=body,
             ),
             android=messaging.AndroidConfig(
-                channel_id='high_importance_channel',
                 priority='high',
                 notification=messaging.AndroidNotification(
                     icon='notification_icon',
@@ -1622,7 +1622,6 @@ def send_daily_quiz_notification():
                 body="Test your knowledge with today's questions.",
             ),
             android=messaging.AndroidConfig(
-                channel_id='high_importance_channel',
                 priority='high',
                 notification=messaging.AndroidNotification(
                     icon='notification_icon',
@@ -1674,13 +1673,13 @@ def send_test_notification():
         
         # 2. Construct the message
         # Sending to 'daily_news' topic as it's the main one
+        # Note: channel_id goes inside AndroidNotification, NOT AndroidConfig.
         message = messaging.Message(
             notification=messaging.Notification(
                 title=title,
                 body=body,
             ),
             android=messaging.AndroidConfig(
-                channel_id='high_importance_channel',
                 priority='high',
                 notification=messaging.AndroidNotification(
                     icon='notification_icon',
