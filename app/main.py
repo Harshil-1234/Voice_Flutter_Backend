@@ -1420,6 +1420,40 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/admin/test-notification")
+def trigger_test_notification():
+    """
+    Manually trigger a test FCM notification to verify Firebase is working.
+    Call this endpoint to test notifications without waiting for scheduled jobs.
+    Usage: POST https://your-backend.com/admin/test-notification
+    """
+    try:
+        send_test_notification()
+        return {"status": "sent", "message": "Test notification triggered. Check your device."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/admin/send-news-notification")
+def trigger_news_notification():
+    """Manually trigger the daily news FCM notification."""
+    try:
+        send_daily_news_notification()
+        return {"status": "sent", "message": "Daily news notification triggered."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/admin/send-quiz-notification")
+def trigger_quiz_notification():
+    """Manually trigger the daily quiz FCM notification."""
+    try:
+        send_daily_quiz_notification()
+        return {"status": "sent", "message": "Daily quiz notification triggered."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 def _fetch_prioritized_articles(
     client,
     base_query,
@@ -1545,10 +1579,21 @@ def send_daily_news_notification():
                 body = article["title"]
         
         # 2. Construct the message
+        # IMPORTANT: android.channel_id must match the channel created in the Flutter app
+        # (high_importance_channel) so the notification uses max importance on Android 8+.
         message = messaging.Message(
             notification=messaging.Notification(
                 title=title,
                 body=body,
+            ),
+            android=messaging.AndroidConfig(
+                channel_id='high_importance_channel',
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    icon='notification_icon',
+                    color='#FF6B35',
+                    channel_id='high_importance_channel',
+                ),
             ),
             data={
                 "route": "/home",
@@ -1576,8 +1621,17 @@ def send_daily_quiz_notification():
                 title="Daily Quiz Ready! 🧠",
                 body="Test your knowledge with today's questions.",
             ),
+            android=messaging.AndroidConfig(
+                channel_id='high_importance_channel',
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    icon='notification_icon',
+                    color='#FF6B35',
+                    channel_id='high_importance_channel',
+                ),
+            ),
             data={
-                "route": "/quiz", 
+                "route": "/quiz",
             },
             topic='daily_quiz',
         )
@@ -1624,6 +1678,15 @@ def send_test_notification():
             notification=messaging.Notification(
                 title=title,
                 body=body,
+            ),
+            android=messaging.AndroidConfig(
+                channel_id='high_importance_channel',
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    icon='notification_icon',
+                    color='#FF6B35',
+                    channel_id='high_importance_channel',
+                ),
             ),
             data={
                 "route": "/home",
