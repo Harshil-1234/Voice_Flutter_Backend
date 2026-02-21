@@ -1873,8 +1873,6 @@ def schedule_jobs():
     for job in scheduler.get_jobs():
         print(f"   • {job.id}: next_run={job.next_run_time}, trigger={job.trigger}")
     print(f"{'='*60}\n")
-
-    try:
     
     # 1. Run immediate round-robin and cleanup
     try:
