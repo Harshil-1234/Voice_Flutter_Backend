@@ -37,8 +37,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Model configuration
-HF_REPO_ID = "bartowski/gemma-2-2b-it-GGUF"
-MODEL_FILENAME = "gemma-2-2b-it-Q4_K_M.gguf"
+HF_REPO_ID = "bartowski/Meta-Llama-3-8B-Instruct-GGUF"
+MODEL_FILENAME = "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
 CACHE_DIR = Path.home() / ".cache" / "llm_models"
 CONTEXT_SIZE = 4096
 N_GPU_LAYERS = 0
@@ -210,6 +210,111 @@ class LocalLLMService:
             self.model = None
             logger.info("Model cleaned up.")
 
+    def judge_argument(self, statement: str, argument: str) -> dict:
+        """
+        AI Judge function using local Llama-3-8B.
+        Scores the argument 1-10 based on logic, facts, and lack of fallacies.
+        """
+        self._check_model_loaded()
+
+        system_prompt = """You are an unbiased Logic Professor. 
+Your task is to score the user's argument between 1 and 10 based purely on facts, logic, and lack of logical fallacies. 
+Do not agree or disagree with the conclusion; evaluate only the reasoning.
+
+Respond ONLY with a valid JSON object in the exact following format, without any markdown formatting or extra text:
+{
+    "score": <int 1-10>,
+    "feedback": "<short string explanation of the score>",
+    "key_factors": ["<factor 1>", "<factor 2>"],
+    "detailed_analysis": "<long string detailed analysis of the argument's strengths and weaknesses>"
+}"""
+
+        user_prompt = f"Topic Statement: {statement}\nUser Argument: {argument}"
+        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+
+        try:
+            with self.lock:
+                response = self.model.create_chat_completion(
+                    messages=[{"role": "user", "content": combined_prompt}],
+                    temperature=0.2, # Low temperature for more analytical/consistent scoring
+                    top_p=0.95,
+                    max_tokens=512,
+                    response_format={"type": "json_object"}
+                )
+            
+            response_content = response["choices"][0]["message"]["content"].strip()
+            if not response_content:
+                 raise ValueError("Empty response from local LLM.")
+                 
+            # Llama-cpp might still wrap it in markdown block, so we strip it if needed
+            if response_content.startswith("```json"):
+                response_content = response_content[7:]
+            if response_content.endswith("```"):
+                response_content = response_content[:-3]
+                
+            return json.loads(response_content.strip())
+            
+        except Exception as e:
+            logger.error(f"Error during judge_argument local inference: {e}")
+            # Fallback response in case of error
+            return {
+                "score": 5,
+                "feedback": "AI analysis temporarily unavailable due to a server error.",
+                "key_factors": ["Could not parse argument logically."],
+                "detailed_analysis": "An error occurred while the Logic Professor was analyzing your argument. Please try again."
+            }
+
+    def generate_debate_topic(self, articles_text: str) -> dict:
+        """Generates a debate topic statement from recent Indian politics articles."""
+        self._check_model_loaded()
+        system_prompt = """You are a highly analytical political journalist in India. 
+Based on the provided recent news headlines and summaries, identify ONE highly debatable, controversial topic. 
+Frame a clear, compelling Statement (e.g., 'India should ban algorithmic social feeds') and provide a brief context.
+
+Respond ONLY with a valid JSON object in the exact following format:
+{
+    "statement": "<The controversial statement>",
+    "context": "<1-2 sentences explaining why this is currently debated>"
+}"""
+        try:
+            with self.lock:
+                response = self.model.create_chat_completion(
+                    messages=[{"role": "user", "content": f"{system_prompt}\n\nNews Data:\n{articles_text}"}],
+                    temperature=0.4,
+                    max_tokens=256,
+                    response_format={"type": "json_object"}
+                )
+            content = response["choices"][0]["message"]["content"].strip()
+            if content.startswith("```json"): content = content[7:]
+            if content.endswith("```"): content = content[:-3]
+            return json.loads(content.strip())
+        except Exception as e:
+            logger.error(f"Error generating debate topic: {e}")
+            return {
+                "statement": "The implementation of simultaneous elections (One Nation, One Election) will strengthen Indian democracy.",
+                "context": "Simultaneous elections are being proposed to reduce election expenditure and policy paralysis."
+            }
+
+    def conclude_debate(self, statement: str, winning_side: str, top_args: str) -> str:
+        """Summarizes why the winning side won based on top arguments."""
+        self._check_model_loaded()
+        system_prompt = f"""You are a debate moderator. The debate statement was: '{statement}'.
+The winning side was: '{winning_side}'.
+Based on the following top arguments from the winning side, write a concise, compelling 2-3 sentence conclusion summarizing why they won.
+Do not use JSON. Write plain text."""
+
+        try:
+            with self.lock:
+                response = self.model.create_chat_completion(
+                    messages=[{"role": "user", "content": f"{system_prompt}\n\nTop Arguments:\n{top_args}"}],
+                    temperature=0.3,
+                    max_tokens=256
+                )
+            return response["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.error(f"Error concluding debate: {e}")
+            return "The winning side presented stronger logical points and practical evidence to support their stance."
+
 
 # Convenience functions
 _service = None
@@ -225,4 +330,16 @@ def get_local_llm_service() -> LocalLLMService:
 def analyze_article(text: str) -> Dict:
     service = get_local_llm_service()
     return service.analyze_article(text)
+
+def judge_argument(statement: str, argument: str) -> dict:
+    service = get_local_llm_service()
+    return service.judge_argument(statement, argument)
+
+def generate_debate_topic(articles_text: str) -> dict:
+    service = get_local_llm_service()
+    return service.generate_debate_topic(articles_text)
+
+def conclude_debate(statement: str, winning_side: str, top_args: str) -> str:
+    service = get_local_llm_service()
+    return service.conclude_debate(statement, winning_side, top_args)
 

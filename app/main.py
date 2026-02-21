@@ -24,6 +24,7 @@ import trafilatura
 from googlenewsdecoder import new_decoderv1
 from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
 from LocalLLMService import get_local_llm_service
+from debate_service import router as debate_router
 import firebase_admin
 from firebase_admin import credentials, messaging
 
@@ -136,6 +137,25 @@ class ArticleOut(BaseModel):
     content: Optional[str] = None
     summary: Optional[str] = None
 
+class ProfileUpdate(BaseModel):
+    user_id: str
+    display_name: str
+
+def is_valid_display_name(name: str) -> Tuple[bool, str]:
+    if not name or len(name.strip()) < 3:
+        return False, "Display name must be at least 3 characters."
+    
+    if name.strip().isdigit():
+        return False, "Display name cannot consist of only numbers."
+    
+    # Very basic profanity check 
+    bad_words = ["admin", "root", "moderator", "fuck", "shit", "bitch"]
+    name_lower = name.lower()
+    for word in bad_words:
+        if word in name_lower:
+             return False, "Display name contains inappropriate language."
+
+    return True, ""
 
 def supabase_client():
     from supabase import create_client, Client
@@ -1353,6 +1373,113 @@ def generate_daily_quiz_questions():
     print(f"🏁 Daily quiz generation complete. Total questions generated: {total_generated}")
 
 
+def generate_daily_debate_topic():
+    print("⚖️ [DEBATE] Generating new daily debate topic...")
+    client = supabase_client()
+    try:
+        # Fetch Top 5 Indian Politics articles
+        res = client.table("articles").select("title, summary, id").eq("category", "politics").eq("country", "IN").eq("summarized", True).order("created_at", desc=True).limit(5).execute()
+        articles = res.data or []
+        if not articles:
+            print("⚠️ [DEBATE] Not enough IN politics articles to generate a debate.")
+            return
+
+        combined_text = "\n".join([f"- {a['title']}: {a['summary']}" for a in articles])
+        article_ids = [str(a['id']) for a in articles]
+
+        # Call Local LLM
+        from LocalLLMService import generate_debate_topic
+        topic_data = generate_debate_topic(combined_text)
+
+        if "statement" in topic_data:
+            client.table("debate_topics").insert({
+                "statement": topic_data["statement"],
+                "context": topic_data.get("context", ""),
+                "status": "upcoming",
+                "related_article_ids": article_ids
+            }).execute()
+            print(f"✅ [DEBATE] Generated upcoming debate: {topic_data['statement']}")
+
+    except Exception as e:
+        print(f"❌ [DEBATE] Error generating topic: {e}")
+
+def manage_debate_lifecycle():
+    print("⏳ [DEBATE] Managing debate lifecycles...")
+    client = supabase_client()
+    try:
+        now_iso = datetime.now().isoformat()
+        
+        # 1. Check for expired active debates
+        expired_res = client.table("debate_topics").select("id, statement").eq("status", "active").lte("end_time", now_iso).execute()
+        expired_debates = expired_res.data or []
+
+        for debate in expired_debates:
+            topic_id = debate["id"]
+            statement = debate["statement"]
+            print(f"🔄 [DEBATE] Concluding topic ID: {topic_id}")
+            
+            # Aggregate stats
+            support_count = 0
+            oppose_count = 0
+            
+            votes_res = client.table("user_votes").select("id, side, argument_text, ai_score").eq("topic_id", topic_id).execute()
+            votes = votes_res.data or []
+            
+            support_args = []
+            oppose_args = []
+            
+            for v in votes:
+                if v["side"] == "support":
+                    support_count += 1
+                    if v.get("ai_score", 0) >= 7: support_args.append(v)
+                elif v["side"] == "oppose":
+                    oppose_count += 1
+                    if v.get("ai_score", 0) >= 7: oppose_args.append(v)
+            
+            winning_side = "support" if support_count >= oppose_count else "oppose"
+            
+            # Fetch top 5 arguments for the winning side
+            top_args = sorted(support_args if winning_side == "support" else oppose_args, key=lambda x: x.get("ai_score", 0), reverse=True)[:5]
+            top_args_text = "\n".join([f"- {a['argument_text']}" for a in top_args]) if top_args else "No strong arguments provided."
+
+            # Call AI to summarize
+            ai_conclusion = "The debate ended with equal participation but lacked strong logical arguments to summarize."
+            if args:
+                from LocalLLMService import conclude_debate
+                ai_conclusion = conclude_debate(statement, winning_side, top_args_text)
+            
+            # Update DB
+            client.table("debate_topics").update({
+                "status": "completed",
+                "winning_side": winning_side,
+                "ai_conclusion": ai_conclusion
+            }).eq("id", topic_id).execute()
+            print(f"✅ [DEBATE] Concluded topic ID {topic_id}. Winner: {winning_side}")
+
+        # 2. Check if we need to activate an upcoming debate
+        active_res = client.table("debate_topics").select("id", count="exact").eq("status", "active").execute()
+        if active_res.count == 0:
+            # Find the oldest upcoming debate
+            upcoming_res = client.table("debate_topics").select("id").eq("status", "upcoming").order("created_at").limit(1).execute()
+            if upcoming_res.data:
+                next_id = upcoming_res.data[0]["id"]
+                start_time = datetime.now()
+                end_time = start_time + timedelta(hours=24)
+                
+                client.table("debate_topics").update({
+                    "status": "active",
+                    "start_time": start_time.isoformat(),
+                    "end_time": end_time.isoformat()
+                }).eq("id", next_id).execute()
+                print(f"🚀 [DEBATE] Activated new debate topic ID: {next_id} for 24 hours.")
+            else:
+                # No upcoming debates, trigger generation immediately
+                generate_daily_debate_topic()
+
+    except Exception as e:
+        print(f"❌ [DEBATE] Lifecycle error: {e}")
+
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -1420,20 +1547,6 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/admin/test-notification")
-def trigger_test_notification():
-    """
-    Manually trigger a test FCM notification to verify Firebase is working.
-    Call this endpoint to test notifications without waiting for scheduled jobs.
-    Usage: POST https://your-backend.com/admin/test-notification
-    """
-    try:
-        send_test_notification()
-        return {"status": "sent", "message": "Test notification triggered. Check your device."}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-
 @app.post("/admin/send-news-notification")
 def trigger_news_notification():
     """Manually trigger the daily news FCM notification."""
@@ -1450,6 +1563,31 @@ def trigger_quiz_notification():
     try:
         send_daily_quiz_notification()
         return {"status": "sent", "message": "Daily quiz notification triggered."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/admin/scheduler-status")
+def get_scheduler_status():
+    """
+    Check if the APScheduler is running and list all registered jobs with their next run times.
+    Use this to verify that notification cron jobs are correctly registered and will fire.
+    """
+    try:
+        jobs_info = []
+        for job in scheduler.get_jobs():
+            jobs_info.append({
+                "id": job.id,
+                "name": job.name,
+                "next_run_time": str(job.next_run_time) if job.next_run_time else "PAUSED/NONE",
+                "trigger": str(job.trigger),
+            })
+        return {
+            "scheduler_running": scheduler.running,
+            "total_jobs": len(jobs_info),
+            "current_time_utc": datetime.utcnow().isoformat(),
+            "jobs": jobs_info,
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -1643,67 +1781,6 @@ def send_daily_quiz_notification():
 
 
 
-def send_test_notification():
-    """
-    Sends a TEST push notification 1 minute after server start to verify Firebase connection.
-    This helps the user verify notifications without waiting for scheduled times.
-    """
-    print(f"🔔 [FCM TEST] Preparing TEST notification at {datetime.now().isoformat()} UTC")
-    
-    try:
-        # 1. Fetch a random summarized article for realistic content
-        client = supabase_client()
-        res = (
-            client.table("articles")
-            .select("title, summary")
-            .eq("summarized", True)
-            .limit(10)
-            .execute()
-        )
-        
-        title = "Test Notification 🔔"
-        body = "This is a test message to verify Firebase is working."
-        
-        if res.data and len(res.data) > 0:
-            import random
-            article = random.choice(res.data)
-            if article.get("title"):
-                title = "Daily Round-Up 📰" # Realistic title
-                body = f"Test: {article['title']}"
-        
-        # 2. Construct the message
-        # Sending to 'daily_news' topic as it's the main one
-        # Note: channel_id goes inside AndroidNotification, NOT AndroidConfig.
-        message = messaging.Message(
-            notification=messaging.Notification(
-                title=title,
-                body=body,
-            ),
-            android=messaging.AndroidConfig(
-                priority='high',
-                notification=messaging.AndroidNotification(
-                    icon='notification_icon',
-                    color='#FF6B35',
-                    channel_id='high_importance_channel',
-                ),
-            ),
-            data={
-                "route": "/home",
-                "is_test": "true"
-            },
-            topic='daily_news',
-        )
-        
-        # 3. Send the message
-        response = messaging.send(message)
-        print(f"✅ [FCM TEST] Successfully sent TEST notification: {response}")
-        
-    except Exception as e:
-        print(f"❌ [FCM TEST] Error sending TEST notification: {e}")
-        import traceback
-        traceback.print_exc()
-
-
 @app.on_event("startup")
 def schedule_jobs():
     # Heal inconsistent DB flags on startup
@@ -1711,13 +1788,8 @@ def schedule_jobs():
 
     # Run news ingestion immediately on startup, then every 15 minutes
     scheduler.add_job(smart_ingest_all_categories, "interval", minutes=15, id="ingest_news", replace_existing=True)
-    
-    # Schedule TEST notification 1 minute after startup
-    # We use a date trigger for one-time execution shortly in the future
-    run_date = datetime.now() + timedelta(minutes=1)
-    scheduler.add_job(send_test_notification, "date", run_date=run_date, id="test_notification_startup", replace_existing=True)
 
-    
+
     # Add periodic round-robin summarizer (keeps summaries flowing across categories)
     scheduler.add_job(
         summarize_pending_round_robin,
@@ -1751,53 +1823,93 @@ def schedule_jobs():
     # Add Daily News push notification jobs (9:00 AM and 7:00 PM IST)
     # 9:00 AM IST = 03:30 UTC
     # 7:00 PM IST = 13:30 UTC
-    scheduler.add_job(send_daily_news_notification, "cron", hour=3, minute=30, id="push_notify_news_morning", replace_existing=True, timezone="UTC")
-    scheduler.add_job(send_daily_news_notification, "cron", hour=13, minute=30, id="push_notify_news_evening", replace_existing=True, timezone="UTC")
+    # Wrapped in error-logging wrappers so failures are visible in GCP logs
+    def _scheduled_news_notification(label=""):
+        """Wrapper with full error logging for scheduled news FCM push."""
+        try:
+            print(f"\n{'='*60}")
+            print(f"🔔 [SCHEDULER] Running scheduled NEWS notification ({label}) at {datetime.utcnow().isoformat()} UTC")
+            print(f"{'='*60}")
+            send_daily_news_notification()
+            print(f"✅ [SCHEDULER] Scheduled NEWS notification ({label}) completed successfully")
+        except Exception as e:
+            print(f"❌ [SCHEDULER] FAILED scheduled NEWS notification ({label}): {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _scheduled_quiz_notification():
+        """Wrapper with full error logging for scheduled quiz FCM push."""
+        try:
+            print(f"\n{'='*60}")
+            print(f"🔔 [SCHEDULER] Running scheduled QUIZ notification at {datetime.utcnow().isoformat()} UTC")
+            print(f"{'='*60}")
+            send_daily_quiz_notification()
+            print(f"✅ [SCHEDULER] Scheduled QUIZ notification completed successfully")
+        except Exception as e:
+            print(f"❌ [SCHEDULER] FAILED scheduled QUIZ notification: {e}")
+            import traceback
+            traceback.print_exc()
+
+    scheduler.add_job(
+        lambda: _scheduled_news_notification("morning"),
+        "cron", hour=3, minute=30, id="push_notify_news_morning", replace_existing=True, timezone="UTC"
+    )
+    scheduler.add_job(
+        lambda: _scheduled_news_notification("evening"),
+        "cron", hour=13, minute=30, id="push_notify_news_evening", replace_existing=True, timezone="UTC"
+    )
 
     # Add Daily Quiz push notification job (9:30 AM IST = 04:00 UTC)
-    scheduler.add_job(send_daily_quiz_notification, "cron", hour=4, minute=0, id="push_notify_quiz", replace_existing=True, timezone="UTC")
+    scheduler.add_job(
+        _scheduled_quiz_notification,
+        "cron", hour=4, minute=0, id="push_notify_quiz", replace_existing=True, timezone="UTC"
+    )
     
     scheduler.start()
-    
-    # Kick off initial runs asynchronously
-    try:
-        import threading
-        
-        # Start the one-time quiz option cleanup
-        threading.Thread(target=clean_existing_quiz_options, daemon=True).start()
-        
-        # Start news ingestion
-        threading.Thread(target=smart_ingest_all_categories, daemon=True).start()
-        
-        # Kick the summarizer once on startup for quicker initial coverage
-        threading.Thread(
-            target=lambda: summarize_pending_round_robin(per_category_limit=2, max_cycles=20),
-            daemon=True
-        ).start()
 
-        # Start quiz generation immediately on startup to ensure fresh questions
-        # This prevents empty quiz pools after backend restarts
-        def immediate_quiz_generation():
-            print("🚀 Generating quiz questions immediately on backend startup...")
-            generate_daily_quiz_questions()
-            print("✅ Initial quiz question generation completed")
-        
-        threading.Thread(target=immediate_quiz_generation, daemon=True).start()
-        
-        # Start riddle generation immediately on startup if no riddle exists for today
-        def immediate_riddle_generation():
-            print("🧩 Checking for today's riddle...")
-            if not check_today_riddle_exists():
-                print("🚀 Generating daily riddle immediately on backend startup...")
-                generate_daily_riddle()
-                print("✅ Initial riddle generation completed")
-            else:
-                print("✅ Today's riddle already exists")
-        
-        threading.Thread(target=immediate_riddle_generation, daemon=True).start()
-        
+    # Log all registered jobs so we can verify in GCP logs
+    print(f"\n{'='*60}")
+    print(f"📋 [SCHEDULER] All registered jobs ({len(scheduler.get_jobs())} total):")
+    for job in scheduler.get_jobs():
+        print(f"   • {job.id}: next_run={job.next_run_time}, trigger={job.trigger}")
+    print(f"{'='*60}\n")
+
+    try:
+    
+    # 1. Run immediate round-robin and cleanup
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(summarize_pending_round_robin, per_category_limit=2, max_cycles=100)
+        executor.submit(clean_existing_quiz_options)
+        print("✅ Submitted async summarization & DB cleanup tasks at startup")
     except Exception as e:
-        print(f"❌ Error starting initial jobs: {e}")
+        print(f"⚠️ Error starting async tasks: {e}")
+
+    if not scheduler.running:
+        try:
+            scheduler.start()
+            print("🕒 APScheduler started successfully")
+        except Exception as e:
+            print(f"❌ Failed to start APScheduler: {e}")
+
+    # Register scheduled jobs
+    try:
+        # Debates
+        scheduler.add_job(generate_daily_debate_topic, 'cron', hour=1, minute=0, id='gen_debate')
+        scheduler.add_job(manage_debate_lifecycle, 'interval', minutes=10, id='manage_debate')
+        
+        # Existing
+        scheduler.add_job(smart_ingest_all_categories, "interval", hours=4, id="smart_ingest_job")
+        scheduler.add_job(summarize_pending_round_robin, "interval", minutes=60, id="summarize_round_robin_job")
+        scheduler.add_job(generate_daily_quiz_questions, "cron", hour=2, minute=0, id="daily_quiz_gen_job")
+        scheduler.add_job(send_daily_news_notification, 'cron', hour=8, minute=0, id="daily_news_push")
+        scheduler.add_job(generate_daily_riddle, 'cron', hour=3, minute=0, id="daily_riddle_gen")
+        scheduler.add_job(send_daily_quiz_notification, 'cron', hour=12, minute=0, id="daily_quiz_push")
+        
+        print("📋 Scheduled jobs configured successfully")
+    except Exception as e:
+        print(f"❌ Error configuring scheduled jobs: {e}")
 
 
 @app.on_event("shutdown")
