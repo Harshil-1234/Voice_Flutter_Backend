@@ -4,7 +4,7 @@ import json
 import os
 from datetime import datetime
 
-from app.LocalLLMService import judge_argument
+from LocalLLMService import judge_argument
 
 # Initialize Router
 router = APIRouter(prefix="/debate", tags=["debate"])
