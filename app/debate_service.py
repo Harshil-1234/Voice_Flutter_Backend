@@ -3,7 +3,6 @@ from pydantic import BaseModel
 import json
 import os
 from datetime import datetime
-from groq import Groq
 
 from app.LocalLLMService import judge_argument
 
