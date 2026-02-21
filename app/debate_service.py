@@ -46,13 +46,18 @@ def calculate_new_title(total_xp: int) -> str:
 
 @router.post("/vote", response_model=VoteResponse)
 async def submit_vote(vote: VoteRequest):
-    # Mocking statement for standalone function
-    statement = "Artificial Intelligence will eventually replace most human jobs." 
+    from main import supabase_client
+    client = supabase_client()
     
-    # 1. AI Judge Argument (using Local LLM)
+    # 1. Fetch current topic statement for AI evaluation
+    topic_res = client.table("debate_topics").select("statement").eq("id", vote.topic_id).execute()
+    if not topic_res.data:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    statement = topic_res.data[0]["statement"]
+    
+    # 2. AI Judge Argument (using Local LLM)
     ai_evaluated = True
     if not vote.argument_text or len(vote.argument_text.strip()) < 5:
-        # Edge case: No real argument provided. Save resources by skipping LLM.
         ai_evaluated = False
         ai_analysis = {
             "score": 1,
@@ -63,35 +68,38 @@ async def submit_vote(vote: VoteRequest):
     else:
         ai_analysis = judge_argument(statement, vote.argument_text)
     
-    # 2. Gamification Math
+    # 3. Gamification Math
     score = ai_analysis.get("score", 1)
     xp_earned = XP_BASE_VOTE + (score * XP_MULTIPLIER_SCORE)
     
-    # 3. DB Transactions (Mocked for now)
-    # supabase = get_supabase_client()
+    # 4. DB Transactions
+    # a. Store Vote
+    vote_data = {
+        "user_id": vote.user_id,
+        "topic_id": vote.topic_id,
+        "side": vote.side,
+        "argument_text": vote.argument_text,
+        "ai_score": score,
+        "ai_feedback": ai_analysis["feedback"],
+        "hidden_feedback": ai_analysis.get("detailed_analysis", "No detailed analysis available."),
+        "ai_evaluated": ai_evaluated
+    }
+    client.table("user_votes").insert(vote_data).execute()
     
-    # a. Store Vote and hidden feedback
-    # vote_data = {
-    #     "user_id": vote.user_id,
-    #     ...
-    #     "ai_score": score,
-    #     "ai_feedback": ai_analysis["feedback"],
-    #     "hidden_feedback": ai_analysis.get("detailed_analysis", "No detailed analysis available.")
-    # }
-    # supabase.table("user_votes").insert(vote_data).execute()
+    # b. Update Profile XP and Title
+    profile_res = client.table("profiles").select("debate_xp", "current_title").eq("id", vote.user_id).execute()
+    current_profile = profile_res.data[0] if profile_res.data else {"debate_xp": 0, "current_title": "Rookie"}
     
-    # b. Fetch current XP and Update Profile
-    # current_profile = supabase.table("profiles").select("debate_xp", "current_title").eq("id", vote.user_id).execute().data[0]
-    # new_total_xp = current_profile['debate_xp'] + xp_earned
-    # expected_title = calculate_new_title(new_total_xp)
-    # new_title_to_return = None
-    # if expected_title != current_profile['current_title']:
-    #      new_title_to_return = expected_title
-    #      supabase.table("profiles").update({"debate_xp": new_total_xp, "current_title": expected_title}).eq("id", vote.user_id).execute()
-    # else:
-    #      supabase.table("profiles").update({"debate_xp": new_total_xp}).eq("id", vote.user_id).execute()
+    new_total_xp = current_profile.get('debate_xp', 0) + xp_earned
+    expected_title = calculate_new_title(new_total_xp)
+    new_title_to_return = None
     
-    new_title_to_return = "Observer" # Mock level up
+    update_data = {"debate_xp": new_total_xp}
+    if expected_title != current_profile.get('current_title', 'Rookie'):
+        new_title_to_return = expected_title
+        update_data["current_title"] = expected_title
+        
+    client.table("profiles").update(update_data).eq("id", vote.user_id).execute()
     
     return VoteResponse(
         score=score,
@@ -117,17 +125,24 @@ async def unlock_feedback(req: UnlockRequest):
 
 @router.get("/user_stats/{user_id}")
 async def get_user_stats(user_id: str):
-    # Mocking Database query since supabase is commented out
+    from main import supabase_client
+    client = supabase_client()
+    
     # 1. Fetch from Profiles
-    current_xp = 0 # Default if no votes
-    current_title = "Rookie"
+    profile_res = client.table("profiles").select("debate_xp", "current_title").eq("id", user_id).execute()
+    profile = profile_res.data[0] if profile_res.data else {"debate_xp": 0, "current_title": "Rookie"}
+    
+    current_xp = profile.get("debate_xp", 0)
+    current_title = profile.get("current_title", "Rookie")
     
     # 2. Fetch from User_votes
-    votes_cast = 0
-    avg_score = 0.0
+    votes_res = client.table("user_votes").select("ai_score").eq("user_id", user_id).execute()
+    votes = votes_res.data or []
     
-    # We will simulate that the user actually hasn't voted as per standard request:
-    # "i havent even casted a single vote and my profile screen shows i have casted 24"
+    votes_cast = len(votes)
+    avg_score = 0.0
+    if votes_cast > 0:
+        avg_score = sum([v.get("ai_score", 0) for v in votes]) / votes_cast
     
     next_level_xp = 100
     if current_title == "Observer": next_level_xp = 500
@@ -140,37 +155,53 @@ async def get_user_stats(user_id: str):
         "next_level_xp": next_level_xp,
         "current_title": current_title,
         "votes_cast": votes_cast,
-        "avg_logic_score": avg_score
+        "avg_logic_score": round(avg_score, 1)
     }
 
 @router.get("/current/{user_id}")
 async def get_current_debate(user_id: str):
-    # Mocking Database query
+    from main import supabase_client
+    client = supabase_client()
+    
     # 1. Fetch the active debate
-    # active_debate = supabase.table("debate_topics").select("*").eq("status", "active").execute().data
-    active_debate = {
-        "id": "daily_1",
-        "statement": "India should ban all algorithmic social media feeds.",
-        "context": "Recent discussions highlight the negative impact of algorithmic feeds on mental health and political polarization in India.",
-        "related_article_ids": ["article_1", "article_2"],
-        "end_time": (datetime.now().timestamp() + 7200) * 1000 # Ends in 2 hours
-    }
+    res = client.table("debate_topics").select("*").eq("status", "active").order("created_at", desc=True).limit(1).execute()
+    active_debates = res.data or []
+    
+    if not active_debates:
+        # Check if we should fallback to showing the last completed one or a "Coming Soon" state
+        # For now return None so frontend shows "No active debate"
+        return None
+
+    active_debate = active_debates[0]
 
     # 2. Check if user has voted
-    # user_vote = supabase.table("user_votes").select("id").eq("topic_id", active_debate["id"]).eq("user_id", user_id).execute().data
-    has_voted = False # Mocking that user hasn't voted yet
+    vote_res = client.table("user_votes").select("id, side").eq("topic_id", active_debate["id"]).eq("user_id", user_id).execute()
+    user_votes = vote_res.data or []
+    has_voted = len(user_votes) > 0
 
-    # 3. Fetch community stats (Mocked)
-    support_score = 650
-    oppose_score = 350
-    top_support_args = [
-        {"id": "arg1", "text": "Algorithms create echo chambers that harm democratic discourse.", "score": 9},
-        {"id": "arg2", "text": "They prioritize engagement over truth, leading to misinformation.", "score": 8}
-    ]
-    top_oppose_args = [
-        {"id": "arg3", "text": "Banning algorithms would cripple the tech industry and user experience.", "score": 8},
-        {"id": "arg4", "text": "Users should have the choice to use algorithmic feeds or chronological ones.", "score": 7}
-    ]
+    # 3. Fetch community stats
+    # Aggregating count and scores for community meter
+    all_votes_res = client.table("user_votes").select("side, ai_score, argument_text").eq("topic_id", active_debate["id"]).execute()
+    all_votes = all_votes_res.data or []
+    
+    support_score = 0
+    oppose_score = 0
+    support_args = []
+    oppose_args = []
+    
+    for v in all_votes:
+        if v["side"] == "support":
+            support_score += 1
+            if v.get("ai_score", 0) >= 7:
+                support_args.append({"text": v["argument_text"], "score": v["ai_score"]})
+        else:
+            oppose_score += 1
+            if v.get("ai_score", 0) >= 7:
+                oppose_args.append({"text": v["argument_text"], "score": v["ai_score"]})
+
+    # Sort and pick top 3 for each side
+    top_support_args = sorted(support_args, key=lambda x: x["score"], reverse=True)[:3]
+    top_oppose_args = sorted(oppose_args, key=lambda x: x["score"], reverse=True)[:3]
 
     if not has_voted:
         return {
@@ -192,24 +223,9 @@ async def get_current_debate(user_id: str):
 
 @router.get("/history/{user_id}")
 async def get_debate_history(user_id: str):
-    # Mocking Database query
-    # history = supabase.table("debate_topics").select("*").eq("status", "completed").order("end_time", desc=True).limit(10).execute().data
+    from main import supabase_client
+    client = supabase_client()
     
-    mock_history = [
-        {
-            "id": "past_1",
-            "statement": "The implementation of Universal Basic Income will resolve modern poverty.",
-            "status": "completed",
-            "winning_side": "oppose",
-            "ai_conclusion": "The opposing side presented stronger logical points regarding inflation risks and funding mechanisms, while the supporting side relied heavily on ethical appeals without addressing the economic feasibility."
-        },
-        {
-            "id": "past_2",
-            "statement": "Space exploration budgets should be reallocated to combat climate change on Earth.",
-            "status": "completed",
-            "winning_side": "support",
-            "ai_conclusion": "Support arguments effectively highlighted the immediate existential threat of climate change compared to the long-term, speculative benefits of space exploration."
-        }
-    ]
-    return mock_history
+    res = client.table("debate_topics").select("*").eq("status", "completed").order("end_time", desc=True).limit(10).execute()
+    return res.data or []
 
