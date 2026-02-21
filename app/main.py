@@ -1794,10 +1794,10 @@ def schedule_jobs():
     scheduler.add_job(
         summarize_pending_round_robin,
         "interval",
-        minutes=3,
+        minutes=10,  # Run every 10 minutes instead of 3 for Llama-3
         id="summarize_rr",
         replace_existing=True,
-        kwargs={"per_category_limit": 2, "max_cycles": 10}
+        kwargs={"per_category_limit": 1, "max_cycles": 5}
     )
 
     # Run quiz generation daily at 2 AM UTC
@@ -1878,7 +1878,8 @@ def schedule_jobs():
     try:
         from concurrent.futures import ThreadPoolExecutor
         executor = ThreadPoolExecutor(max_workers=1)
-        executor.submit(summarize_pending_round_robin, per_category_limit=2, max_cycles=100)
+        # Reduced limits for Llama-3 at startup
+        executor.submit(summarize_pending_round_robin, per_category_limit=1, max_cycles=5)
         executor.submit(clean_existing_quiz_options)
         print("✅ Submitted async summarization & DB cleanup tasks at startup")
     except Exception as e:
@@ -1899,7 +1900,7 @@ def schedule_jobs():
         
         # Existing
         scheduler.add_job(smart_ingest_all_categories, "interval", hours=4, id="smart_ingest_job")
-        scheduler.add_job(summarize_pending_round_robin, "interval", minutes=60, id="summarize_round_robin_job")
+        # Notice: removed duplicate summarize_round_robin_job since we have summarize_rr above
         scheduler.add_job(generate_daily_quiz_questions, "cron", hour=2, minute=0, id="daily_quiz_gen_job")
         scheduler.add_job(send_daily_news_notification, 'cron', hour=8, minute=0, id="daily_news_push")
         scheduler.add_job(generate_daily_riddle, 'cron', hour=3, minute=0, id="daily_riddle_gen")
