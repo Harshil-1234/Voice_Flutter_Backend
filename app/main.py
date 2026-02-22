@@ -79,6 +79,9 @@ try:
 except Exception as e:
     print(f"❌ Failed to initialize Firebase Admin SDK: {e}")
 
+# Create FastAPI app before any route decorators are declared.
+app = FastAPI()
+
 # --- NEW RSS INGESTION CONFIG ---
 RSS_TOPIC_IDS = {
     "technology": "TECHNOLOGY",
@@ -1517,7 +1520,6 @@ def manage_debate_lifecycle():
         print(f"❌ [DEBATE] Lifecycle error: {e}")
 
 
-app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
