@@ -163,9 +163,29 @@ async def get_current_debate(user_id: str):
     from main import supabase_client
     client = supabase_client()
     
-    # 1. Fetch the active debate
-    res = client.table("debate_topics").select("*").eq("status", "active").order("created_at", desc=True).limit(1).execute()
-    active_debates = res.data or []
+    # 1. Fetch the active debate with schema fallbacks.
+    active_debates = []
+    try:
+        res = client.table("debate_topics").select("*").eq("status", "active").order("created_at", desc=True).limit(1).execute()
+        active_debates = res.data or []
+    except Exception:
+        active_debates = []
+
+    if not active_debates:
+        # Legacy schema fallback: is_active boolean.
+        try:
+            res = client.table("debate_topics").select("*").eq("is_active", True).order("created_at", desc=True).limit(1).execute()
+            active_debates = res.data or []
+        except Exception:
+            active_debates = []
+
+    if not active_debates:
+        # Lifecycle fallback: show upcoming when no active exists yet.
+        try:
+            res = client.table("debate_topics").select("*").eq("status", "upcoming").order("created_at", desc=True).limit(1).execute()
+            active_debates = res.data or []
+        except Exception:
+            active_debates = []
     
     if not active_debates:
         # Check if we should fallback to showing the last completed one or a "Coming Soon" state

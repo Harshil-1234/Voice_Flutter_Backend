@@ -157,6 +157,43 @@ def is_valid_display_name(name: str) -> Tuple[bool, str]:
 
     return True, ""
 
+@app.post("/user/update_display_name")
+def update_display_name(req: ProfileUpdate):
+    cleaned_name = req.display_name.strip()
+    is_valid, error_msg = is_valid_display_name(cleaned_name)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+    
+    try:
+        client = supabase_client()
+
+        try:
+            # Preferred schema: display_name + full_name.
+            client.table("profiles").update({
+                "display_name": cleaned_name,
+                "full_name": cleaned_name
+            }).eq("id", req.user_id).execute()
+        except Exception as update_err:
+            err_text = str(update_err).lower()
+            missing_display_col = ("display_name" in err_text) and (
+                "column" in err_text or "schema cache" in err_text
+            )
+            if missing_display_col:
+                # Legacy schema fallback: update full_name only.
+                client.table("profiles").update({
+                    "full_name": cleaned_name
+                }).eq("id", req.user_id).execute()
+            else:
+                raise update_err
+
+        return {"message": "Display name updated successfully"}
+    except Exception as e:
+        err_text = str(e).lower()
+        if "duplicate key value" in err_text or "unique constraint" in err_text:
+            raise HTTPException(status_code=409, detail="Display name is already taken.")
+        print(f"❌ Error updating display name: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update display name")
+
 def supabase_client():
     from supabase import create_client, Client
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
@@ -1444,7 +1481,7 @@ def manage_debate_lifecycle():
 
             # Call AI to summarize
             ai_conclusion = "The debate ended with equal participation but lacked strong logical arguments to summarize."
-            if args:
+            if top_args:
                 from LocalLLMService import conclude_debate
                 ai_conclusion = conclude_debate(statement, winning_side, top_args_text)
             
@@ -1488,6 +1525,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(debate_router)
 
 
 from fastapi import Depends, Header
