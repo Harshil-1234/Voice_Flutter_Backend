@@ -71,9 +71,12 @@ try:
     # Use the specific service account file provided by the user
     FB_SVC_PATH = os.path.join(os.path.dirname(__file__), "readdio-firebase-adminsdk-fbsvc-559cbc2036.json")
     if os.path.exists(FB_SVC_PATH):
-        cred = credentials.Certificate(FB_SVC_PATH)
-        firebase_admin.initialize_app(cred)
-        print("✅ Firebase Admin SDK initialized successfully")
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(FB_SVC_PATH)
+            firebase_admin.initialize_app(cred)
+            print("✅ Firebase Admin SDK initialized successfully")
+        else:
+            print("ℹ️ Firebase Admin SDK already initialized, reusing existing app")
     else:
         print(f"⚠️ Firebase service account not found at {FB_SVC_PATH}. FCM disabled.")
 except Exception as e:
@@ -3054,3 +3057,6 @@ def _randomize_question_options(question: dict) -> dict:
     except (json.JSONDecodeError, ValueError, IndexError) as e:
         print(f"Error randomizing options for question {question.get('id')}: {e}")
         return question
+
+
+

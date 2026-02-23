@@ -1,8 +1,5 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-import json
-import os
-from datetime import datetime
 
 from LocalLLMService import judge_argument
 
@@ -16,8 +13,9 @@ class VoteRequest(BaseModel):
     argument_text: str
 
 class VoteResponse(BaseModel):
-    score: int
-    feedback: str
+    vote_id: str
+    ai_score: int | None = None
+    ai_feedback: str
     key_factors: list[str]
     xp_earned: int
     new_title: str | None = None
@@ -44,70 +42,117 @@ def calculate_new_title(total_xp: int) -> str:
         return 'Observer'
     return 'Rookie'
 
+def _calculate_and_apply_xp(client, user_id: str, score: int) -> tuple[int, str | None]:
+    xp_earned = XP_BASE_VOTE + (score * XP_MULTIPLIER_SCORE)
+
+    profile_res = client.table("profiles").select("debate_xp", "current_title").eq("id", user_id).execute()
+    current_profile = profile_res.data[0] if profile_res.data else {"debate_xp": 0, "current_title": "Rookie"}
+    current_xp = int(current_profile.get("debate_xp", 0) or 0)
+
+    new_total_xp = current_xp + xp_earned
+    expected_title = calculate_new_title(new_total_xp)
+    new_title_to_return = None
+
+    update_data = {"debate_xp": new_total_xp}
+    if expected_title != current_profile.get("current_title", "Rookie"):
+        new_title_to_return = expected_title
+        update_data["current_title"] = expected_title
+
+    client.table("profiles").update(update_data).eq("id", user_id).execute()
+    return xp_earned, new_title_to_return
+
+def _evaluate_vote_in_background(vote_id: str, user_id: str, statement: str, argument_text: str):
+    from main import supabase_client
+
+    client = supabase_client()
+    ai_analysis = judge_argument(statement, argument_text)
+
+    try:
+        score = int(ai_analysis.get("score", 5))
+    except Exception:
+        score = 5
+    score = max(1, min(10, score))
+
+    ai_feedback = ai_analysis.get("feedback", "AI analysis completed.")
+    detailed = ai_analysis.get("detailed_analysis", "No detailed analysis available.")
+
+    client.table("user_votes").update({
+        "ai_score": score,
+        "ai_feedback": ai_feedback,
+        "hidden_feedback": detailed,
+        "ai_evaluated": True
+    }).eq("id", vote_id).execute()
+
+    # XP is awarded after AI scoring finishes.
+    _calculate_and_apply_xp(client, user_id, score)
+
 @router.post("/vote", response_model=VoteResponse)
-async def submit_vote(vote: VoteRequest):
+async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
     from main import supabase_client
     client = supabase_client()
-    
-    # 1. Fetch current topic statement for AI evaluation
+    clean_argument = (vote.argument_text or "").strip()
+
+    # Fast path: no argument means no AI call.
+    if not clean_argument:
+        vote_data = {
+            "user_id": vote.user_id,
+            "topic_id": vote.topic_id,
+            "side": vote.side,
+            "argument_text": "",
+            "ai_score": 1,
+            "ai_feedback": "Vote counted. No argument provided.",
+            "hidden_feedback": "To participate fully in the debate and earn a higher logic score, provide a written argument.",
+            "ai_evaluated": False
+        }
+        insert_res = client.table("user_votes").insert(vote_data).execute()
+        vote_id = insert_res.data[0]["id"] if insert_res.data else ""
+
+        xp_earned, new_title_to_return = _calculate_and_apply_xp(client, vote.user_id, 1)
+        return VoteResponse(
+            vote_id=vote_id,
+            ai_score=1,
+            ai_feedback="Vote counted. No argument provided.",
+            key_factors=["Missing reasoning"],
+            xp_earned=xp_earned,
+            new_title=new_title_to_return,
+            ai_evaluated=False
+        )
+
+    # Non-empty argument: insert pending vote and return immediately.
     topic_res = client.table("debate_topics").select("statement").eq("id", vote.topic_id).execute()
     if not topic_res.data:
         raise HTTPException(status_code=404, detail="Topic not found")
     statement = topic_res.data[0]["statement"]
-    
-    # 2. AI Judge Argument (using Local LLM)
-    ai_evaluated = True
-    if not vote.argument_text or len(vote.argument_text.strip()) < 5:
-        ai_evaluated = False
-        ai_analysis = {
-            "score": 1,
-            "feedback": "Vote counted. No argument provided.",
-            "key_factors": ["Missing reasoning"],
-            "detailed_analysis": "To participate fully in the debate and earn a higher logic score, you must provide a written argument defending your position."
-        }
-    else:
-        ai_analysis = judge_argument(statement, vote.argument_text)
-    
-    # 3. Gamification Math
-    score = ai_analysis.get("score", 1)
-    xp_earned = XP_BASE_VOTE + (score * XP_MULTIPLIER_SCORE)
-    
-    # 4. DB Transactions
-    # a. Store Vote
+
     vote_data = {
         "user_id": vote.user_id,
         "topic_id": vote.topic_id,
         "side": vote.side,
-        "argument_text": vote.argument_text,
-        "ai_score": score,
-        "ai_feedback": ai_analysis["feedback"],
-        "hidden_feedback": ai_analysis.get("detailed_analysis", "No detailed analysis available."),
-        "ai_evaluated": ai_evaluated
+        "argument_text": clean_argument,
+        "ai_score": None,
+        "ai_feedback": "AI is judging your logic...",
+        "hidden_feedback": None,
+        "ai_evaluated": False
     }
-    client.table("user_votes").insert(vote_data).execute()
-    
-    # b. Update Profile XP and Title
-    profile_res = client.table("profiles").select("debate_xp", "current_title").eq("id", vote.user_id).execute()
-    current_profile = profile_res.data[0] if profile_res.data else {"debate_xp": 0, "current_title": "Rookie"}
-    
-    new_total_xp = current_profile.get('debate_xp', 0) + xp_earned
-    expected_title = calculate_new_title(new_total_xp)
-    new_title_to_return = None
-    
-    update_data = {"debate_xp": new_total_xp}
-    if expected_title != current_profile.get('current_title', 'Rookie'):
-        new_title_to_return = expected_title
-        update_data["current_title"] = expected_title
-        
-    client.table("profiles").update(update_data).eq("id", vote.user_id).execute()
-    
+    insert_res = client.table("user_votes").insert(vote_data).execute()
+    vote_id = insert_res.data[0]["id"] if insert_res.data else ""
+
+    background_tasks.add_task(
+        _evaluate_vote_in_background,
+        vote_id,
+        vote.user_id,
+        statement,
+        clean_argument,
+    )
+
     return VoteResponse(
-        score=score,
-        feedback=ai_analysis["feedback"],
-        key_factors=ai_analysis.get("key_factors", []),
-        xp_earned=xp_earned,
-        new_title=new_title_to_return,
-        ai_evaluated=ai_evaluated
+        vote_id=vote_id,
+        ai_score=None,
+        ai_feedback="Vote cast! AI is judging your logic...",
+        key_factors=[],
+        xp_earned=0,
+        new_title=None,
+        ai_evaluated=False
     )
 
 @router.post("/unlock_feedback", response_model=UnlockResponse)
