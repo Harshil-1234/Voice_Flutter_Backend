@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
+import datetime
 
 from LocalLLMService import judge_argument
 
@@ -255,14 +256,15 @@ async def get_current_debate(user_id: str):
     oppose_args = []
     
     for v in all_votes:
+        score_val = v.get("ai_score") or 0
         if v["side"] == "support":
-            support_score += 1
-            if v.get("ai_score", 0) >= 7:
-                support_args.append({"text": v["argument_text"], "score": v["ai_score"]})
+            support_score += score_val
+            if score_val >= 7:
+                support_args.append({"text": v["argument_text"], "score": score_val})
         else:
-            oppose_score += 1
-            if v.get("ai_score", 0) >= 7:
-                oppose_args.append({"text": v["argument_text"], "score": v["ai_score"]})
+            oppose_score += score_val
+            if score_val >= 7:
+                oppose_args.append({"text": v["argument_text"], "score": score_val})
 
     # Sort and pick top 3 for each side
     top_support_args = sorted(support_args, key=lambda x: x["score"], reverse=True)[:3]
@@ -294,3 +296,40 @@ async def get_debate_history(user_id: str):
     res = client.table("debate_topics").select("*").eq("status", "completed").order("end_time", desc=True).limit(10).execute()
     return res.data or []
 
+@router.post("/conclude/{topic_id}")
+async def conclude_debate(topic_id: str):
+    from main import supabase_client
+    client = supabase_client()
+    
+    # 1. Fetch all votes for this topic
+    votes_res = client.table("user_votes").select("side, ai_score").eq("topic_id", topic_id).execute()
+    votes = votes_res.data or []
+    
+    support_sum = sum([v.get("ai_score") or 0 for v in votes if v["side"] == "support"])
+    oppose_sum = sum([v.get("ai_score") or 0 for v in votes if v["side"] == "oppose"])
+    
+    # 2. Determine winner
+    winning_side = "draw"
+    if support_sum > oppose_sum:
+        winning_side = "support"
+    elif oppose_sum > support_sum:
+        winning_side = "oppose"
+        
+    # 3. Update topic
+    update_data = {
+        "status": "completed",
+        "support_score": support_sum,
+        "oppose_score": oppose_sum,
+        "winning_side": winning_side,
+        "end_time": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }
+    
+    client.table("debate_topics").update(update_data).eq("id", topic_id).execute()
+    
+    return {
+        "status": "success",
+        "topic_id": topic_id,
+        "support_score": support_sum,
+        "oppose_score": oppose_sum,
+        "winner": winning_side
+    }
