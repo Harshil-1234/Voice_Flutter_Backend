@@ -12,6 +12,7 @@ class VoteRequest(BaseModel):
     topic_id: str
     side: str
     argument_text: str
+    is_anonymous: bool = False
 
 class VoteResponse(BaseModel):
     vote_id: str
@@ -103,7 +104,8 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
             "ai_score": 1,
             "ai_feedback": "Vote counted. No argument provided.",
             "hidden_feedback": "To participate fully in the debate and earn a higher logic score, provide a written argument.",
-            "ai_evaluated": False
+            "ai_evaluated": False,
+            "is_anonymous": vote.is_anonymous
         }
         insert_res = client.table("user_votes").insert(vote_data).execute()
         vote_id = insert_res.data[0]["id"] if insert_res.data else ""
@@ -133,7 +135,8 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
         "ai_score": None,
         "ai_feedback": "AI is judging your logic...",
         "hidden_feedback": None,
-        "ai_evaluated": False
+        "ai_evaluated": False,
+        "is_anonymous": vote.is_anonymous
     }
     insert_res = client.table("user_votes").insert(vote_data).execute()
     vote_id = insert_res.data[0]["id"] if insert_res.data else ""
