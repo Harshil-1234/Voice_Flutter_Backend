@@ -85,6 +85,14 @@ except Exception as e:
 # Create FastAPI app before any route decorators are declared.
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # --- NEW RSS INGESTION CONFIG ---
 RSS_TOPIC_IDS = {
     "technology": "TECHNOLOGY",
