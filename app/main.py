@@ -56,15 +56,15 @@ SUMMARIZE_BATCH_SIZE = int(os.getenv("SUMMARIZE_BATCH_SIZE", "20"))
 # Initialize LocalLLMService (Gemma-2-2b-it)
 try:
     llm_service = get_local_llm_service()
-    print("✅ LocalLLMService initialized successfully")
+    print("âœ… LocalLLMService initialized successfully")
 except Exception as e:
-    print(f"❌ CRITICAL ERROR: Failed to initialize LocalLLMService")
+    print(f"âŒ CRITICAL ERROR: Failed to initialize LocalLLMService")
     print(f"Error type: {type(e).__name__}")
     print(f"Error message: {e}")
     import traceback
     print("Full traceback:")
     traceback.print_exc()
-    print("⚠️ WARNING: Falling back to None - articles will NOT be summarized!")
+    print("âš ï¸ WARNING: Falling back to None - articles will NOT be summarized!")
     llm_service = None
 
 # Initialize Firebase Admin SDK
@@ -75,13 +75,13 @@ try:
         if not firebase_admin._apps:
             cred = credentials.Certificate(FB_SVC_PATH)
             firebase_admin.initialize_app(cred)
-            print("✅ Firebase Admin SDK initialized successfully")
+            print("âœ… Firebase Admin SDK initialized successfully")
         else:
-            print("ℹ️ Firebase Admin SDK already initialized, reusing existing app")
+            print("â„¹ï¸ Firebase Admin SDK already initialized, reusing existing app")
     else:
-        print(f"⚠️ Firebase service account not found at {FB_SVC_PATH}. FCM disabled.")
+        print(f"âš ï¸ Firebase service account not found at {FB_SVC_PATH}. FCM disabled.")
 except Exception as e:
-    print(f"❌ Failed to initialize Firebase Admin SDK: {e}")
+    print(f"âŒ Failed to initialize Firebase Admin SDK: {e}")
 
 # Create FastAPI app before any route decorators are declared.
 app = FastAPI()
@@ -240,7 +240,7 @@ def update_display_name(req: ProfileUpdate):
         err_text = str(e).lower()
         if "duplicate key value" in err_text or "unique constraint" in err_text:
             raise HTTPException(status_code=409, detail="Display name is already taken.")
-        print(f"❌ Error updating display name: {e}")
+        print(f"âŒ Error updating display name: {e}")
         raise HTTPException(status_code=500, detail="Failed to update display name")
 
 def supabase_client():
@@ -267,10 +267,10 @@ def resolve_redirect_url(url: str, timeout: int = 10) -> str:
         response = requests.head(url, allow_redirects=True, timeout=timeout, headers=headers)
         final_url = response.url
         if final_url != url:
-            print(f"🔗 Resolved redirect: {str(url)[:80]}... → {str(final_url)[:80]}...")
+            print(f"ðŸ”— Resolved redirect: {str(url)[:80]}... â†’ {str(final_url)[:80]}...")
         return final_url
     except Exception as e:
-        print(f"⚠️ Redirect resolution failed for {str(url)[:80]}: {e}")
+        print(f"âš ï¸ Redirect resolution failed for {str(url)[:80]}: {e}")
         return url
 
 
@@ -292,11 +292,11 @@ def extract_with_trafilatura(url: str) -> Optional[str]:
         text = trafilatura.extract(html, include_comments=False, include_tables=False)
         if text:
             # Log scraped length and resolved URL for debugging
-            print(f"🔎 Trafilatura extracted {len(text)} chars from {final_url}")
+            print(f"ðŸ”Ž Trafilatura extracted {len(text)} chars from {final_url}")
             return text
         return None
     except Exception as e:
-        print(f"⚠️ Trafilatura extraction failed for {url}: {e}")
+        print(f"âš ï¸ Trafilatura extraction failed for {url}: {e}")
         return None
 
 
@@ -329,7 +329,7 @@ def extract_with_beautifulsoup_fallback(url: str) -> Optional[str]:
         combined_text = "\n\n".join(texts)
         return combined_text if combined_text else None
     except Exception as e:
-        print(f"⚠️ BeautifulSoup fallback failed for {url}: {e}")
+        print(f"âš ï¸ BeautifulSoup fallback failed for {url}: {e}")
         return None
 
 
@@ -355,7 +355,7 @@ def extract_hero_image(html_content: str) -> Optional[str]:
         if og_image_tag and og_image_tag.get('content'):
             image_url = og_image_tag['content'].strip()
             if image_url:
-                print(f"🖼️ [extract_hero_image] Found og:image: {image_url[:80]}")
+                print(f"ðŸ–¼ï¸ [extract_hero_image] Found og:image: {image_url[:80]}")
                 return image_url
         
         # Priority 2: Twitter Card Image (twitter:image)
@@ -363,15 +363,15 @@ def extract_hero_image(html_content: str) -> Optional[str]:
         if twitter_image_tag and twitter_image_tag.get('content'):
             image_url = twitter_image_tag['content'].strip()
             if image_url:
-                print(f"🖼️ [extract_hero_image] Found twitter:image: {image_url[:80]}")
+                print(f"ðŸ–¼ï¸ [extract_hero_image] Found twitter:image: {image_url[:80]}")
                 return image_url
         
         # No image found
-        print(f"⚠️ [extract_hero_image] No og:image or twitter:image found")
+        print(f"âš ï¸ [extract_hero_image] No og:image or twitter:image found")
         return None
         
     except Exception as e:
-        print(f"❌ [extract_hero_image] Error extracting image: {e}")
+        print(f"âŒ [extract_hero_image] Error extracting image: {e}")
         return None
 
 
@@ -407,7 +407,7 @@ def extract_youtube_id(youtube_url: str) -> Optional[str]:
         if match:
             return match.group(1)
     except Exception as e:
-        print(f"⚠️ [extract_youtube_id] Error: {e}")
+        print(f"âš ï¸ [extract_youtube_id] Error: {e}")
     return None
 
 
@@ -420,10 +420,10 @@ def extract_youtube_thumbnail(youtube_url: str) -> Optional[str]:
         video_id = extract_youtube_id(youtube_url)
         if video_id:
             thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
-            print(f"🎬 [extract_youtube_thumbnail] Generated thumbnail: {thumbnail_url}")
+            print(f"ðŸŽ¬ [extract_youtube_thumbnail] Generated thumbnail: {thumbnail_url}")
             return thumbnail_url
     except Exception as e:
-        print(f"⚠️ [extract_youtube_thumbnail] Error: {e}")
+        print(f"âš ï¸ [extract_youtube_thumbnail] Error: {e}")
     return None
 
 
@@ -435,12 +435,12 @@ def fetch_article_content(url: str) -> Tuple[Optional[str], str, bool, Optional[
     1) Decode Google URL using new_decoderv1 (handles Protobuf/Base64 encoding)
     2) Validate: ensure decoded URL is NOT a Google domain
     3) Check for YouTube: if video, mark is_video=True and extract thumbnail
-    4) Scrape: use trafilatura.fetch_url() → trafilatura.extract() and extract_hero_image()
+    4) Scrape: use trafilatura.fetch_url() â†’ trafilatura.extract() and extract_hero_image()
     
     Returns: (extracted_text or None, final_url, is_video, image_url or None)
     """
     safe_url = str(url)
-    print(f"\n🚀 [fetch_article_content] Starting with Google URL: {safe_url[:80]}")
+    print(f"\nðŸš€ [fetch_article_content] Starting with Google URL: {safe_url[:80]}")
     final_url = safe_url
     image_url = None
     
@@ -449,32 +449,32 @@ def fetch_article_content(url: str) -> Tuple[Optional[str], str, bool, Optional[
         decoded_data = new_decoderv1(url)
         if decoded_data.get("status"):
             final_url = decoded_data["decoded_url"]
-            print(f"✅ [googlenewsdecoder] Successfully decoded to: {final_url[:80]}")
+            print(f"âœ… [googlenewsdecoder] Successfully decoded to: {final_url[:80]}")
         else:
-            print(f"⚠️ [googlenewsdecoder] Decode failed (status=False). Keeping original URL.")
+            print(f"âš ï¸ [googlenewsdecoder] Decode failed (status=False). Keeping original URL.")
     except Exception as e:
-        print(f"❌ [googlenewsdecoder] Decoder error: {e}. Keeping original URL.")
+        print(f"âŒ [googlenewsdecoder] Decoder error: {e}. Keeping original URL.")
 
     # STEP 2: Safety Check - If still stuck on Google, ABORT immediately
     if "news.google.com" in final_url or "google.com" in final_url:
-        print(f"⏭️ Skipping: Could not resolve from Google domain: {final_url[:80]}")
+        print(f"â­ï¸ Skipping: Could not resolve from Google domain: {final_url[:80]}")
         return None, final_url, False, None
 
     # STEP 3: Video Detection (YouTube) - Extract thumbnail instead of scraping
     low_url = final_url.lower()
     if "youtube.com" in low_url or "youtu.be" in low_url:
-        print(f"📹 [fetch_article_content] YouTube video detected: {final_url[:80]}")
+        print(f"ðŸ“¹ [fetch_article_content] YouTube video detected: {final_url[:80]}")
         thumbnail = extract_youtube_thumbnail(final_url)
         return None, final_url, True, thumbnail
 
     # STEP 4: Scrape the actual publisher URL with trafilatura
     try:
-        print(f"📄 [fetch_article_content] Fetching real article from: {final_url[:80]}")
+        print(f"ðŸ“„ [fetch_article_content] Fetching real article from: {final_url[:80]}")
         
         # Use trafilatura.fetch_url to handle headers, redirects, and encoding automatically
         downloaded = trafilatura.fetch_url(final_url)
         if not downloaded:
-            print(f"⚠️ [trafilatura] fetch_url returned None/empty for {final_url[:80]}")
+            print(f"âš ï¸ [trafilatura] fetch_url returned None/empty for {final_url[:80]}")
             return None, final_url, False, None
         
         # Extract text from the downloaded HTML
@@ -485,15 +485,15 @@ def fetch_article_content(url: str) -> Tuple[Optional[str], str, bool, Optional[
         
         # Basic validation: ensure we have sufficient text
         if text and len(text) > 200:
-            print(f"✅ [fetch_article_content] Extracted {len(text)} chars from {final_url[:80]}")
+            print(f"âœ… [fetch_article_content] Extracted {len(text)} chars from {final_url[:80]}")
             return text, final_url, False, image_url
         else:
             text_len = len(text) if text else 0
-            print(f"⚠️ [fetch_article_content] Text too short ({text_len} chars) from {final_url[:80]}")
+            print(f"âš ï¸ [fetch_article_content] Text too short ({text_len} chars) from {final_url[:80]}")
             return None, final_url, False, image_url
             
     except Exception as e:
-        print(f"❌ [fetch_article_content] Scrape/extraction failed for {final_url[:80]}: {e}")
+        print(f"âŒ [fetch_article_content] Scrape/extraction failed for {final_url[:80]}: {e}")
         return None, final_url, False, None
 
 
@@ -501,13 +501,13 @@ def summarize_text_if_possible(content, titles=None):
     """
     Summarize text using LocalLLMService (Gemma-2-2b-it).
     Returns summary + UPSC relevance + tags.
-    - If `content` is a single string → returns a single Dict or None.
-    - If `content` is a list of strings → returns a list of Dicts aligned with input.
+    - If `content` is a single string â†’ returns a single Dict or None.
+    - If `content` is a list of strings â†’ returns a list of Dicts aligned with input.
     Titles are optional, mainly used for debugging/logging.
     No longer skips short articles; sends everything to the local model.
     """
     if llm_service is None:
-        print("❌ CRITICAL: LocalLLMService is None - model not loaded!")
+        print("âŒ CRITICAL: LocalLLMService is None - model not loaded!")
         print("   Check startup logs for initialization errors.")
         print("   Skipping summarization for this batch.")
         if isinstance(content, str):
@@ -533,7 +533,7 @@ def summarize_text_if_possible(content, titles=None):
                 if not text or not text.strip():
                     results.append(None)
                     if titles and idx < len(titles):
-                        print(f"⏭️ Skipped empty article: {titles[idx][:80]}")
+                        print(f"â­ï¸ Skipped empty article: {titles[idx][:80]}")
                     continue
                 
                 result = llm_service.analyze_article(text)
@@ -544,7 +544,7 @@ def summarize_text_if_possible(content, titles=None):
                         summary = result.get("summary", "")[:80].replace("\n", " ")
                         relevant = result.get("upsc_relevant", False)
                         tags = result.get("tags", [])
-                        print(f"✅ Analyzed: {titles[idx][:60]} → Relevant: {relevant}, Tags: {tags}")
+                        print(f"âœ… Analyzed: {titles[idx][:60]} â†’ Relevant: {relevant}, Tags: {tags}")
                 else:
                     results.append(None)
             
@@ -569,7 +569,7 @@ def call_groq_summarize(titles: List[str], texts: List[str]) -> List[str]:
     This function remains for backward compatibility but should NOT be called.
     Returns empty list immediately to prevent any accidental Groq API usage.
     """
-    print("⚠️ WARNING: call_groq_summarize() called but is DISABLED!")
+    print("âš ï¸ WARNING: call_groq_summarize() called but is DISABLED!")
     print("   Summarization is now exclusively using LocalLLMService (Gemma-2-2b-it).")
     print("   Returning empty list to prevent Groq API usage.")
     return []
@@ -592,12 +592,12 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
         if full_text and len(full_text.strip()) > 600:
             to_sum.append((a, title, full_text))
         elif full_text and len(full_text.strip()) <= 600:
-            print(f"⏭️ Rejecting short article ({len(full_text.strip())} chars): {title[:80]}")
+            print(f"â­ï¸ Rejecting short article ({len(full_text.strip())} chars): {title[:80]}")
         elif not full_text:
-            print(f"⏭️ Skipping empty article: {title[:80]}")
+            print(f"â­ï¸ Skipping empty article: {title[:80]}")
 
     if not to_sum:
-        print("⚠️ No articles with >600 characters available for summarization.")
+        print("âš ï¸ No articles with >600 characters available for summarization.")
         return (0, 0)
 
     batch_size = 20
@@ -658,11 +658,11 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
 
                 summarized_count += 1
                 tag_str = ", ".join(tags) if tags else "N/A"
-                print(f"✅ Saved summary for: {title[:80]} | Relevant: {upsc_relevant} | Tags: {tag_str}")
+                print(f"âœ… Saved summary for: {title[:80]} | Relevant: {upsc_relevant} | Tags: {tag_str}")
             except Exception as e:
-                print(f"⚠️ Error saving summary for {title[:80]}: {e}")
+                print(f"âš ï¸ Error saving summary for {title[:80]}: {e}")
 
-    print(f"✅ Summarization complete — batches: {batches}, summarized: {summarized_count}")
+    print(f"âœ… Summarization complete â€” batches: {batches}, summarized: {summarized_count}")
     return (batches, summarized_count)
 
 
@@ -728,7 +728,7 @@ def _prepare_texts(items):
             filtered_texts.append(txt)
         else:
             title = item.get("title") or ""
-            print(f"⏭️ Skipping empty article: {title[:80]}")
+            print(f"â­ï¸ Skipping empty article: {title[:80]}")
     
     return filtered_titles, filtered_texts, filtered_items
 
@@ -744,7 +744,7 @@ def summarize_pending_round_robin(per_category_limit: int = 2, max_cycles: int =
         if not pending_map:
             break
 
-        # Round‑robin flattening: preserve fairness
+        # Roundâ€‘robin flattening: preserve fairness
         combined = []
         has_more = True
         while has_more:
@@ -795,10 +795,10 @@ def summarize_pending_round_robin(per_category_limit: int = 2, max_cycles: int =
             except Exception as e:
                 print(f"Save summary error for id={item.get('id')}: {e}")
 
-    print(f"✅ Round‑robin summarization complete: cycles={cycles}, updated={total_updated}")
+    print(f"âœ… Roundâ€‘robin summarization complete: cycles={cycles}, updated={total_updated}")
 
 def clean_existing_quiz_options():
-    print("🧹 Starting one-time cleanup of Quiz Options...")
+    print("ðŸ§¹ Starting one-time cleanup of Quiz Options...")
     client = supabase_client()
     
     # 1. Fetch all questions
@@ -829,7 +829,7 @@ def clean_existing_quiz_options():
                     try:
                         options_list = json.loads(raw_options)
                     except:
-                        print(f"⚠️ Skipping invalid JSON for {q_id}")
+                        print(f"âš ï¸ Skipping invalid JSON for {q_id}")
                         continue
                 elif isinstance(raw_options, list):
                     options_list = raw_options
@@ -861,10 +861,10 @@ def clean_existing_quiz_options():
             page += 1
             
         except Exception as e:
-            print(f"❌ Error in cleanup loop: {e}")
+            print(f"âŒ Error in cleanup loop: {e}")
             break
             
-    print(f"✅ Cleanup Complete. Fixed {total_cleaned} questions.")
+    print(f"âœ… Cleanup Complete. Fixed {total_cleaned} questions.")
 
 # --- START NEW INGESTION LOGIC ---
 
@@ -889,13 +889,13 @@ def fetch_rss_feed(category: str, country_code: str) -> List[dict]:
     
     url = RSS_URL_PATTERN.format(topic_id=topic_id, country_code=country_code)
     try:
-        print(f"📡 Fetching RSS feed: {url}")
+        print(f"ðŸ“¡ Fetching RSS feed: {url}")
         feed = feedparser.parse(url)
         if feed.bozo:
-            print(f"⚠️ Warning: Malformed feed from {url}. Reason: {feed.bozo_exception}")
+            print(f"âš ï¸ Warning: Malformed feed from {url}. Reason: {feed.bozo_exception}")
         return feed.entries
     except Exception as e:
-        print(f"❌ Error fetching or parsing RSS feed {url}: {e}")
+        print(f"âŒ Error fetching or parsing RSS feed {url}: {e}")
         return []
 
 
@@ -968,12 +968,12 @@ def fetch_video_news():
     - Saves thumbnail via img.youtube.com
     - Stores metadata only (no video download/re-host)
     """
-    print("🎬 Starting dedicated video ingestion cycle...")
+    print("ðŸŽ¬ Starting dedicated video ingestion cycle...")
     client = supabase_client()
     search_queries = [
-        "India News (English OR Hindi OR हिंदी) site:youtube.com",
-        "World News (English OR Hindi OR हिंदी) site:youtube.com",
-        "Tech News (English OR Hindi OR हिंदी) site:youtube.com",
+        "India News (English OR Hindi OR à¤¹à¤¿à¤‚à¤¦à¥€) site:youtube.com",
+        "World News (English OR Hindi OR à¤¹à¤¿à¤‚à¤¦à¥€) site:youtube.com",
+        "Tech News (English OR Hindi OR à¤¹à¤¿à¤‚à¤¦à¥€) site:youtube.com",
     ]
 
     candidate_rows: List[Dict] = []
@@ -984,10 +984,10 @@ def fetch_video_news():
                 "https://news.google.com/rss/search"
                 f"?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
             )
-            print(f"🎥 [VIDEO] Fetching query: {query} -> {search_url[:100]}...")
+            print(f"ðŸŽ¥ [VIDEO] Fetching query: {query} -> {search_url[:100]}...")
             feed = feedparser.parse(search_url)
             entries = feed.entries if hasattr(feed, "entries") else []
-            print(f"🎥 [VIDEO] Found {len(entries)} entries for '{query}'")
+            print(f"ðŸŽ¥ [VIDEO] Found {len(entries)} entries for '{query}'")
 
             for entry in entries[:20]:
                 try:
@@ -1001,7 +1001,7 @@ def fetch_video_news():
                         if dec and dec.get("status") and dec.get("decoded_url"):
                             resolved_link = dec.get("decoded_url") or rss_link
                     except Exception as decode_err:
-                        print(f"⚠️ [VIDEO] Decode failed for link: {decode_err}")
+                        print(f"âš ï¸ [VIDEO] Decode failed for link: {decode_err}")
 
                     if not _is_youtube_host(resolved_link):
                         continue
@@ -1011,7 +1011,8 @@ def fetch_video_news():
                         # Strictly keep only videos from YouTube
                         continue
 
-                    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+                    # Keep original YouTube format (watch/shorts/youtu.be) so UI can adapt layout.
+                    source_url = resolved_link
                     thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
                     source_name = entry.get("source", {}).get("title") or "YouTube"
                     title = (entry.get("title") or "Video Update").strip()
@@ -1021,11 +1022,11 @@ def fetch_video_news():
 
                     lang_sample = f"{title}\n{description}"
                     if not _is_english_or_hindi_text(lang_sample):
-                        print(f"⏭️ [VIDEO] Skipped non EN/HI item: {title[:80]}")
+                        print(f"â­ï¸ [VIDEO] Skipped non EN/HI item: {title[:80]}")
                         continue
 
                     if not _is_trusted_video_source(source_name, title, description):
-                        print(f"⏭️ [VIDEO] Skipped non-allowlisted source: {source_name}")
+                        print(f"â­ï¸ [VIDEO] Skipped non-allowlisted source: {source_name}")
                         continue
 
                     safe_description = _truncate_metadata_text(description, max_chars=220)
@@ -1033,7 +1034,7 @@ def fetch_video_news():
 
                     candidate_rows.append(
                         {
-                            "url": canonical_url,
+                            "url": source_url,
                             "title": title,
                             "description": safe_description,
                             "content": None,
@@ -1046,40 +1047,44 @@ def fetch_video_news():
                             "published_at": published_at,
                             "summarized": True,
                             "summarization_needed": False,
+                            "_video_id": video_id,
                         }
                     )
                 except Exception as item_err:
-                    print(f"⚠️ [VIDEO] Failed to process entry: {item_err}")
+                    print(f"âš ï¸ [VIDEO] Failed to process entry: {item_err}")
         except Exception as e:
-            print(f"❌ [VIDEO] Query failed for '{query}': {e}")
+            print(f"âŒ [VIDEO] Query failed for '{query}': {e}")
 
     if not candidate_rows:
-        print("ℹ️ [VIDEO] No YouTube video news found in this cycle.")
+        print("â„¹ï¸ [VIDEO] No YouTube video news found in this cycle.")
         return
 
     # Dedupe within this cycle by URL hash
     unique_rows: Dict[str, Dict] = {}
     for row in candidate_rows:
+        video_id = row.get("_video_id")
         url = row.get("url")
-        if not url:
+        if not video_id or not url:
             continue
-        unique_rows[md5_lower(url)] = row
+        # Prefer de-duplication by YouTube video ID over raw URL (params can vary).
+        unique_rows[str(video_id)] = row
 
     saved = 0
     for row in unique_rows.values():
+        row.pop("_video_id", None)
         try:
             client.table("articles").upsert(row, on_conflict="url_hash").execute()
             saved += 1
         except Exception as upsert_err:
             # Fallback for projects where upsert by generated url_hash is not allowed.
-            print(f"⚠️ [VIDEO] url_hash upsert failed, retrying by title: {upsert_err}")
+            print(f"âš ï¸ [VIDEO] url_hash upsert failed, retrying by title: {upsert_err}")
             try:
                 client.table("articles").upsert(row, on_conflict="title").execute()
                 saved += 1
             except Exception as fallback_err:
-                print(f"❌ [VIDEO] Fallback upsert failed: {fallback_err}")
+                print(f"âŒ [VIDEO] Fallback upsert failed: {fallback_err}")
 
-    print(f"✅ [VIDEO] Saved/updated {saved} video articles.")
+    print(f"âœ… [VIDEO] Saved/updated {saved} video articles.")
 
 
 def update_live_ticker():
@@ -1087,10 +1092,10 @@ def update_live_ticker():
     Updates the currently active live event:
     1) fetch active topic from DB
     2) fetch latest Google RSS headlines for that topic
-    3) ask local Llama model for one-sentence status
-    4) write status_text + last_updated back to DB
+    3) ask local Llama model for material-change decision
+    4) update DB only when there is a significant new development
     """
-    print("📡 [LIVE] Updating live ticker...")
+    print("[LIVE] Updating live ticker...")
     client = supabase_client()
 
     try:
@@ -1104,18 +1109,19 @@ def update_live_ticker():
         )
         active_rows = active_res.data or []
     except Exception as e:
-        print(f"❌ [LIVE] Failed to fetch active live event: {e}")
+        print(f"[LIVE] Failed to fetch active live event: {e}")
         return
 
     if not active_rows:
-        print("ℹ️ [LIVE] No active live event found.")
+        print("[LIVE] No active live event found.")
         return
 
     event = active_rows[0]
     event_id = event.get("id")
     topic_query = (event.get("topic_query") or "").strip()
+    previous_status = (event.get("status_text") or "").strip()
     if not event_id or not topic_query:
-        print("⚠️ [LIVE] Active event is missing id/topic_query; skipping.")
+        print("[LIVE] Active event is missing id/topic_query; skipping.")
         return
 
     search_url = (
@@ -1131,19 +1137,38 @@ def update_live_ticker():
             if title:
                 headlines.append(title)
     except Exception as e:
-        print(f"❌ [LIVE] Failed to fetch Google RSS for '{topic_query}': {e}")
+        print(f"[LIVE] Failed to fetch Google RSS for '{topic_query}': {e}")
 
-    if headlines:
-        try:
-            if llm_service is not None and hasattr(llm_service, "generate_live_ticker_status"):
-                status_text = llm_service.generate_live_ticker_status(topic_query, headlines)
-            else:
-                status_text = headlines[0]
-        except Exception as e:
-            print(f"⚠️ [LIVE] LLM status generation failed: {e}")
-            status_text = headlines[0]
-    else:
-        status_text = f"No major updates yet for {topic_query}."
+    if not headlines:
+        print("[LIVE] Live event: No significant change.")
+        return
+
+    try:
+        if llm_service is not None and hasattr(llm_service, "generate_live_ticker_status"):
+            status_text = llm_service.generate_live_ticker_status(
+                topic_query,
+                headlines,
+                previous_status,
+            )
+        else:
+            status_text = "NO_UPDATE"
+    except Exception as e:
+        print(f"[LIVE] LLM status generation failed: {e}")
+        status_text = "NO_UPDATE"
+
+    status_text = re.sub(r"\s+", " ", (status_text or "").strip())
+    no_update_token = re.sub(r"[^A-Z_]", "", status_text.upper())
+    if not status_text or no_update_token == "NOUPDATE":
+        print("[LIVE] Live event: No significant change.")
+        return
+
+    if status_text == previous_status:
+        print("[LIVE] Live event: No significant change.")
+        return
+
+    words = status_text.split()
+    if len(words) > 15:
+        status_text = " ".join(words[:15])
 
     try:
         client.table("live_events").update(
@@ -1152,9 +1177,22 @@ def update_live_ticker():
                 "last_updated": datetime.utcnow().isoformat(),
             }
         ).eq("id", event_id).execute()
-        print(f"✅ [LIVE] Updated ticker: {status_text}")
+        print(f"[LIVE] Updated ticker: {status_text}")
     except Exception as e:
-        print(f"❌ [LIVE] Failed to update live event row: {e}")
+        print(f"[LIVE] Failed to update live event row: {e}")
+        return
+
+    # Keep a compact history feed for UI ("past 4-5 updates").
+    try:
+        client.table("live_event_updates").insert(
+            {
+                "live_event_id": event_id,
+                "status_text": status_text,
+            }
+        ).execute()
+    except Exception as e:
+        print(f"[LIVE] Failed to append update history: {e}")
+
 
 def process_rss_entry(entry: dict, category: str, country: str) -> Optional[dict]:
     """Processes a single RSS entry into a dictionary for database insertion."""
@@ -1181,12 +1219,12 @@ def process_rss_entry(entry: dict, category: str, country: str) -> Optional[dict
             try:
                 dec = new_decoderv1(link)
             except Exception as e:
-                print(f"⚠️ googlenewsdecoder error for {link}: {e}")
+                print(f"âš ï¸ googlenewsdecoder error for {link}: {e}")
             if dec and dec.get("status") and dec.get("decoded_url"):
                 final_link = dec.get("decoded_url") or link
-                print(f"🔗 Decoded RSS link to: {final_link}")
+                print(f"ðŸ”— Decoded RSS link to: {final_link}")
         except Exception as e:
-            print(f"⚠️ Error during decode for {link}: {e}")
+            print(f"âš ï¸ Error during decode for {link}: {e}")
 
         is_video = False
         if final_link and ("youtube.com" in final_link.lower() or "youtu.be" in final_link.lower()):
@@ -1215,7 +1253,7 @@ def smart_ingest_all_categories():
     Main function to fetch news from Google News RSS feeds, process, and store them.
     This replaces the old NewsAPI-based ingestion.
     """
-    print("🚀 Starting smart ingestion cycle...")
+    print("ðŸš€ Starting smart ingestion cycle...")
     client = supabase_client()
     
     all_new_articles = []
@@ -1246,16 +1284,16 @@ def smart_ingest_all_categories():
             country_code = "US"
             search_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-{country_code}&gl={country_code}&ceid={country_code}:en"
             
-            print(f"   → Fetching niche category '{category}': {search_url[:120]}...")
+            print(f"   â†’ Fetching niche category '{category}': {search_url[:120]}...")
             feed = feedparser.parse(search_url)
             entries = feed.entries if hasattr(feed, 'entries') else []
-            print(f"   → Found {len(entries)} entries for '{category}'")
+            print(f"   â†’ Found {len(entries)} entries for '{category}'")
             
             processed_entries = [process_rss_entry(e, category, "GLOBAL") for e in entries[:5]]
             all_new_articles.extend([p for p in processed_entries if p])
             time.sleep(2)
         except Exception as e:
-            print(f"   ⚠️ Niche category fetch failed for '{category}': {e}")
+            print(f"   âš ï¸ Niche category fetch failed for '{category}': {e}")
 
     # 3. Fetch Local Categories for each active country
     for country_code in ACTIVE_COUNTRIES:
@@ -1265,28 +1303,28 @@ def smart_ingest_all_categories():
             
             # SPECIAL HANDLING: Sports category gets dual-fetch (local + global)
             if category == "sports":
-                print(f"⚽ [Sports] Performing dual-fetch: Local + International")
+                print(f"âš½ [Sports] Performing dual-fetch: Local + International")
                 
                 # Fetch 1: Local Sports (Cricket, local tournaments, etc.)
                 local_entries = fetch_rss_feed(category, country_code)
-                print(f"   → Local Sports entries: {len(local_entries)}")
+                print(f"   â†’ Local Sports entries: {len(local_entries)}")
                 
                 # Fetch 2: Global search for international sports (Football, F1, Tennis)
                 try:
                     global_query = "Football OR Soccer OR Premier League OR Champions League OR F1 OR Tennis"
                     encoded_query = global_query.replace(" ", "+")
                     global_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-{country_code.lower()}&gl={country_code}&ceid={country_code}:en"
-                    print(f"   → Fetching global search: {global_url[:80]}...")
+                    print(f"   â†’ Fetching global search: {global_url[:80]}...")
                     global_feed = feedparser.parse(global_url)
                     global_entries = global_feed.entries if hasattr(global_feed, 'entries') else []
-                    print(f"   → Global Sports entries: {len(global_entries)}")
+                    print(f"   â†’ Global Sports entries: {len(global_entries)}")
                 except Exception as e:
-                    print(f"   ⚠️ Global sports fetch failed: {e}")
+                    print(f"   âš ï¸ Global sports fetch failed: {e}")
                     global_entries = []
                 
                 # Merge: Take top 4 from local + top 4 from global
                 entries = local_entries[:4] + global_entries[:4]
-                print(f"   ✅ Combined entries (local + global): {len(entries)}")
+                print(f"   âœ… Combined entries (local + global): {len(entries)}")
             else:
                 # Standard fetch for non-sports categories
                 entries = fetch_rss_feed(category, country_code)
@@ -1308,7 +1346,7 @@ def smart_ingest_all_categories():
         result = client.table("articles").select("url_hash").execute()
         existing_urls_hashes = {item['url_hash'] for item in result.data}
     except Exception as e:
-        print(f"⚠️ Could not fetch existing URLs for deduplication: {e}")
+        print(f"âš ï¸ Could not fetch existing URLs for deduplication: {e}")
 
     unique_articles = []
     for article in all_new_articles:
@@ -1334,7 +1372,7 @@ def smart_ingest_all_categories():
         try:
             scraped_text, real_url, is_video, image_url = fetch_article_content(url)
         except Exception as e:
-            print(f"⚠️ Error during fetch_article_content for {url}: {e}")
+            print(f"âš ï¸ Error during fetch_article_content for {url}: {e}")
             scraped_text, real_url, is_video, image_url = None, url, False, None
 
         # --- Start Refactored Logic ---
@@ -1345,7 +1383,7 @@ def smart_ingest_all_categories():
 
         # 2. CRITICAL CHECK: If both content and description are invalid, abort.
         if content is None and desc is None:
-            print(f"⏭️ Skipping article (no content): {article.get('title', 'No Title')[:80]}")
+            print(f"â­ï¸ Skipping article (no content): {article.get('title', 'No Title')[:80]}")
             return # DO NOT SAVE
 
         article_data = article.copy()
@@ -1364,7 +1402,7 @@ def smart_ingest_all_categories():
             article_data["summary"] = desc # Use sanitized description if available
             article_data["summarized"] = desc is not None
             article_data["summarization_needed"] = False
-            print(f"📹 Detected video, saving with description as summary: {article.get('title')}")
+            print(f"ðŸ“¹ Detected video, saving with description as summary: {article.get('title')}")
         else:
             # 3. Flag Logic for regular articles (with LocalLLMService, require 600+ characters)
             summary = None
@@ -1376,10 +1414,10 @@ def smart_ingest_all_categories():
                     # Content is sufficient - queue for summarization
                     summarization_needed = True
                     article_data["content"] = content
-                    print(f"📝 Article has {len(content.strip())} chars, queued for LocalLLM summarization: {article.get('title')}")
+                    print(f"ðŸ“ Article has {len(content.strip())} chars, queued for LocalLLM summarization: {article.get('title')}")
                 else:
                     # Content is too short - reject and don't save
-                    print(f"⏭️ Rejecting article ({len(content.strip())} chars < 600): {article.get('title')}")
+                    print(f"â­ï¸ Rejecting article ({len(content.strip())} chars < 600): {article.get('title')}")
                     return
             
             # If no content but have description, check its length
@@ -1388,14 +1426,14 @@ def smart_ingest_all_categories():
                     # Description is sufficient - use it
                     summary = desc
                     article_data["content"] = desc
-                    print(f"📝 Using long description as summary ({len(desc.strip())} chars): {article.get('title')}")
+                    print(f"ðŸ“ Using long description as summary ({len(desc.strip())} chars): {article.get('title')}")
                 else:
                     # Description too short - reject and don't save
-                    print(f"⏭️ Rejecting article (description {len(desc.strip())} chars < 600): {article.get('title')}")
+                    print(f"â­ï¸ Rejecting article (description {len(desc.strip())} chars < 600): {article.get('title')}")
                     return
             else:
                 # No content and no description - nothing to work with
-                print(f"⏭️ Skipping article (no content or description): {article.get('title')}")
+                print(f"â­ï¸ Skipping article (no content or description): {article.get('title')}")
                 return
 
 
@@ -1438,15 +1476,15 @@ def smart_ingest_all_categories():
             row_to_insert = {k: v for k, v in row_to_insert.items() if v is not None or k == "tags"}
             
             client.table("articles").upsert(row_to_insert, on_conflict="title").execute()
-            print(f"✅ Saved initial data for: {article_data.get('title', 'No Title')[:60]}")
+            print(f"âœ… Saved initial data for: {article_data.get('title', 'No Title')[:60]}")
         except Exception as e:
-            print(f"❌ DB insert/update failed for {article_data.get('title', 'No Title')}: {e}")
+            print(f"âŒ DB insert/update failed for {article_data.get('title', 'No Title')}: {e}")
 
     # Run the scraping and saving process in parallel for each unique article
     with ThreadPoolExecutor(max_workers=8) as executor:
         executor.map(process_and_scrape, unique_articles)
 
-    print("🏁 Smart ingestion cycle complete. Summaries will be processed by the background worker.")
+    print("ðŸ Smart ingestion cycle complete. Summaries will be processed by the background worker.")
 
 # --- END NEW INGESTION LOGIC ---
 
@@ -1688,7 +1726,7 @@ def generate_daily_quiz_questions():
     It iteratively fetches batches of unprocessed articles and generates questions until
     a target number is met or a safety limit is reached.
     """
-    print("🚀 Starting 'Fill the Bucket' daily quiz generation...")
+    print("ðŸš€ Starting 'Fill the Bucket' daily quiz generation...")
     client = supabase_client()
 
     target_questions = 60
@@ -1709,14 +1747,14 @@ def generate_daily_quiz_questions():
         articles_to_process = [a for a in articles_batch if a.get('title') not in processed_titles_in_run]
 
         if not articles_to_process:
-            print("✅ No more unprocessed articles in the database. Halting.")
+            print("âœ… No more unprocessed articles in the database. Halting.")
             break
 
         titles_in_batch = [a.get('title') for a in articles_to_process if a.get('title')]
         articles_scanned += len(articles_to_process)
         processed_titles_in_run.update(titles_in_batch)
 
-        print(f"ℹ️ Fetched {len(articles_to_process)} new articles to process...")
+        print(f"â„¹ï¸ Fetched {len(articles_to_process)} new articles to process...")
 
         # 2. Generate questions from the batch (in smaller sub-batches for Groq)
         groq_batch_size = 20
@@ -1731,38 +1769,38 @@ def generate_daily_quiz_questions():
         if generated_questions_in_batch:
             inserted_count = insert_quiz_questions(generated_questions_in_batch)
             total_generated += inserted_count
-            print(f"👍 Generated and inserted {inserted_count} new questions. Total so far: {total_generated}")
+            print(f"ðŸ‘ Generated and inserted {inserted_count} new questions. Total so far: {total_generated}")
         else:
-            print("🤔 No relevant questions generated in this batch.")
+            print("ðŸ¤” No relevant questions generated in this batch.")
 
         # 4. Mark the fetched articles as processed immediately
         if titles_in_batch:
             try:
-                print(f"🔔 Marking {len(titles_in_batch)} articles as processed...")
+                print(f"ðŸ”” Marking {len(titles_in_batch)} articles as processed...")
                 client.table("articles").update({
                     "quiz_generated": True,
                     "updated_at": "now()"
                 }).in_("title", titles_in_batch).execute()
             except Exception as e:
-                print(f"❌ Error marking articles as processed: {e}")
+                print(f"âŒ Error marking articles as processed: {e}")
 
         # 5. Sleep if we are going to continue
         if total_generated < target_questions and articles_scanned < max_articles_to_scan and articles_to_process:
-            print("⏳ Waiting 3 seconds before next iteration...")
+            print("â³ Waiting 3 seconds before next iteration...")
             time.sleep(3)
 
-    print(f"🏁 Daily quiz generation complete. Total questions generated: {total_generated}")
+    print(f"ðŸ Daily quiz generation complete. Total questions generated: {total_generated}")
 
 
 def generate_daily_debate_topic():
-    print("⚖️ [DEBATE] Generating new daily debate topic...")
+    print("âš–ï¸ [DEBATE] Generating new daily debate topic...")
     client = supabase_client()
     try:
         # Fetch Top 5 Indian Politics articles
         res = client.table("articles").select("title, summary, id").eq("category", "politics").eq("country", "IN").eq("summarized", True).order("created_at", desc=True).limit(5).execute()
         articles = res.data or []
         if not articles:
-            print("⚠️ [DEBATE] Not enough IN politics articles to generate a debate.")
+            print("âš ï¸ [DEBATE] Not enough IN politics articles to generate a debate.")
             return
 
         combined_text = "\n".join([f"- {a['title']}: {a['summary']}" for a in articles])
@@ -1779,13 +1817,13 @@ def generate_daily_debate_topic():
                 "status": "upcoming",
                 "related_article_ids": article_ids
             }).execute()
-            print(f"✅ [DEBATE] Generated upcoming debate: {topic_data['statement']}")
+            print(f"âœ… [DEBATE] Generated upcoming debate: {topic_data['statement']}")
 
     except Exception as e:
-        print(f"❌ [DEBATE] Error generating topic: {e}")
+        print(f"âŒ [DEBATE] Error generating topic: {e}")
 
 def manage_debate_lifecycle():
-    print("⏳ [DEBATE] Managing debate lifecycles...")
+    print("â³ [DEBATE] Managing debate lifecycles...")
     client = supabase_client()
     try:
         now_iso = datetime.now().isoformat()
@@ -1797,7 +1835,7 @@ def manage_debate_lifecycle():
         for debate in expired_debates:
             topic_id = debate["id"]
             statement = debate["statement"]
-            print(f"🔄 [DEBATE] Concluding topic ID: {topic_id}")
+            print(f"ðŸ”„ [DEBATE] Concluding topic ID: {topic_id}")
             
             # Aggregate stats
             support_count = 0
@@ -1835,7 +1873,7 @@ def manage_debate_lifecycle():
                 "winning_side": winning_side,
                 "ai_conclusion": ai_conclusion
             }).eq("id", topic_id).execute()
-            print(f"✅ [DEBATE] Concluded topic ID {topic_id}. Winner: {winning_side}")
+            print(f"âœ… [DEBATE] Concluded topic ID {topic_id}. Winner: {winning_side}")
 
         # 2. Check if we need to activate an upcoming debate
         active_res = client.table("debate_topics").select("id", count="exact").eq("status", "active").execute()
@@ -1852,13 +1890,13 @@ def manage_debate_lifecycle():
                     "start_time": start_time.isoformat(),
                     "end_time": end_time.isoformat()
                 }).eq("id", next_id).execute()
-                print(f"🚀 [DEBATE] Activated new debate topic ID: {next_id} for 24 hours.")
+                print(f"ðŸš€ [DEBATE] Activated new debate topic ID: {next_id} for 24 hours.")
             else:
                 # No upcoming debates, trigger generation immediately
                 generate_daily_debate_topic()
 
     except Exception as e:
-        print(f"❌ [DEBATE] Lifecycle error: {e}")
+        print(f"âŒ [DEBATE] Lifecycle error: {e}")
 
 
 app.add_middleware(
@@ -1909,18 +1947,18 @@ def delete_user(user = Depends(_get_authenticated_user)):
         # Create a new client with service_role key for admin operations
         admin_client = supabase_client()
         
-        print(f"🛡️ Admin action: Deleting user with ID: {user.id}")
+        print(f"ðŸ›¡ï¸ Admin action: Deleting user with ID: {user.id}")
         
         # Perform the deletion
         admin_client.auth.admin.delete_user(user.id)
         
-        print(f"✅ Successfully deleted user with ID: {user.id}")
+        print(f"âœ… Successfully deleted user with ID: {user.id}")
         
         # Return a 204 No Content response, which is appropriate for a successful DELETE
         return
 
     except Exception as e:
-        print(f"❌ Error deleting user {user.id}: {e}")
+        print(f"âŒ Error deleting user {user.id}: {e}")
         raise HTTPException(status_code=500, detail="An error occurred while deleting the account")
 
 @app.get("/health")
@@ -2047,7 +2085,7 @@ def heal_database_flags():
     Sets summarized = TRUE and summarization_needed = FALSE for articles
     that have a valid summary but are incorrectly flagged.
     """
-    print("🩹 [DB HEALING] Triggering server-side healing via RPC 'heal_article_flags'...")
+    print("ðŸ©¹ [DB HEALING] Triggering server-side healing via RPC 'heal_article_flags'...")
     try:
         client = supabase_client()
         # Call the Postgres function (RPC) which performs the healing server-side
@@ -2055,18 +2093,18 @@ def heal_database_flags():
 
         # Basic success/failure logging. The supabase client response may include `error` or `data` attributes.
         if getattr(res, 'error', None):
-            print(f"❌ [DB HEALING] RPC returned an error: {res.error}")
+            print(f"âŒ [DB HEALING] RPC returned an error: {res.error}")
         else:
-            print("✅ [DB HEALING] Database healing triggered successfully.")
+            print("âœ… [DB HEALING] Database healing triggered successfully.")
             # Optionally log returned data if present
             if getattr(res, 'data', None):
                 try:
-                    print(f"🩹 [DB HEALING] RPC result: {res.data}")
+                    print(f"ðŸ©¹ [DB HEALING] RPC result: {res.data}")
                 except Exception:
                     pass
 
     except Exception as e:
-        print(f"❌ [DB HEALING] An error occurred while calling heal_article_flags RPC: {e}")
+        print(f"âŒ [DB HEALING] An error occurred while calling heal_article_flags RPC: {e}")
 
 
 def send_daily_news_notification():
@@ -2074,7 +2112,7 @@ def send_daily_news_notification():
     Fetches the top news article and sends a push notification to users
     via the 'daily_news' FCM topic.
     """
-    print(f"🔔 [FCM] Preparing daily NEWS notification at {datetime.now().isoformat()} UTC")
+    print(f"ðŸ”” [FCM] Preparing daily NEWS notification at {datetime.now().isoformat()} UTC")
     
     try:
         # 1. Fetch content for the notification
@@ -2088,7 +2126,7 @@ def send_daily_news_notification():
             .execute()
         )
         
-        title = "Daily Briefing Ready! 📰"
+        title = "Daily Briefing Ready! ðŸ“°"
         body = "Check out today's top stories and stay ahead."
         
         if res.data and len(res.data) > 0:
@@ -2122,22 +2160,22 @@ def send_daily_news_notification():
         
         # 3. Send the message
         response = messaging.send(message)
-        print(f"✅ [FCM] Successfully sent daily NEWS notification: {response}")
+        print(f"âœ… [FCM] Successfully sent daily NEWS notification: {response}")
         
     except Exception as e:
-        print(f"❌ [FCM] Error sending daily NEWS notification: {e}")
+        print(f"âŒ [FCM] Error sending daily NEWS notification: {e}")
 
 
 def send_daily_quiz_notification():
     """
     Sends a push notification to users via the 'daily_quiz' FCM topic.
     """
-    print(f"🔔 [FCM] Preparing daily QUIZ notification at {datetime.now().isoformat()} UTC")
+    print(f"ðŸ”” [FCM] Preparing daily QUIZ notification at {datetime.now().isoformat()} UTC")
     
     try:
         message = messaging.Message(
             notification=messaging.Notification(
-                title="Daily Quiz Ready! 🧠",
+                title="Daily Quiz Ready! ðŸ§ ",
                 body="Test your knowledge with today's questions.",
             ),
             android=messaging.AndroidConfig(
@@ -2155,10 +2193,10 @@ def send_daily_quiz_notification():
         )
         
         response = messaging.send(message)
-        print(f"✅ [FCM] Successfully sent daily QUIZ notification: {response}")
+        print(f"âœ… [FCM] Successfully sent daily QUIZ notification: {response}")
         
     except Exception as e:
-        print(f"❌ [FCM] Error sending daily QUIZ notification: {e}")
+        print(f"âŒ [FCM] Error sending daily QUIZ notification: {e}")
 
 
 
@@ -2206,14 +2244,14 @@ def schedule_jobs():
     def scheduled_riddle_generation():
         """Wrapper function for scheduled riddle generation with error handling and logging"""
         try:
-            print(f"🕛 [SCHEDULER] Running scheduled daily riddle generation at {datetime.now().isoformat()} UTC")
+            print(f"ðŸ•› [SCHEDULER] Running scheduled daily riddle generation at {datetime.now().isoformat()} UTC")
             result = generate_daily_riddle()
             if result:
-                print(f"✅ [SCHEDULER] Successfully generated riddle: {result.get('id', 'unknown')}")
+                print(f"âœ… [SCHEDULER] Successfully generated riddle: {result.get('id', 'unknown')}")
             else:
-                print(f"⚠️ [SCHEDULER] Riddle generation returned None - may have failed or already exists")
+                print(f"âš ï¸ [SCHEDULER] Riddle generation returned None - may have failed or already exists")
         except Exception as e:
-            print(f"❌ [SCHEDULER] Error in scheduled riddle generation: {e}")
+            print(f"âŒ [SCHEDULER] Error in scheduled riddle generation: {e}")
             import traceback
             traceback.print_exc()
     
@@ -2227,12 +2265,12 @@ def schedule_jobs():
         """Wrapper with full error logging for scheduled news FCM push."""
         try:
             print(f"\n{'='*60}")
-            print(f"🔔 [SCHEDULER] Running scheduled NEWS notification ({label}) at {datetime.utcnow().isoformat()} UTC")
+            print(f"ðŸ”” [SCHEDULER] Running scheduled NEWS notification ({label}) at {datetime.utcnow().isoformat()} UTC")
             print(f"{'='*60}")
             send_daily_news_notification()
-            print(f"✅ [SCHEDULER] Scheduled NEWS notification ({label}) completed successfully")
+            print(f"âœ… [SCHEDULER] Scheduled NEWS notification ({label}) completed successfully")
         except Exception as e:
-            print(f"❌ [SCHEDULER] FAILED scheduled NEWS notification ({label}): {e}")
+            print(f"âŒ [SCHEDULER] FAILED scheduled NEWS notification ({label}): {e}")
             import traceback
             traceback.print_exc()
 
@@ -2240,12 +2278,12 @@ def schedule_jobs():
         """Wrapper with full error logging for scheduled quiz FCM push."""
         try:
             print(f"\n{'='*60}")
-            print(f"🔔 [SCHEDULER] Running scheduled QUIZ notification at {datetime.utcnow().isoformat()} UTC")
+            print(f"ðŸ”” [SCHEDULER] Running scheduled QUIZ notification at {datetime.utcnow().isoformat()} UTC")
             print(f"{'='*60}")
             send_daily_quiz_notification()
-            print(f"✅ [SCHEDULER] Scheduled QUIZ notification completed successfully")
+            print(f"âœ… [SCHEDULER] Scheduled QUIZ notification completed successfully")
         except Exception as e:
-            print(f"❌ [SCHEDULER] FAILED scheduled QUIZ notification: {e}")
+            print(f"âŒ [SCHEDULER] FAILED scheduled QUIZ notification: {e}")
             import traceback
             traceback.print_exc()
 
@@ -2268,9 +2306,9 @@ def schedule_jobs():
 
     # Log all registered jobs so we can verify in GCP logs
     print(f"\n{'='*60}")
-    print(f"📋 [SCHEDULER] All registered jobs ({len(scheduler.get_jobs())} total):")
+    print(f"ðŸ“‹ [SCHEDULER] All registered jobs ({len(scheduler.get_jobs())} total):")
     for job in scheduler.get_jobs():
-        print(f"   • {job.id}: next_run={job.next_run_time}, trigger={job.trigger}")
+        print(f"   â€¢ {job.id}: next_run={job.next_run_time}, trigger={job.trigger}")
     print(f"{'='*60}\n")
     
     # 1. Run immediate round-robin and cleanup
@@ -2280,16 +2318,16 @@ def schedule_jobs():
         # Reduced limits for Llama-3 at startup
         executor.submit(summarize_pending_round_robin, per_category_limit=1, max_cycles=5)
         executor.submit(clean_existing_quiz_options)
-        print("✅ Submitted async summarization & DB cleanup tasks at startup")
+        print("âœ… Submitted async summarization & DB cleanup tasks at startup")
     except Exception as e:
-        print(f"⚠️ Error starting async tasks: {e}")
+        print(f"âš ï¸ Error starting async tasks: {e}")
 
     if not scheduler.running:
         try:
             scheduler.start()
-            print("🕒 APScheduler started successfully")
+            print("ðŸ•’ APScheduler started successfully")
         except Exception as e:
-            print(f"❌ Failed to start APScheduler: {e}")
+            print(f"âŒ Failed to start APScheduler: {e}")
 
     # Register scheduled jobs
     try:
@@ -2305,9 +2343,9 @@ def schedule_jobs():
         scheduler.add_job(generate_daily_riddle, 'cron', hour=3, minute=0, id="daily_riddle_gen")
         scheduler.add_job(send_daily_quiz_notification, 'cron', hour=12, minute=0, id="daily_quiz_push")
         
-        print("📋 Scheduled jobs configured successfully")
+        print("ðŸ“‹ Scheduled jobs configured successfully")
     except Exception as e:
-        print(f"❌ Error configuring scheduled jobs: {e}")
+        print(f"âŒ Error configuring scheduled jobs: {e}")
 
 
 @app.on_event("shutdown")
@@ -2473,7 +2511,7 @@ def ingest_articles(items: List[IncomingArticle]):
             if content and len(content) >= 100:
                 summary = summarize_text_if_possible(content, title)
             elif content:
-                print(f"⏭️ Skipping short article in ingest (len={len(content)}): {title[:80]}")
+                print(f"â­ï¸ Skipping short article in ingest (len={len(content)}): {title[:80]}")
             # Clean the URL by stripping query parameters to keep DB tidy
             clean_url = (a.url or "").split('?')[0]
             row = {
@@ -2945,7 +2983,7 @@ def get_latest_riddle_endpoint():
             )
             
     except Exception as e:
-        print(f"❌ Error fetching latest riddle: {e}")
+        print(f"âŒ Error fetching latest riddle: {e}")
         return RiddleResponse(
             riddle=None,
             message="Error retrieving riddle. Please try again later."
@@ -3094,7 +3132,7 @@ def redirect_to_article(encoded_url: str, request):
         </head>
         <body>
             <div class="container">
-                <h1>📰 Open in Readdio</h1>
+                <h1>ðŸ“° Open in Readdio</h1>
                 <p>Opening article in the Readdio app...</p>
                 <div class="spinner"></div>
                 <p style="font-size: 14px; opacity: 0.7; margin-top: 20px;">
@@ -3146,7 +3184,7 @@ def redirect_to_article(encoded_url: str, request):
         return HTMLResponse(content=html_content)
         
     except Exception as e:
-        print(f"❌ Error processing article redirect: {e}")
+        print(f"âŒ Error processing article redirect: {e}")
         # Return error page
         error_html = """
         <!DOCTYPE html>
@@ -3180,7 +3218,7 @@ def redirect_to_article(encoded_url: str, request):
         </head>
         <body>
             <div class="container">
-                <h1>⚠️ Error</h1>
+                <h1>âš ï¸ Error</h1>
                 <p>Unable to process this link. Please try again.</p>
             </div>
         </body>

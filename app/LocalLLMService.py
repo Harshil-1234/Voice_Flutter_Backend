@@ -335,31 +335,42 @@ Do not use JSON. Write plain text."""
             logger.error(f"Error concluding debate: {e}")
             return "The winning side presented stronger logical points and practical evidence to support their stance."
 
-    def generate_live_ticker_status(self, topic: str, headlines: list[str]) -> str:
-        """Generate one concise live ticker status sentence from latest headlines."""
+    def generate_live_ticker_status(
+        self,
+        topic: str,
+        headlines: list[str],
+        current_status: str = "",
+    ) -> str:
+        """Return NO_UPDATE unless headlines show a material event change."""
         if not topic:
             topic = "breaking news"
         if not headlines:
-            return f"No major updates yet on {topic}."
+            return "NO_UPDATE"
 
         self._check_model_loaded()
         cleaned_headlines = [h.strip() for h in headlines if h and h.strip()][:8]
         if not cleaned_headlines:
-            return f"No major updates yet on {topic}."
+            return "NO_UPDATE"
+
+        current_status = (current_status or "").strip()
+        if not current_status:
+            current_status = "No current ticker update."
 
         system_prompt = (
-            "You are a live newsroom editor.\n"
-            "Given a topic and latest headlines, write exactly one sentence status update.\n"
-            "Rules:\n"
-            "- Keep it factual and neutral.\n"
-            "- Max 24 words.\n"
-            "- No bullet points.\n"
-            "- No labels like 'Status:'.\n"
-            "- Output only the sentence."
+            "You are a Senior Breaking News Editor.\n"
+            f"Current Ticker: '{current_status}'\n"
+            "Task: Decide if there is a MAJOR new development "
+            "(new attack, official statement/treaty, casualty update, major escalation/de-escalation).\n"
+            "If the new headlines are opinions, recycled reports, old news, or minor details, return NO_UPDATE.\n"
+            "If there is a real event update, return new status text in present tense.\n"
+            "Maximum 15 words.\n"
+            "Output plain text only. Either NO_UPDATE or the new status string."
         )
         user_prompt = (
-            f"Topic: {topic}\n"
-            f"Headlines:\n- " + "\n- ".join(cleaned_headlines)
+            f"TOPIC: {topic}\n"
+            f"CURRENT_STATUS: \"{current_status}\"\n"
+            "NEW_WIRE_HEADLINES:\n- "
+            + "\n- ".join(cleaned_headlines)
         )
 
         try:
@@ -369,22 +380,29 @@ Do not use JSON. Write plain text."""
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    temperature=0.2,
-                    top_p=0.95,
-                    max_tokens=80,
+                    temperature=0.1,
+                    top_p=0.9,
+                    max_tokens=64,
                     repeat_penalty=1.1,
                 )
 
             status = response["choices"][0]["message"]["content"].strip()
-            status = re.sub(r"\s+", " ", status).strip().strip('"')
+            status = status.replace("```", "").replace("`", "")
+            status = re.sub(r"\s+", " ", status).strip().strip('"').strip("'")
             if not status:
-                raise ValueError("Empty live ticker status from model.")
-            if len(status) > 180:
-                status = status[:177].rsplit(" ", 1)[0] + "..."
+                return "NO_UPDATE"
+
+            normalized = re.sub(r"[^A-Z_]", "", status.upper())
+            if normalized == "NOUPDATE":
+                return "NO_UPDATE"
+
+            words = status.split()
+            if len(words) > 15:
+                status = " ".join(words[:15])
             return status
         except Exception as e:
             logger.error(f"Error generating live ticker status: {e}")
-            return cleaned_headlines[0]
+            return "NO_UPDATE"
 
 
 # Convenience functions
@@ -414,7 +432,7 @@ def conclude_debate(statement: str, winning_side: str, top_args: str) -> str:
     service = get_local_llm_service()
     return service.conclude_debate(statement, winning_side, top_args)
 
-def generate_live_ticker_status(topic: str, headlines: list[str]) -> str:
+def generate_live_ticker_status(topic: str, headlines: list[str], current_status: str = "") -> str:
     service = get_local_llm_service()
-    return service.generate_live_ticker_status(topic, headlines)
+    return service.generate_live_ticker_status(topic, headlines, current_status)
 
