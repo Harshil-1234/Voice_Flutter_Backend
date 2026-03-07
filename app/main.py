@@ -1157,8 +1157,8 @@ def update_live_ticker():
         status_text = "NO_UPDATE"
 
     status_text = re.sub(r"\s+", " ", (status_text or "").strip())
-    no_update_token = re.sub(r"[^A-Z_]", "", status_text.upper())
-    if not status_text or no_update_token == "NOUPDATE":
+    no_update_token = re.sub(r"[^A-Z]", "", status_text.upper())
+    if not status_text or no_update_token.startswith("NOUPDATE"):
         print("[LIVE] Live event: No significant change.")
         return
 

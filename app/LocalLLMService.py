@@ -392,8 +392,8 @@ Do not use JSON. Write plain text."""
             if not status:
                 return "NO_UPDATE"
 
-            normalized = re.sub(r"[^A-Z_]", "", status.upper())
-            if normalized == "NOUPDATE":
+            normalized = re.sub(r"[^A-Z]", "", status.upper())
+            if normalized.startswith("NOUPDATE"):
                 return "NO_UPDATE"
 
             words = status.split()
