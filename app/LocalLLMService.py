@@ -335,6 +335,57 @@ Do not use JSON. Write plain text."""
             logger.error(f"Error concluding debate: {e}")
             return "The winning side presented stronger logical points and practical evidence to support their stance."
 
+    def generate_live_ticker_status(self, topic: str, headlines: list[str]) -> str:
+        """Generate one concise live ticker status sentence from latest headlines."""
+        if not topic:
+            topic = "breaking news"
+        if not headlines:
+            return f"No major updates yet on {topic}."
+
+        self._check_model_loaded()
+        cleaned_headlines = [h.strip() for h in headlines if h and h.strip()][:8]
+        if not cleaned_headlines:
+            return f"No major updates yet on {topic}."
+
+        system_prompt = (
+            "You are a live newsroom editor.\n"
+            "Given a topic and latest headlines, write exactly one sentence status update.\n"
+            "Rules:\n"
+            "- Keep it factual and neutral.\n"
+            "- Max 24 words.\n"
+            "- No bullet points.\n"
+            "- No labels like 'Status:'.\n"
+            "- Output only the sentence."
+        )
+        user_prompt = (
+            f"Topic: {topic}\n"
+            f"Headlines:\n- " + "\n- ".join(cleaned_headlines)
+        )
+
+        try:
+            with self.lock:
+                response = self.model.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.2,
+                    top_p=0.95,
+                    max_tokens=80,
+                    repeat_penalty=1.1,
+                )
+
+            status = response["choices"][0]["message"]["content"].strip()
+            status = re.sub(r"\s+", " ", status).strip().strip('"')
+            if not status:
+                raise ValueError("Empty live ticker status from model.")
+            if len(status) > 180:
+                status = status[:177].rsplit(" ", 1)[0] + "..."
+            return status
+        except Exception as e:
+            logger.error(f"Error generating live ticker status: {e}")
+            return cleaned_headlines[0]
+
 
 # Convenience functions
 _service = None
@@ -362,4 +413,8 @@ def generate_debate_topic(articles_text: str) -> dict:
 def conclude_debate(statement: str, winning_side: str, top_args: str) -> str:
     service = get_local_llm_service()
     return service.conclude_debate(statement, winning_side, top_args)
+
+def generate_live_ticker_status(topic: str, headlines: list[str]) -> str:
+    service = get_local_llm_service()
+    return service.generate_live_ticker_status(topic, headlines)
 

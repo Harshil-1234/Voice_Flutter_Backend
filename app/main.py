@@ -5,10 +5,11 @@ import random
 import re
 import codecs
 import base64
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import feedparser
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 from fastapi import FastAPI, Query, Path, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -104,6 +105,7 @@ RSS_TOPIC_IDS = {
     "sports": "SPORTS",
     "politics": "POLITICS",
     "general": "NATION",
+    "india": "NATION",
 }
 
 # Categories to be fetched once with a global country code (e.g., US)
@@ -111,6 +113,9 @@ GLOBAL_CATEGORIES = ["technology", "science", "world", "business", "health", "en
 
 # Categories to be fetched for each active country
 LOCAL_CATEGORIES = ["general", "politics", "sports"]
+
+# Dedicated local-only categories that should always use India's geo feed.
+INDIA_ONLY_CATEGORIES = ["india"]
 
 # List of active countries to fetch local news for
 # Expanded list of active countries for local category fetches
@@ -135,6 +140,36 @@ SEARCH_CATEGORIES = {
     "environment": "Environment OR Climate Change OR Nature",
 }
 # --- END NEW SEARCH-BASED CATEGORIES ---
+
+# --- VIDEO INGEST SAFETY CONFIG ---
+VIDEO_STRICT_SOURCE_FILTER = os.getenv("VIDEO_STRICT_SOURCE_FILTER", "true").lower() == "true"
+VIDEO_SOURCE_ALLOWLIST = [
+    s.strip().lower()
+    for s in os.getenv(
+        "VIDEO_SOURCE_ALLOWLIST",
+        "aaj tak,abp news,ani news,bbc news,cnbc tv18,cnn-ibn,dd news,hindustan times,india today,ndtv,republic tv,the hindu,the print,times now,wion,zee news",
+    ).split(",")
+    if s.strip()
+]
+
+# Scripts we explicitly do NOT allow for video ingestion (English/Hindi only).
+_DISALLOWED_VIDEO_SCRIPT_PATTERNS = [
+    re.compile(r"[\u0980-\u09FF]"),  # Bengali
+    re.compile(r"[\u0A00-\u0A7F]"),  # Gurmukhi
+    re.compile(r"[\u0A80-\u0AFF]"),  # Gujarati
+    re.compile(r"[\u0B00-\u0B7F]"),  # Oriya
+    re.compile(r"[\u0B80-\u0BFF]"),  # Tamil
+    re.compile(r"[\u0C00-\u0C7F]"),  # Telugu
+    re.compile(r"[\u0C80-\u0CFF]"),  # Kannada
+    re.compile(r"[\u0D00-\u0D7F]"),  # Malayalam
+    re.compile(r"[\u0E00-\u0E7F]"),  # Thai
+    re.compile(r"[\u0600-\u06FF]"),  # Arabic/Urdu
+    re.compile(r"[\u0400-\u04FF]"),  # Cyrillic
+    re.compile(r"[\u3040-\u30FF]"),  # Hiragana/Katakana
+    re.compile(r"[\u4E00-\u9FFF]"),  # CJK
+    re.compile(r"[\uAC00-\uD7AF]"),  # Hangul
+]
+# --- END VIDEO INGEST SAFETY CONFIG ---
 
 
 class ArticleOut(BaseModel):
@@ -340,27 +375,55 @@ def extract_hero_image(html_content: str) -> Optional[str]:
         return None
 
 
+def extract_youtube_id(youtube_url: str) -> Optional[str]:
+    """Extract a YouTube video ID from watch/shorts/embed/youtu.be URLs."""
+    try:
+        if not youtube_url:
+            return None
+
+        parsed = urlparse(youtube_url)
+        host = (parsed.netloc or "").lower()
+        path = parsed.path or ""
+
+        if "youtu.be" in host:
+            vid = path.strip("/").split("/")[0]
+            return vid or None
+
+        if "youtube.com" in host:
+            # watch?v=VIDEO_ID
+            query_params = parse_qs(parsed.query or "")
+            if query_params.get("v"):
+                vid = (query_params.get("v") or [None])[0]
+                if vid:
+                    return vid
+
+            # /shorts/VIDEO_ID or /embed/VIDEO_ID
+            parts = [p for p in path.split("/") if p]
+            if len(parts) >= 2 and parts[0] in {"shorts", "embed"}:
+                return parts[1]
+
+        # Fallback regex if URL is non-standard
+        match = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{6,})", youtube_url)
+        if match:
+            return match.group(1)
+    except Exception as e:
+        print(f"⚠️ [extract_youtube_id] Error: {e}")
+    return None
+
+
 def extract_youtube_thumbnail(youtube_url: str) -> Optional[str]:
     """
     Extract YouTube video thumbnail URL from a YouTube link.
     Constructs the high-quality thumbnail: https://img.youtube.com/vi/{VIDEO_ID}/hqdefault.jpg
     """
     try:
-        # Extract video ID from various YouTube URL formats
-        video_id = None
-        
-        if "youtube.com/watch?v=" in youtube_url:
-            video_id = youtube_url.split("v=")[1].split("&")[0]
-        elif "youtu.be/" in youtube_url:
-            video_id = youtube_url.split("youtu.be/")[1].split("?")[0]
-        
+        video_id = extract_youtube_id(youtube_url)
         if video_id:
             thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
             print(f"🎬 [extract_youtube_thumbnail] Generated thumbnail: {thumbnail_url}")
             return thumbnail_url
     except Exception as e:
         print(f"⚠️ [extract_youtube_thumbnail] Error: {e}")
-    
     return None
 
 
@@ -835,6 +898,264 @@ def fetch_rss_feed(category: str, country_code: str) -> List[dict]:
         print(f"❌ Error fetching or parsing RSS feed {url}: {e}")
         return []
 
+
+def _extract_rss_description(summary_html: str) -> str:
+    """Extract plain-text description from Google RSS summary HTML."""
+    try:
+        soup = BeautifulSoup(summary_html or "", "html.parser")
+        for tag in soup.find_all(["ul", "ol", "table"]):
+            tag.decompose()
+        return soup.get_text(separator="\n", strip=True)
+    except Exception:
+        return ""
+
+
+def _truncate_metadata_text(text: str, max_chars: int = 240) -> str:
+    """Store only short metadata snippets (no full transcripts/articles)."""
+    cleaned = (text or "").strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip() + "..."
+
+
+def _is_youtube_host(url: str) -> bool:
+    """Allow only direct YouTube hosts for video ingestion."""
+    try:
+        host = (urlparse(url).netloc or "").lower()
+        return "youtube.com" in host or "youtu.be" in host
+    except Exception:
+        return False
+
+
+def _is_english_or_hindi_text(text: str) -> bool:
+    """
+    Language guardrail:
+    - Allow only English (Latin script) or Hindi (Devanagari script)
+    - Reject if text contains known disallowed scripts
+    """
+    sample = (text or "").strip()
+    if not sample:
+        return False
+
+    for pat in _DISALLOWED_VIDEO_SCRIPT_PATTERNS:
+        if pat.search(sample):
+            return False
+
+    has_devanagari = bool(re.search(r"[\u0900-\u097F]", sample))
+    has_latin = bool(re.search(r"[A-Za-z]", sample))
+    return has_devanagari or has_latin
+
+
+def _is_trusted_video_source(source_name: str, title: str, description: str) -> bool:
+    """
+    Source guardrail for copyright risk reduction.
+    Enabled by default; can be relaxed with VIDEO_STRICT_SOURCE_FILTER=false.
+    """
+    if not VIDEO_STRICT_SOURCE_FILTER:
+        return True
+
+    haystack = f"{source_name} {title} {description}".lower()
+    return any(token in haystack for token in VIDEO_SOURCE_ALLOWLIST)
+
+
+def fetch_video_news():
+    """
+    Dedicated video ingestor:
+    - Uses explicit YouTube-focused Google News RSS search queries
+    - Filters to English/Hindi only
+    - Applies trusted-source allowlist (configurable)
+    - Forces is_video=True and category='video'
+    - Saves thumbnail via img.youtube.com
+    - Stores metadata only (no video download/re-host)
+    """
+    print("🎬 Starting dedicated video ingestion cycle...")
+    client = supabase_client()
+    search_queries = [
+        "India News (English OR Hindi OR हिंदी) site:youtube.com",
+        "World News (English OR Hindi OR हिंदी) site:youtube.com",
+        "Tech News (English OR Hindi OR हिंदी) site:youtube.com",
+    ]
+
+    candidate_rows: List[Dict] = []
+
+    for query in search_queries:
+        try:
+            search_url = (
+                "https://news.google.com/rss/search"
+                f"?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+            )
+            print(f"🎥 [VIDEO] Fetching query: {query} -> {search_url[:100]}...")
+            feed = feedparser.parse(search_url)
+            entries = feed.entries if hasattr(feed, "entries") else []
+            print(f"🎥 [VIDEO] Found {len(entries)} entries for '{query}'")
+
+            for entry in entries[:20]:
+                try:
+                    rss_link = entry.get("link")
+                    if not rss_link:
+                        continue
+
+                    resolved_link = rss_link
+                    try:
+                        dec = new_decoderv1(rss_link)
+                        if dec and dec.get("status") and dec.get("decoded_url"):
+                            resolved_link = dec.get("decoded_url") or rss_link
+                    except Exception as decode_err:
+                        print(f"⚠️ [VIDEO] Decode failed for link: {decode_err}")
+
+                    if not _is_youtube_host(resolved_link):
+                        continue
+
+                    video_id = extract_youtube_id(resolved_link)
+                    if not video_id:
+                        # Strictly keep only videos from YouTube
+                        continue
+
+                    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+                    thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+                    source_name = entry.get("source", {}).get("title") or "YouTube"
+                    title = (entry.get("title") or "Video Update").strip()
+                    description = _extract_rss_description(entry.get("summary", ""))
+                    if not description:
+                        description = "Latest video update from YouTube."
+
+                    lang_sample = f"{title}\n{description}"
+                    if not _is_english_or_hindi_text(lang_sample):
+                        print(f"⏭️ [VIDEO] Skipped non EN/HI item: {title[:80]}")
+                        continue
+
+                    if not _is_trusted_video_source(source_name, title, description):
+                        print(f"⏭️ [VIDEO] Skipped non-allowlisted source: {source_name}")
+                        continue
+
+                    safe_description = _truncate_metadata_text(description, max_chars=220)
+                    published_at = entry.get("published")
+
+                    candidate_rows.append(
+                        {
+                            "url": canonical_url,
+                            "title": title,
+                            "description": safe_description,
+                            "content": None,
+                            "summary": safe_description,
+                            "source": source_name,
+                            "image_url": thumbnail_url,
+                            "category": "video",
+                            "country": "GLOBAL",
+                            "is_video": True,
+                            "published_at": published_at,
+                            "summarized": True,
+                            "summarization_needed": False,
+                        }
+                    )
+                except Exception as item_err:
+                    print(f"⚠️ [VIDEO] Failed to process entry: {item_err}")
+        except Exception as e:
+            print(f"❌ [VIDEO] Query failed for '{query}': {e}")
+
+    if not candidate_rows:
+        print("ℹ️ [VIDEO] No YouTube video news found in this cycle.")
+        return
+
+    # Dedupe within this cycle by URL hash
+    unique_rows: Dict[str, Dict] = {}
+    for row in candidate_rows:
+        url = row.get("url")
+        if not url:
+            continue
+        unique_rows[md5_lower(url)] = row
+
+    saved = 0
+    for row in unique_rows.values():
+        try:
+            client.table("articles").upsert(row, on_conflict="url_hash").execute()
+            saved += 1
+        except Exception as upsert_err:
+            # Fallback for projects where upsert by generated url_hash is not allowed.
+            print(f"⚠️ [VIDEO] url_hash upsert failed, retrying by title: {upsert_err}")
+            try:
+                client.table("articles").upsert(row, on_conflict="title").execute()
+                saved += 1
+            except Exception as fallback_err:
+                print(f"❌ [VIDEO] Fallback upsert failed: {fallback_err}")
+
+    print(f"✅ [VIDEO] Saved/updated {saved} video articles.")
+
+
+def update_live_ticker():
+    """
+    Updates the currently active live event:
+    1) fetch active topic from DB
+    2) fetch latest Google RSS headlines for that topic
+    3) ask local Llama model for one-sentence status
+    4) write status_text + last_updated back to DB
+    """
+    print("📡 [LIVE] Updating live ticker...")
+    client = supabase_client()
+
+    try:
+        active_res = (
+            client.table("live_events")
+            .select("id,topic_query,status_text")
+            .eq("is_active", True)
+            .order("last_updated", desc=True)
+            .limit(1)
+            .execute()
+        )
+        active_rows = active_res.data or []
+    except Exception as e:
+        print(f"❌ [LIVE] Failed to fetch active live event: {e}")
+        return
+
+    if not active_rows:
+        print("ℹ️ [LIVE] No active live event found.")
+        return
+
+    event = active_rows[0]
+    event_id = event.get("id")
+    topic_query = (event.get("topic_query") or "").strip()
+    if not event_id or not topic_query:
+        print("⚠️ [LIVE] Active event is missing id/topic_query; skipping.")
+        return
+
+    search_url = (
+        "https://news.google.com/rss/search"
+        f"?q={quote_plus(topic_query)}&hl=en-IN&gl=IN&ceid=IN:en"
+    )
+    headlines: List[str] = []
+    try:
+        feed = feedparser.parse(search_url)
+        entries = feed.entries if hasattr(feed, "entries") else []
+        for entry in entries[:8]:
+            title = (entry.get("title") or "").strip()
+            if title:
+                headlines.append(title)
+    except Exception as e:
+        print(f"❌ [LIVE] Failed to fetch Google RSS for '{topic_query}': {e}")
+
+    if headlines:
+        try:
+            if llm_service is not None and hasattr(llm_service, "generate_live_ticker_status"):
+                status_text = llm_service.generate_live_ticker_status(topic_query, headlines)
+            else:
+                status_text = headlines[0]
+        except Exception as e:
+            print(f"⚠️ [LIVE] LLM status generation failed: {e}")
+            status_text = headlines[0]
+    else:
+        status_text = f"No major updates yet for {topic_query}."
+
+    try:
+        client.table("live_events").update(
+            {
+                "status_text": status_text,
+                "last_updated": datetime.utcnow().isoformat(),
+            }
+        ).eq("id", event_id).execute()
+        print(f"✅ [LIVE] Updated ticker: {status_text}")
+    except Exception as e:
+        print(f"❌ [LIVE] Failed to update live event row: {e}")
+
 def process_rss_entry(entry: dict, category: str, country: str) -> Optional[dict]:
     """Processes a single RSS entry into a dictionary for database insertion."""
     try:
@@ -904,6 +1225,14 @@ def smart_ingest_all_categories():
     for category in GLOBAL_CATEGORIES:
         entries = fetch_rss_feed(category, "US")
         processed_entries = [process_rss_entry(e, category, "GLOBAL") for e in entries[:5]]
+        all_new_articles.extend([p for p in processed_entries if p])
+        time.sleep(2)
+
+    # 1b. Fetch dedicated India category with gl=IN
+    print("--- Fetching India Category (Country: IN) ---")
+    for category in INDIA_ONLY_CATEGORIES:
+        entries = fetch_rss_feed(category, "IN")
+        processed_entries = [process_rss_entry(e, category, "IN") for e in entries[:8]]
         all_new_articles.extend([p for p in processed_entries if p])
         time.sleep(2)
 
@@ -1023,7 +1352,8 @@ def smart_ingest_all_categories():
 
         # Update URL and image
         if real_url:
-            article_data["url"] = real_url.split('?')[0]
+            # Keep full YouTube URL so video ID is preserved; trim query only for regular article links.
+            article_data["url"] = real_url if is_video else real_url.split('?')[0]
         if image_url:
             article_data["image_url"] = image_url
         
@@ -1839,6 +2169,24 @@ def schedule_jobs():
 
     # Run news ingestion immediately on startup, then every 15 minutes
     scheduler.add_job(smart_ingest_all_categories, "interval", minutes=15, id="ingest_news", replace_existing=True)
+
+    # Dedicated video ingestion (YouTube-targeted search feeds) every 30 minutes
+    scheduler.add_job(
+        fetch_video_news,
+        "interval",
+        minutes=30,
+        id="ingest_video_news",
+        replace_existing=True,
+    )
+
+    # Live ticker updater
+    scheduler.add_job(
+        update_live_ticker,
+        "interval",
+        minutes=5,
+        id="update_live_ticker",
+        replace_existing=True,
+    )
 
 
     # Add periodic round-robin summarizer (keeps summaries flowing across categories)
