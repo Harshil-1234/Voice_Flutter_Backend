@@ -22,7 +22,7 @@ import logging
 import os
 import re
 import threading
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from pathlib import Path
 
 """
@@ -31,7 +31,7 @@ LocalLLMService: Manages local LLM inference via llama-cpp-python for text analy
 
 import logging
 import threading
-from typing import Dict
+from typing import Dict, List
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -362,9 +362,10 @@ Do not use JSON. Write plain text."""
             "Task: Decide if there is a MAJOR new development "
             "(new attack, official statement/treaty, casualty update, major escalation/de-escalation).\n"
             "If the new headlines are opinions, recycled reports, old news, or minor details, return NO_UPDATE.\n"
-            "If there is a real event update, return new status text in present tense.\n"
-            "Maximum 15 words.\n"
-            "Output plain text only. Either NO_UPDATE or the new status string."
+            "If there is a real event update, write exactly ONE complete, present-tense sentence summarizing the latest update.\n"
+            "DO NOT use the prefix 'NEW_STATUS:'.\n"
+            "Just write the sentence and end with a period.\n"
+            "Output plain text only. Either NO_UPDATE or the new status sentence."
         )
         user_prompt = (
             f"TOPIC: {topic}\n"
@@ -382,12 +383,14 @@ Do not use JSON. Write plain text."""
                     ],
                     temperature=0.1,
                     top_p=0.9,
-                    max_tokens=64,
+                    max_tokens=100,
                     repeat_penalty=1.1,
                 )
 
-            status = response["choices"][0]["message"]["content"].strip()
-            status = status.replace("```", "").replace("`", "")
+            response_text = response["choices"][0]["message"]["content"].strip()
+            clean_status = response_text.replace("NEW_STATUS:", "").replace('"', "").strip()
+            status = clean_status.replace("```", "").replace("`", "")
+            status = re.sub(r"(?i)^new[\s_-]*status\s*:\s*", "", status)
             status = re.sub(r"\s+", " ", status).strip().strip('"').strip("'")
             if not status:
                 return "NO_UPDATE"
@@ -396,13 +399,91 @@ Do not use JSON. Write plain text."""
             if normalized.startswith("NOUPDATE"):
                 return "NO_UPDATE"
 
-            words = status.split()
-            if len(words) > 15:
-                status = " ".join(words[:15])
+            # Keep only one sentence and ensure punctuation for ticker rendering.
+            match = re.search(r"([.!?])", status)
+            if match:
+                status = status[: match.start() + 1].strip()
+            elif status:
+                status = status.rstrip() + "."
             return status
         except Exception as e:
             logger.error(f"Error generating live ticker status: {e}")
             return "NO_UPDATE"
+
+    def generate_seed_debate_votes(self, statement: str, count: int = 15) -> List[Dict]:
+        """Generate synthetic debate votes (support/oppose) with average scores."""
+        if not statement:
+            return []
+
+        self._check_model_loaded()
+        target_count = max(1, min(int(count or 15), 30))
+
+        system_prompt = (
+            "Generate realistic synthetic debate votes for a public discussion thread.\n"
+            "Arguments should sound like regular internet users, not experts.\n"
+            "Keep quality average (score 4-7), no profanity, no hate speech.\n"
+            "Return ONLY JSON object with key 'votes'.\n"
+            "Schema: {\"votes\": [{\"side\": \"support|oppose\", \"argument\": \"text\", \"score\": 4-7}]}\n"
+            "Ensure a mix of support and oppose."
+        )
+        user_prompt = (
+            f"Debate statement: {statement}\n"
+            f"Generate exactly {target_count} votes.\n"
+            "Each argument should be 1-2 lines."
+        )
+
+        try:
+            with self.lock:
+                response = self.model.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.65,
+                    top_p=0.9,
+                    max_tokens=1600,
+                    repeat_penalty=1.05,
+                    response_format={"type": "json_object"},
+                )
+
+            content = response["choices"][0]["message"]["content"].strip()
+            content = content.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(content)
+            raw_votes = parsed.get("votes", []) if isinstance(parsed, dict) else []
+            if not isinstance(raw_votes, list):
+                return []
+
+            votes: List[Dict] = []
+            for item in raw_votes:
+                if not isinstance(item, dict):
+                    continue
+
+                side = (str(item.get("side", "")).strip().lower())
+                if side not in {"support", "oppose"}:
+                    side = "support" if (len(votes) % 2 == 0) else "oppose"
+
+                argument = re.sub(r"\s+", " ", str(item.get("argument", "")).strip())
+                if not argument:
+                    continue
+
+                try:
+                    score = int(item.get("score", 6))
+                except Exception:
+                    score = 6
+                score = max(4, min(7, score))
+
+                votes.append(
+                    {
+                        "side": side,
+                        "argument": argument[:320],
+                        "score": score,
+                    }
+                )
+
+            return votes[:target_count]
+        except Exception as e:
+            logger.error(f"Error generating synthetic debate votes: {e}")
+            return []
 
 
 # Convenience functions
@@ -435,4 +516,8 @@ def conclude_debate(statement: str, winning_side: str, top_args: str) -> str:
 def generate_live_ticker_status(topic: str, headlines: list[str], current_status: str = "") -> str:
     service = get_local_llm_service()
     return service.generate_live_ticker_status(topic, headlines, current_status)
+
+def generate_seed_debate_votes(statement: str, count: int = 15) -> List[Dict]:
+    service = get_local_llm_service()
+    return service.generate_seed_debate_votes(statement, count)
 

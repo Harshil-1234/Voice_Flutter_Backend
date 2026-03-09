@@ -2,6 +2,7 @@ import os
 import hashlib
 import time
 import random
+import uuid
 import re
 import codecs
 import base64
@@ -252,6 +253,18 @@ def supabase_client():
 
 def md5_lower(text: str) -> str:
     return hashlib.md5(text.lower().encode("utf-8")).hexdigest()
+
+
+def _serialize_tags_for_db(upsc_relevant: bool, tags) -> Optional[str]:
+    """
+    Persist tags only when:
+    - UPSC relevant is True
+    - tags is a non-empty list
+    Otherwise return None so Supabase stores SQL NULL.
+    """
+    if upsc_relevant and isinstance(tags, list) and len(tags) > 0:
+        return json.dumps(tags)
+    return None
 
 
 def resolve_redirect_url(url: str, timeout: int = 10) -> str:
@@ -625,13 +638,7 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
                 summary_text = result.get("summary", "")
                 upsc_relevant = result.get("upsc_relevant", False)
                 tags = result.get("tags", [])
-
-                # FIX: Force tags to None if not relevant
-                if not upsc_relevant:
-                    tags = None
-                # Also force None if the list is empty (to avoid empty badges in UI)
-                elif isinstance(tags, list) and not tags:
-                    tags = None
+                tags_for_db = _serialize_tags_for_db(upsc_relevant, tags)
 
                 if not summary_text:
                     continue
@@ -647,17 +654,14 @@ def _summarize_in_batches(articles: List[dict]) -> Tuple[int, int]:
                 # Add UPSC-specific fields if they exist in DB
                 if upsc_relevant is not None:
                     update_dict["upsc_relevant"] = upsc_relevant
-                if tags is not None:
-                    update_dict["tags"] = json.dumps(tags)
-                else:
-                    # Explicitly set NULL in DB to clear any old tags
-                    update_dict["tags"] = None
+                # Explicitly set NULL when tags are not valid for storage.
+                update_dict["tags"] = tags_for_db
                 
                 url_hash = md5_lower(article["url"])
                 client.table("articles").update(update_dict).eq("url_hash", url_hash).execute()
 
                 summarized_count += 1
-                tag_str = ", ".join(tags) if tags else "N/A"
+                tag_str = ", ".join(tags) if tags_for_db else "N/A"
                 print(f"âœ… Saved summary for: {title[:80]} | Relevant: {upsc_relevant} | Tags: {tag_str}")
             except Exception as e:
                 print(f"âš ï¸ Error saving summary for {title[:80]}: {e}")
@@ -787,8 +791,8 @@ def summarize_pending_round_robin(per_category_limit: int = 2, max_cycles: int =
                 
                 if upsc_relevant is not None:
                     update_dict["upsc_relevant"] = upsc_relevant
-                if tags is not None:
-                    update_dict["tags"] = json.dumps(tags)
+                # Empty or non-list tags are stored as SQL NULL.
+                update_dict["tags"] = _serialize_tags_for_db(upsc_relevant, tags)
                 
                 client.table("articles").update(update_dict).eq("id", item["id"]).execute()
                 total_updated += 1
@@ -964,9 +968,9 @@ def fetch_video_news():
     - Uses explicit YouTube-focused Google News RSS search queries
     - Filters to English/Hindi only
     - Applies trusted-source allowlist (configurable)
-    - Forces is_video=True and category='video'
+    - Saves to dedicated `videos` table (no article-table title conflicts)
     - Saves thumbnail via img.youtube.com
-    - Stores metadata only (no video download/re-host)
+    - Stores metadata only (no video download/re-host, no AI summarization)
     """
     print("ðŸŽ¬ Starting dedicated video ingestion cycle...")
     client = supabase_client()
@@ -1029,25 +1033,16 @@ def fetch_video_news():
                         print(f"â­ï¸ [VIDEO] Skipped non-allowlisted source: {source_name}")
                         continue
 
-                    safe_description = _truncate_metadata_text(description, max_chars=220)
                     published_at = entry.get("published")
 
                     candidate_rows.append(
                         {
                             "url": source_url,
                             "title": title,
-                            "description": safe_description,
-                            "content": None,
-                            "summary": safe_description,
+                            "youtube_id": video_id,
+                            "thumbnail_url": thumbnail_url,
                             "source": source_name,
-                            "image_url": thumbnail_url,
-                            "category": "video",
-                            "country": "GLOBAL",
-                            "is_video": True,
                             "published_at": published_at,
-                            "summarized": True,
-                            "summarization_needed": False,
-                            "_video_id": video_id,
                         }
                     )
                 except Exception as item_err:
@@ -1059,27 +1054,25 @@ def fetch_video_news():
         print("â„¹ï¸ [VIDEO] No YouTube video news found in this cycle.")
         return
 
-    # Dedupe within this cycle by URL hash
+    # Dedupe within this cycle by YouTube ID
     unique_rows: Dict[str, Dict] = {}
     for row in candidate_rows:
-        video_id = row.get("_video_id")
+        video_id = row.get("youtube_id")
         url = row.get("url")
         if not video_id or not url:
             continue
-        # Prefer de-duplication by YouTube video ID over raw URL (params can vary).
         unique_rows[str(video_id)] = row
 
     saved = 0
     for row in unique_rows.values():
-        row.pop("_video_id", None)
         try:
-            client.table("articles").upsert(row, on_conflict="url_hash").execute()
+            # Videos are now stored in dedicated table to avoid title conflicts with text articles.
+            client.table("videos").upsert(row, on_conflict="title").execute()
             saved += 1
         except Exception as upsert_err:
-            # Fallback for projects where upsert by generated url_hash is not allowed.
-            print(f"âš ï¸ [VIDEO] url_hash upsert failed, retrying by title: {upsert_err}")
+            print(f"âš ï¸ [VIDEO] Upsert by title failed, retrying by youtube_id: {upsert_err}")
             try:
-                client.table("articles").upsert(row, on_conflict="title").execute()
+                client.table("videos").upsert(row, on_conflict="youtube_id").execute()
                 saved += 1
             except Exception as fallback_err:
                 print(f"âŒ [VIDEO] Fallback upsert failed: {fallback_err}")
@@ -1145,17 +1138,20 @@ def update_live_ticker():
 
     try:
         if llm_service is not None and hasattr(llm_service, "generate_live_ticker_status"):
-            status_text = llm_service.generate_live_ticker_status(
+            response_text = llm_service.generate_live_ticker_status(
                 topic_query,
                 headlines,
                 previous_status,
             )
+            clean_status = response_text.replace("NEW_STATUS:", "").replace('"', '').strip()
+            status_text = clean_status
         else:
             status_text = "NO_UPDATE"
     except Exception as e:
         print(f"[LIVE] LLM status generation failed: {e}")
         status_text = "NO_UPDATE"
 
+    status_text = re.sub(r"(?i)^new[\s_-]*status\s*:\s*", "", status_text or "")
     status_text = re.sub(r"\s+", " ", (status_text or "").strip())
     no_update_token = re.sub(r"[^A-Z]", "", status_text.upper())
     if not status_text or no_update_token.startswith("NOUPDATE"):
@@ -1165,10 +1161,6 @@ def update_live_ticker():
     if status_text == previous_status:
         print("[LIVE] Live event: No significant change.")
         return
-
-    words = status_text.split()
-    if len(words) > 15:
-        status_text = " ".join(words[:15])
 
     try:
         client.table("live_events").update(
@@ -1446,13 +1438,9 @@ def smart_ingest_all_categories():
 
         # Immediately upsert the article to the database
         try:
-            # Handle tags: convert empty list or non-relevant to None so DB stores NULL
             tags = article_data.get("tags")
             upsc_relevant = article_data.get("upsc_relevant", False)
-            if not upsc_relevant or not tags:
-                tags_processed = None
-            else:
-                tags_processed = tags
+            tags_for_db = _serialize_tags_for_db(upsc_relevant, tags)
 
             row_to_insert = {
                 "url": article_data.get("url"),
@@ -1468,8 +1456,8 @@ def smart_ingest_all_categories():
                 "summary": article_data.get("summary"),
                 "summarized": article_data.get("summarized", False),
                 "summarization_needed": article_data.get("summarization_needed", False),
-                # include tags explicitly (may be None to force NULL in DB)
-                "tags": (json.dumps(tags_processed) if tags_processed is not None else None),
+                # Include tags explicitly (may be None to force SQL NULL in DB)
+                "tags": tags_for_db,
             }
 
             # Keep all non-None values, but keep 'tags' even if it's None (to write NULL)
@@ -1792,6 +1780,132 @@ def generate_daily_quiz_questions():
     print(f"ðŸ Daily quiz generation complete. Total questions generated: {total_generated}")
 
 
+def _build_fallback_seed_votes(statement: str, count: int) -> List[Dict]:
+    """Fallback synthetic arguments if local LLM is unavailable."""
+    support_templates = [
+        f"I support this because it could make implementation faster and easier to monitor for results in practice.",
+        f"This seems useful if executed properly, especially for people who want clearer accountability from leadership.",
+        f"I am in favor since the long-term gains could outweigh the short-term friction if checks are kept strong.",
+        f"Even if imperfect, this idea can help if authorities publish transparent progress and fix issues quickly.",
+        f"I think this can work because it pushes institutions to coordinate better instead of acting in silos.",
+    ]
+    oppose_templates = [
+        f"I oppose this because it sounds good on paper but may create side effects that hurt ordinary citizens.",
+        f"This worries me since implementation gaps are usually ignored and then people carry the burden later.",
+        f"I am not convinced because similar plans often overpromise while ground realities remain unchanged.",
+        f"This should be reconsidered; without stronger safeguards it can centralize too much power too quickly.",
+        f"I disagree because the proposal may ignore local differences and could fail in many regions.",
+    ]
+
+    votes: List[Dict] = []
+    for idx in range(max(1, count)):
+        use_support = (idx % 2 == 0)
+        template_pool = support_templates if use_support else oppose_templates
+        argument = random.choice(template_pool)
+        votes.append(
+            {
+                "side": "support" if use_support else "oppose",
+                "argument": f"{argument} ({statement[:80]})",
+                "score": random.randint(4, 7),
+            }
+        )
+    return votes
+
+
+def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_votes: int = 20) -> int:
+    """
+    Seed a new debate with synthetic average-quality votes so the thread is not empty at launch.
+    Uses local LLM first; falls back to template-based arguments when needed.
+    """
+    if not topic_id or not statement:
+        return 0
+
+    client = supabase_client()
+    target_votes = random.randint(min_votes, max_votes)
+
+    try:
+        existing_res = (
+            client.table("user_votes")
+            .select("id", count="exact")
+            .eq("topic_id", topic_id)
+            .execute()
+        )
+        existing_count = existing_res.count or 0
+    except Exception:
+        existing_count = 0
+
+    if existing_count >= min_votes:
+        print(f"â„¹ï¸ [DEBATE] Seed skipped for topic {topic_id}: existing votes={existing_count}")
+        return 0
+
+    needed = max(0, target_votes - existing_count)
+    if needed <= 0:
+        return 0
+
+    synthetic_votes: List[Dict] = []
+    try:
+        if llm_service is not None and hasattr(llm_service, "generate_seed_debate_votes"):
+            # Llama-3 prompt-backed synthetic vote generation.
+            synthetic_votes = llm_service.generate_seed_debate_votes(statement, needed) or []
+    except Exception as e:
+        print(f"âš ï¸ [DEBATE] LLM seed generation failed: {e}")
+        synthetic_votes = []
+
+    if len(synthetic_votes) < needed:
+        synthetic_votes = (synthetic_votes or []) + _build_fallback_seed_votes(statement, needed)
+
+    rows = []
+    for item in synthetic_votes[:needed]:
+        side = str(item.get("side", "")).strip().lower()
+        if side not in {"support", "oppose"}:
+            side = "support" if (len(rows) % 2 == 0) else "oppose"
+
+        argument_text = re.sub(r"\s+", " ", str(item.get("argument", "")).strip())
+        if not argument_text:
+            continue
+
+        try:
+            ai_score = int(item.get("score", 6))
+        except Exception:
+            ai_score = 6
+        ai_score = max(4, min(7, ai_score))
+
+        rows.append(
+            {
+                "user_id": str(uuid.uuid4()),
+                "topic_id": topic_id,
+                "side": side,
+                "argument_text": argument_text[:320],
+                "ai_score": ai_score,
+                "ai_feedback": "Community seed vote",
+                "ai_evaluated": True,
+            }
+        )
+
+    if not rows:
+        return 0
+
+    # Ensure both sides are represented for a realistic seed mix.
+    has_support = any(r.get("side") == "support" for r in rows)
+    has_oppose = any(r.get("side") == "oppose" for r in rows)
+    if not has_support and rows:
+        rows[0]["side"] = "support"
+    if not has_oppose and len(rows) > 1:
+        rows[-1]["side"] = "oppose"
+
+    inserted = 0
+    for i in range(0, len(rows), 50):
+        batch = rows[i:i + 50]
+        try:
+            res = client.table("user_votes").insert(batch).execute()
+            inserted += len(res.data or [])
+        except Exception as e:
+            print(f"âš ï¸ [DEBATE] Failed to insert seed vote batch: {e}")
+
+    print(f"âœ… [DEBATE] Seeded {inserted} synthetic votes for topic {topic_id}")
+    return inserted
+
+
 def generate_daily_debate_topic():
     print("âš–ï¸ [DEBATE] Generating new daily debate topic...")
     client = supabase_client()
@@ -1811,13 +1925,20 @@ def generate_daily_debate_topic():
         topic_data = generate_debate_topic(combined_text)
 
         if "statement" in topic_data:
-            client.table("debate_topics").insert({
+            insert_res = client.table("debate_topics").insert({
                 "statement": topic_data["statement"],
                 "context": topic_data.get("context", ""),
                 "status": "upcoming",
                 "related_article_ids": article_ids
             }).execute()
             print(f"âœ… [DEBATE] Generated upcoming debate: {topic_data['statement']}")
+            topic_id = None
+            try:
+                topic_id = (insert_res.data or [{}])[0].get("id")
+            except Exception:
+                topic_id = None
+            if topic_id:
+                seed_debate_votes(topic_id, topic_data["statement"])
 
     except Exception as e:
         print(f"âŒ [DEBATE] Error generating topic: {e}")
@@ -1879,9 +2000,10 @@ def manage_debate_lifecycle():
         active_res = client.table("debate_topics").select("id", count="exact").eq("status", "active").execute()
         if active_res.count == 0:
             # Find the oldest upcoming debate
-            upcoming_res = client.table("debate_topics").select("id").eq("status", "upcoming").order("created_at").limit(1).execute()
+            upcoming_res = client.table("debate_topics").select("id, statement").eq("status", "upcoming").order("created_at").limit(1).execute()
             if upcoming_res.data:
                 next_id = upcoming_res.data[0]["id"]
+                next_statement = upcoming_res.data[0].get("statement") or ""
                 start_time = datetime.now()
                 end_time = start_time + timedelta(hours=24)
                 
@@ -1891,6 +2013,8 @@ def manage_debate_lifecycle():
                     "end_time": end_time.isoformat()
                 }).eq("id", next_id).execute()
                 print(f"ðŸš€ [DEBATE] Activated new debate topic ID: {next_id} for 24 hours.")
+                # Ensure each new active debate has synthetic baseline participation.
+                seed_debate_votes(next_id, next_statement)
             else:
                 # No upcoming debates, trigger generation immediately
                 generate_daily_debate_topic()
