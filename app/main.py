@@ -172,6 +172,31 @@ _DISALLOWED_VIDEO_SCRIPT_PATTERNS = [
 ]
 # --- END VIDEO INGEST SAFETY CONFIG ---
 
+# --- DEBATE SEED BOT NETWORK ---
+SEED_BOT_IDENTITIES: List[Tuple[str, str]] = [
+    ("2f7b77f7-9c8d-4c6f-8c7b-1d4e9d09f201", "Rohan Mehta"),
+    ("9a1c4f20-3b4e-4d91-9f3a-5b8e7a10c122", "Priya Desai"),
+    ("c4f21b9d-6d3f-44d0-a4f5-2ab8c9e71d33", "Amit Kumar"),
+    ("d1b7e395-8a4c-4f0a-b9de-31f76c2e4a44", "Neha Sharma"),
+    ("e8c23a71-1f6d-4b2b-8ce1-4dd9a7315b55", "Vikram Iyer"),
+    ("f3a9d6c2-7b1e-4c9a-a2f8-6b0c5e4d6f66", "Sneha Reddy"),
+    ("0d5e7f91-2a8b-4d3c-9e7a-7c1d8f2b7a77", "Arjun Nair"),
+    ("1e6f8a02-3b9c-4e4d-b1f9-8d2e9a3c8b88", "Kavya Joshi"),
+    ("2f7a9b13-4cad-4f5e-8a2b-9e3f0b4d9c99", "Rahul Verma"),
+    ("3a8b0c24-5dbe-4a6f-9b3c-af401c5ead10", "Ananya Gupta"),
+    ("4b9c1d35-6ecf-4b70-ac4d-b0512d6fbe21", "Siddharth Rao"),
+    ("5cad2e46-7fd0-4c81-8d5e-c1623e70cf32", "Pooja Singh"),
+    ("6dbe3f57-80e1-4d92-9e6f-d2734f81d043", "Manish Patel"),
+    ("7ecf4068-91f2-4ea3-af70-e3845092e154", "Isha Malhotra"),
+    ("8fd05179-a203-4fb4-8071-f49561a3f265", "Karan Bhat"),
+    ("9ae1628a-b314-40c5-9172-a5a672b40576", "Meera Kulkarni"),
+    ("abf2739b-c425-41d6-a273-b6b783c51687", "Aditya Sinha"),
+    ("bc0384ac-d536-42e7-b374-c7c894d62798", "Nidhi Jain"),
+    ("cd1495bd-e647-43f8-8475-d8d9a5e738a9", "Varun Chawla"),
+    ("de25a6ce-f758-4499-9576-e9eab6f849ba", "Sana Khan"),
+]
+# --- END DEBATE SEED BOT NETWORK ---
+
 
 class ArticleOut(BaseModel):
     id: str
@@ -1010,9 +1035,14 @@ def fetch_video_news():
                     if not _is_youtube_host(resolved_link):
                         continue
 
-                    video_id = extract_youtube_id(resolved_link)
+                    try:
+                        video_id = extract_youtube_id(resolved_link)
+                    except Exception as youtube_err:
+                        print(f"[VIDEO] youtube_id extraction failed for '{resolved_link}': {youtube_err}")
+                        continue
                     if not video_id:
                         # Strictly keep only videos from YouTube
+                        print(f"[VIDEO] Skipping item with missing youtube_id: {resolved_link[:120]}")
                         continue
 
                     # Keep original YouTube format (watch/shorts/youtu.be) so UI can adapt layout.
@@ -1034,9 +1064,16 @@ def fetch_video_news():
                         continue
 
                     published_at = entry.get("published")
+                    published_parsed = entry.get("published_parsed")
+                    if published_parsed:
+                        try:
+                            published_at = datetime(*published_parsed[:6]).isoformat() + "Z"
+                        except Exception as date_err:
+                            print(f"[VIDEO] Failed to normalize published_at for '{title[:80]}': {date_err}")
 
                     candidate_rows.append(
                         {
+                            "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"youtube:{video_id}")),
                             "url": source_url,
                             "title": title,
                             "youtube_id": video_id,
@@ -1065,17 +1102,33 @@ def fetch_video_news():
 
     saved = 0
     for row in unique_rows.values():
+        payload = {
+            "id": row.get("id"),
+            "title": row.get("title"),
+            "url": row.get("url"),
+            "youtube_id": row.get("youtube_id"),
+            "thumbnail_url": row.get("thumbnail_url"),
+            "source": row.get("source"),
+            "published_at": row.get("published_at"),
+        }
         try:
-            # Videos are now stored in dedicated table to avoid title conflicts with text articles.
-            client.table("videos").upsert(row, on_conflict="title").execute()
+            client.table("videos").upsert(payload, on_conflict="youtube_id").execute()
             saved += 1
         except Exception as upsert_err:
-            print(f"âš ï¸ [VIDEO] Upsert by title failed, retrying by youtube_id: {upsert_err}")
+            print(f"DB Error: {upsert_err}")
+            print(f"[VIDEO] Upsert by youtube_id failed. Payload: {json.dumps(payload)}")
             try:
-                client.table("videos").upsert(row, on_conflict="youtube_id").execute()
+                client.table("videos").upsert(payload, on_conflict="title").execute()
                 saved += 1
-            except Exception as fallback_err:
-                print(f"âŒ [VIDEO] Fallback upsert failed: {fallback_err}")
+            except Exception as title_fallback_err:
+                print(f"DB Error: {title_fallback_err}")
+                print(f"[VIDEO] Upsert by title failed. Payload: {json.dumps(payload)}")
+                try:
+                    client.table("videos").insert(payload).execute()
+                    saved += 1
+                except Exception as insert_err:
+                    print(f"DB Error: {insert_err}")
+                    print(f"[VIDEO] Final insert failed. Payload: {json.dumps(payload)}")
 
     print(f"âœ… [VIDEO] Saved/updated {saved} video articles.")
 
@@ -1812,6 +1865,120 @@ def _build_fallback_seed_votes(statement: str, count: int) -> List[Dict]:
     return votes
 
 
+def _ensure_seed_bot_profiles(client) -> bool:
+    """
+    Ensure synthetic debate bots exist in profiles with stable IDs and names
+    so frontend profile joins resolve display names and ranks.
+    """
+    full_rows = []
+    for idx, (bot_id, bot_name) in enumerate(SEED_BOT_IDENTITIES, start=1):
+        full_rows.append(
+            {
+                "id": bot_id,
+                "display_name": bot_name,
+                "full_name": bot_name,
+                "email": f"bot.seed.{idx}@readdio.local",
+                "debate_xp": 0,
+                "current_title": "Rookie",
+            }
+        )
+
+    slim_rows = [
+        {"id": r["id"], "display_name": r["display_name"], "full_name": r["full_name"], "debate_xp": 0, "current_title": "Rookie"}
+        for r in full_rows
+    ]
+    minimal_rows = [
+        {"id": r["id"], "display_name": r["display_name"], "debate_xp": 0, "current_title": "Rookie"}
+        for r in full_rows
+    ]
+    tiny_rows = [
+        {"id": r["id"], "display_name": r["display_name"], "current_title": "Rookie"}
+        for r in full_rows
+    ]
+    id_name_rows = [
+        {"id": r["id"], "display_name": r["display_name"]}
+        for r in full_rows
+    ]
+
+    attempts = [full_rows, slim_rows, minimal_rows, tiny_rows, id_name_rows]
+    for payload in attempts:
+        try:
+            client.table("profiles").upsert(payload, on_conflict="id").execute()
+            print(f"[DEBATE] Bot profile network ensured ({len(payload)} profiles upserted).")
+            return True
+        except Exception as e:
+            print(f"DB Error: {e}")
+            print("[DEBATE] Bot profile upsert attempt failed; trying schema fallback payload.")
+
+    print("[DEBATE] Could not ensure bot profiles. Seeded votes may show as 'User'.")
+    return False
+
+
+def _apply_seed_bot_xp(client, inserted_rows: List[Dict]) -> None:
+    """
+    Apply debate XP/title progression to seed bots using the same formula as normal users.
+    """
+    if not inserted_rows:
+        return
+
+    try:
+        from debate_service import XP_BASE_VOTE, XP_MULTIPLIER_SCORE, calculate_new_title
+    except Exception:
+        XP_BASE_VOTE = 10
+        XP_MULTIPLIER_SCORE = 5
+
+        def calculate_new_title(total_xp: int) -> str:
+            if total_xp >= 5000:
+                return "Logic Lord"
+            if total_xp >= 1000:
+                return "Senior Pundit"
+            if total_xp >= 500:
+                return "Analyst"
+            if total_xp >= 100:
+                return "Observer"
+            return "Rookie"
+
+    xp_by_user: Dict[str, int] = {}
+    for row in inserted_rows:
+        user_id = str(row.get("user_id") or "").strip()
+        if not user_id:
+            continue
+        try:
+            score = int(row.get("ai_score", 5))
+        except Exception:
+            score = 5
+        score = max(1, min(10, score))
+        xp_delta = XP_BASE_VOTE + (score * XP_MULTIPLIER_SCORE)
+        xp_by_user[user_id] = xp_by_user.get(user_id, 0) + xp_delta
+
+    if not xp_by_user:
+        return
+
+    existing_profiles: Dict[str, Dict] = {}
+    bot_ids = list(xp_by_user.keys())
+    try:
+        existing_res = client.table("profiles").select("id,debate_xp,current_title").in_("id", bot_ids).execute()
+        existing_profiles = {str(p.get("id")): p for p in (existing_res.data or []) if p.get("id")}
+    except Exception as e:
+        print(f"DB Error: {e}")
+        print("[DEBATE] Could not read bot profiles before XP update.")
+
+    for bot_id, xp_delta in xp_by_user.items():
+        current = existing_profiles.get(bot_id, {})
+        current_xp = int(current.get("debate_xp", 0) or 0)
+        next_xp = current_xp + xp_delta
+        next_title = calculate_new_title(next_xp)
+        update_data = {"debate_xp": next_xp}
+        if (current.get("current_title") or "Rookie") != next_title:
+            update_data["current_title"] = next_title
+
+        try:
+            client.table("profiles").update(update_data).eq("id", bot_id).execute()
+        except Exception as e:
+            print(f"DB Error: {e}")
+            print(f"[DEBATE] Failed to update bot XP/title for id={bot_id}.")
+
+
 def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_votes: int = 20) -> int:
     """
     Seed a new debate with synthetic average-quality votes so the thread is not empty at launch.
@@ -1842,6 +2009,8 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
     if needed <= 0:
         return 0
 
+    _ensure_seed_bot_profiles(client)
+
     synthetic_votes: List[Dict] = []
     try:
         if llm_service is not None and hasattr(llm_service, "generate_seed_debate_votes"):
@@ -1870,9 +2039,10 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
             ai_score = 6
         ai_score = max(4, min(7, ai_score))
 
+        bot_id, _bot_name = random.choice(SEED_BOT_IDENTITIES)
         rows.append(
             {
-                "user_id": str(uuid.uuid4()),
+                "user_id": bot_id,
                 "topic_id": topic_id,
                 "side": side,
                 "argument_text": argument_text[:320],
@@ -1894,13 +2064,18 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
         rows[-1]["side"] = "oppose"
 
     inserted = 0
+    inserted_rows: List[Dict] = []
     for i in range(0, len(rows), 50):
         batch = rows[i:i + 50]
         try:
-            res = client.table("user_votes").insert(batch).execute()
-            inserted += len(res.data or [])
+            client.table("user_votes").insert(batch).execute()
+            inserted += len(batch)
+            inserted_rows.extend(batch)
         except Exception as e:
             print(f"âš ï¸ [DEBATE] Failed to insert seed vote batch: {e}")
+
+    if inserted_rows:
+        _apply_seed_bot_xp(client, inserted_rows)
 
     print(f"âœ… [DEBATE] Seeded {inserted} synthetic votes for topic {topic_id}")
     return inserted
