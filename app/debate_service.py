@@ -255,16 +255,20 @@ async def get_current_debate(user_id: str):
     
     support_score = 0
     oppose_score = 0
+    support_vote_count = 0
+    oppose_vote_count = 0
     support_args = []
     oppose_args = []
     
     for v in all_votes:
         score_val = v.get("ai_score") or 0
         if v["side"] == "support":
+            support_vote_count += 1
             support_score += score_val
             if score_val >= 7:
                 support_args.append({"text": v["argument_text"], "score": score_val})
-        else:
+        elif v["side"] == "oppose":
+            oppose_vote_count += 1
             oppose_score += score_val
             if score_val >= 7:
                 oppose_args.append({"text": v["argument_text"], "score": score_val})
@@ -286,6 +290,8 @@ async def get_current_debate(user_id: str):
             "stats": {
                 "support_score": support_score,
                 "oppose_score": oppose_score,
+                "support_vote_count": support_vote_count,
+                "oppose_vote_count": oppose_vote_count,
                 "top_support_args": top_support_args,
                 "top_oppose_args": top_oppose_args
             }
@@ -297,7 +303,35 @@ async def get_debate_history(user_id: str):
     client = supabase_client()
     
     res = client.table("debate_topics").select("*").eq("status", "completed").order("end_time", desc=True).limit(10).execute()
-    return res.data or []
+    history = res.data or []
+    if not history:
+        return []
+
+    topic_ids = [str(row.get("id")) for row in history if row.get("id")]
+    counts_by_topic: dict[str, dict[str, int]] = {}
+    if topic_ids:
+        try:
+            votes_res = client.table("user_votes").select("topic_id, side").in_("topic_id", topic_ids).execute()
+            for vote in (votes_res.data or []):
+                topic_id = str(vote.get("topic_id") or "")
+                side = str(vote.get("side") or "")
+                if not topic_id:
+                    continue
+                if topic_id not in counts_by_topic:
+                    counts_by_topic[topic_id] = {"support_vote_count": 0, "oppose_vote_count": 0}
+                if side == "support":
+                    counts_by_topic[topic_id]["support_vote_count"] += 1
+                elif side == "oppose":
+                    counts_by_topic[topic_id]["oppose_vote_count"] += 1
+        except Exception as e:
+            print(f"[DEBATE] Failed to load history vote counts: {e}")
+
+    for row in history:
+        topic_id = str(row.get("id") or "")
+        topic_counts = counts_by_topic.get(topic_id, {"support_vote_count": 0, "oppose_vote_count": 0})
+        row["support_vote_count"] = topic_counts["support_vote_count"]
+        row["oppose_vote_count"] = topic_counts["oppose_vote_count"]
+    return history
 
 @router.post("/conclude/{topic_id}")
 async def conclude_debate(topic_id: str):
@@ -305,11 +339,13 @@ async def conclude_debate(topic_id: str):
     client = supabase_client()
     
     # 1. Fetch all votes for this topic
-    votes_res = client.table("user_votes").select("side, ai_score").eq("topic_id", topic_id).execute()
+    votes_res = client.table("user_votes").select("side, ai_score, argument_text").eq("topic_id", topic_id).execute()
     votes = votes_res.data or []
     
     support_sum = sum([v.get("ai_score") or 0 for v in votes if v["side"] == "support"])
     oppose_sum = sum([v.get("ai_score") or 0 for v in votes if v["side"] == "oppose"])
+    support_vote_count = len([v for v in votes if v.get("side") == "support"])
+    oppose_vote_count = len([v for v in votes if v.get("side") == "oppose"])
     
     # 2. Determine winner
     winning_side = "draw"
@@ -317,13 +353,47 @@ async def conclude_debate(topic_id: str):
         winning_side = "support"
     elif oppose_sum > support_sum:
         winning_side = "oppose"
+
+    # 3. Build AI conclusion with winner + strongest arguments.
+    topic_res = client.table("debate_topics").select("statement").eq("id", topic_id).limit(1).execute()
+    statement = (topic_res.data or [{}])[0].get("statement", "")
+
+    if winning_side == "support":
+        candidate_votes = [v for v in votes if v.get("side") == "support"]
+    elif winning_side == "oppose":
+        candidate_votes = [v for v in votes if v.get("side") == "oppose"]
+    else:
+        candidate_votes = votes
+
+    top_votes = sorted(
+        [v for v in candidate_votes if (v.get("argument_text") or "").strip()],
+        key=lambda v: int(v.get("ai_score") or 0),
+        reverse=True,
+    )[:5]
+    top_args_text = (
+        "\n".join([f"- {(v.get('argument_text') or '').strip()}" for v in top_votes])
+        if top_votes
+        else "No strong arguments provided."
+    )
+    ai_conclusion = (
+        "The debate ended in a draw on total logic points, with both sides presenting comparable reasoning."
+        if winning_side == "draw"
+        else "The winning side presented stronger logical points and practical evidence."
+    )
+    if statement:
+        try:
+            from LocalLLMService import conclude_debate as llm_conclude_debate
+            ai_conclusion = llm_conclude_debate(statement, winning_side, top_args_text)
+        except Exception as e:
+            print(f"[DEBATE] LLM conclusion failed for topic {topic_id}: {e}")
         
-    # 3. Update topic
+    # 4. Update topic
     update_data = {
         "status": "completed",
         "support_score": support_sum,
         "oppose_score": oppose_sum,
         "winning_side": winning_side,
+        "ai_conclusion": ai_conclusion,
         "end_time": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }
     
@@ -334,5 +404,8 @@ async def conclude_debate(topic_id: str):
         "topic_id": topic_id,
         "support_score": support_sum,
         "oppose_score": oppose_sum,
+        "support_vote_count": support_vote_count,
+        "oppose_vote_count": oppose_vote_count,
+        "ai_conclusion": ai_conclusion,
         "winner": winning_side
     }
