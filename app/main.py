@@ -174,61 +174,24 @@ _DISALLOWED_VIDEO_SCRIPT_PATTERNS = [
 # --- END VIDEO INGEST SAFETY CONFIG ---
 
 # --- DEBATE SEED BOT NETWORK ---
-SEED_BOT_UUIDS: List[str] = [
-    "2f7b77f7-9c8d-4c6f-8c7b-1d4e9d09f201",
-    "9a1c4f20-3b4e-4d91-9f3a-5b8e7a10c122",
-    "c4f21b9d-6d3f-44d0-a4f5-2ab8c9e71d33",
-    "d1b7e395-8a4c-4f0a-b9de-31f76c2e4a44",
-    "e8c23a71-1f6d-4b2b-8ce1-4dd9a7315b55",
-    "f3a9d6c2-7b1e-4c9a-a2f8-6b0c5e4d6f66",
-    "0d5e7f91-2a8b-4d3c-9e7a-7c1d8f2b7a77",
-    "1e6f8a02-3b9c-4e4d-b1f9-8d2e9a3c8b88",
-    "2f7a9b13-4cad-4f5e-8a2b-9e3f0b4d9c99",
-    "3a8b0c24-5dbe-4a6f-9b3c-af401c5ead10",
-    "4b9c1d35-6ecf-4b70-ac4d-b0512d6fbe21",
-    "5cad2e46-7fd0-4c81-8d5e-c1623e70cf32",
-    "6dbe3f57-80e1-4d92-9e6f-d2734f81d043",
-    "7ecf4068-91f2-4ea3-af70-e3845092e154",
-    "8fd05179-a203-4fb4-8071-f49561a3f265",
+BOT_ACCOUNT_DEFS: List[Tuple[str, str]] = [
+    ("Rohan M.", "bot_rohan@readdio.internal"),
+    ("Priya Sharma", "bot_priya@readdio.internal"),
+    ("Amit K.", "bot_amit@readdio.internal"),
+    ("Neha Rao", "bot_neha@readdio.internal"),
+    ("Vikram I.", "bot_vikram@readdio.internal"),
+    ("Sneha Reddy", "bot_sneha@readdio.internal"),
+    ("Arjun Nair", "bot_arjun@readdio.internal"),
+    ("Kavya Joshi", "bot_kavya@readdio.internal"),
+    ("Rahul Verma", "bot_rahul@readdio.internal"),
+    ("Ananya G.", "bot_ananya@readdio.internal"),
+    ("Siddharth R.", "bot_siddharth@readdio.internal"),
+    ("Pooja Singh", "bot_pooja@readdio.internal"),
+    ("Manish Patel", "bot_manish@readdio.internal"),
+    ("Isha Malhotra", "bot_isha@readdio.internal"),
+    ("Karan Bhat", "bot_karan@readdio.internal"),
 ]
-SEED_BOT_DISPLAY_NAMES: List[str] = [
-    "Rohan M.",
-    "Priya Sharma",
-    "Amit K.",
-    "Neha Rao",
-    "Vikram I.",
-    "Sneha Reddy",
-    "Arjun Nair",
-    "Kavya Joshi",
-    "Rahul Verma",
-    "Ananya G.",
-    "Siddharth R.",
-    "Pooja Singh",
-    "Manish Patel",
-    "Isha Malhotra",
-    "Karan Bhat",
-]
-SEED_BOT_EMAILS: List[str] = [
-    "bot_rohan@readdio.internal",
-    "bot_priya@readdio.internal",
-    "bot_amit@readdio.internal",
-    "bot_neha@readdio.internal",
-    "bot_vikram@readdio.internal",
-    "bot_sneha@readdio.internal",
-    "bot_arjun@readdio.internal",
-    "bot_kavya@readdio.internal",
-    "bot_rahul@readdio.internal",
-    "bot_ananya@readdio.internal",
-    "bot_siddharth@readdio.internal",
-    "bot_pooja@readdio.internal",
-    "bot_manish@readdio.internal",
-    "bot_isha@readdio.internal",
-    "bot_karan@readdio.internal",
-]
-SEED_BOT_ROSTER: List[Dict[str, str]] = [
-    {"id": bot_id, "display_name": display_name, "email": email}
-    for bot_id, display_name, email in zip(SEED_BOT_UUIDS, SEED_BOT_DISPLAY_NAMES, SEED_BOT_EMAILS)
-]
+BOT_DEFAULT_PASSWORD = "SecureBotPassword123!"
 # --- END DEBATE SEED BOT NETWORK ---
 
 
@@ -1014,6 +977,11 @@ def _is_trusted_video_source(source_name: str, title: str, description: str) -> 
     Source guardrail for copyright risk reduction.
     Enabled by default; can be relaxed with VIDEO_STRICT_SOURCE_FILTER=false.
     """
+    # Dedicated video feeds may expose source as plain "YouTube".
+    # Always allow this canonical platform label to avoid false negatives.
+    if (source_name or "").strip().lower() == "youtube":
+        return True
+
     if not VIDEO_STRICT_SOURCE_FILTER:
         return True
 
@@ -1163,33 +1131,17 @@ def fetch_video_news():
                     }
                     processed_entries += 1
 
-                    inserted = False
-                    for conflict_col in ("url", "youtube_id", "title"):
-                        try:
-                            client.table("videos").upsert(video_data, on_conflict=conflict_col).execute()
-                            print(f"Saved Video: {video_data['title'][:50]}... (conflict={conflict_col})")
-                            saved += 1
-                            inserted = True
-                            break
-                        except Exception as e:
-                            print(f"DB Error: {e}")
-                            print(
-                                f"[VIDEO] Upsert failed for '{video_data['title'][:50]}' "
-                                f"(on_conflict={conflict_col}) payload={json.dumps(video_data)}"
-                            )
-
-                    if not inserted:
-                        try:
-                            client.table("videos").insert(video_data).execute()
-                            print(f"Saved Video: {video_data['title'][:50]}... (insert fallback)")
-                            saved += 1
-                        except Exception as e:
-                            failed += 1
-                            print(f"DB Error: {e}")
-                            print(
-                                f"[VIDEO] DB Insert Failed for Video '{video_data['title'][:30]}': "
-                                f"payload={json.dumps(video_data)}"
-                            )
+                    try:
+                        client.table("videos").upsert(video_data, on_conflict="youtube_id").execute()
+                        print(f"Saved Video: {video_data['title'][:50]}... (conflict=youtube_id)")
+                        saved += 1
+                    except Exception as e:
+                        failed += 1
+                        print(f"DB Error: {e}")
+                        print(
+                            f"[VIDEO] Upsert failed for '{video_data['title'][:50]}' "
+                            f"(on_conflict=youtube_id) payload={json.dumps(video_data)}"
+                        )
                 except Exception as item_err:
                     failed += 1
                     print(f"[VIDEO] Failed to process entry: {item_err}")
@@ -1937,21 +1889,164 @@ def _build_fallback_seed_votes(statement: str, count: int) -> List[Dict]:
     return votes
 
 
-def initialize_bot_profiles(client=None) -> int:
+def _extract_auth_user_id(resp) -> Optional[str]:
+    """Best-effort extraction of user.id from Supabase admin responses."""
+    if resp is None:
+        return None
+    try:
+        user_obj = getattr(resp, "user", None)
+        if user_obj is not None:
+            user_id = getattr(user_obj, "id", None) or (user_obj.get("id") if isinstance(user_obj, dict) else None)
+            if user_id:
+                return str(user_id)
+    except Exception:
+        pass
+    try:
+        data_obj = getattr(resp, "data", None)
+        if isinstance(data_obj, dict):
+            if data_obj.get("id"):
+                return str(data_obj["id"])
+            nested_user = data_obj.get("user")
+            if isinstance(nested_user, dict) and nested_user.get("id"):
+                return str(nested_user["id"])
+    except Exception:
+        pass
+    return None
+
+
+def _extract_users_from_admin_list(resp) -> List[dict]:
+    """Normalize possible list_users response shapes into plain dict records."""
+    out: List[dict] = []
+    if resp is None:
+        return out
+    try:
+        users_attr = getattr(resp, "users", None)
+        if users_attr:
+            for u in users_attr:
+                if isinstance(u, dict):
+                    out.append(u)
+                else:
+                    out.append({"id": getattr(u, "id", None), "email": getattr(u, "email", None)})
+            if out:
+                return out
+    except Exception:
+        pass
+    try:
+        data_attr = getattr(resp, "data", None)
+        if isinstance(data_attr, list):
+            for u in data_attr:
+                if isinstance(u, dict):
+                    out.append(u)
+        elif isinstance(data_attr, dict):
+            nested = data_attr.get("users")
+            if isinstance(nested, list):
+                for u in nested:
+                    if isinstance(u, dict):
+                        out.append(u)
+        if out:
+            return out
+    except Exception:
+        pass
+    if isinstance(resp, list):
+        for u in resp:
+            if isinstance(u, dict):
+                out.append(u)
+    elif isinstance(resp, dict):
+        nested = resp.get("users")
+        if isinstance(nested, list):
+            for u in nested:
+                if isinstance(u, dict):
+                    out.append(u)
+    return out
+
+
+def _find_auth_user_id_by_email(client, email: str) -> Optional[str]:
+    """Lookup bot user id in auth.users via admin list endpoint."""
+    email_lc = (email or "").strip().lower()
+    if not email_lc:
+        return None
+    try:
+        res = client.auth.admin.list_users()
+        users = _extract_users_from_admin_list(res)
+        for u in users:
+            u_email = str(u.get("email") or "").strip().lower()
+            if u_email == email_lc and u.get("id"):
+                return str(u["id"])
+    except Exception as e:
+        print(f"DB Error: {e}")
+        print(f"[DEBATE] Could not lookup auth user by email: {email}")
+    return None
+
+
+def get_bot_profile_ids(client=None) -> List[str]:
+    """Fetch valid bot IDs from profiles using internal bot email pattern."""
+    local_client = client or supabase_client()
+    try:
+        res = (
+            local_client.table("profiles")
+            .select("id,email")
+            .ilike("email", "%@readdio.internal")
+            .execute()
+        )
+        rows = res.data or []
+        return [str(r.get("id")) for r in rows if r.get("id")]
+    except Exception as e:
+        print(f"DB Error: {e}")
+        print("[DEBATE] Failed to fetch bot profile IDs from profiles table.")
+        return []
+
+
+def initialize_bot_profiles(client=None) -> List[str]:
     """
-    Initialize debate bot profiles with all key fields populated so profile inserts
-    satisfy stricter NOT NULL/required column constraints.
+    Create bot auth users first, then upsert corresponding profiles using the
+    real UUID assigned by Supabase Auth.
     """
     local_client = client or supabase_client()
     now_iso = datetime.now(timezone.utc).isoformat()
-    initialized = 0
+    ready_ids: List[str] = []
 
-    for bot in SEED_BOT_ROSTER:
-        bot_id = bot["id"]
-        display_name = bot["display_name"]
-        fake_email = bot["email"]
+    for display_name, fake_email in BOT_ACCOUNT_DEFS:
+        bot_uuid: Optional[str] = None
+        try:
+            create_resp = local_client.auth.admin.create_user(
+                {
+                    "email": fake_email,
+                    "password": BOT_DEFAULT_PASSWORD,
+                    "email_confirm": True,
+                }
+            )
+            bot_uuid = _extract_auth_user_id(create_resp)
+            if bot_uuid:
+                print(f"[DEBATE] Created bot auth user: {fake_email} ({bot_uuid})")
+        except Exception as e:
+            print(f"DB Error: {e}")
+            print(f"[DEBATE] Bot likely already exists in auth for {fake_email}.")
+
+        if not bot_uuid:
+            try:
+                existing_profile = (
+                    local_client.table("profiles")
+                    .select("id,email")
+                    .eq("email", fake_email)
+                    .limit(1)
+                    .execute()
+                )
+                rows = existing_profile.data or []
+                if rows and rows[0].get("id"):
+                    bot_uuid = str(rows[0]["id"])
+            except Exception as e:
+                print(f"DB Error: {e}")
+                print(f"[DEBATE] Failed to resolve existing profile id for {fake_email}.")
+
+        if not bot_uuid:
+            bot_uuid = _find_auth_user_id_by_email(local_client, fake_email)
+
+        if not bot_uuid:
+            print(f"[DEBATE] Could not resolve auth UUID for {fake_email}; skipping profile upsert.")
+            continue
+
         bot_data = {
-            "id": bot_id,
+            "id": bot_uuid,
             "email": fake_email,
             "display_name": display_name,
             "full_name": display_name,
@@ -1960,23 +2055,19 @@ def initialize_bot_profiles(client=None) -> int:
             "created_at": now_iso,
             "updated_at": now_iso,
         }
-
         try:
             local_client.table("profiles").upsert(bot_data, on_conflict="id").execute()
-            initialized += 1
-            print(f"[DEBATE] Bot profile ready: {display_name} ({bot_id})")
+            ready_ids.append(bot_uuid)
+            print(f"[DEBATE] Bot profile ready: {display_name} ({bot_uuid})")
         except Exception as e:
             print(f"DB Error: {e}")
             print(
-                f"[DEBATE] Bot profile upsert failed for '{display_name}' ({bot_id}). "
+                f"[DEBATE] Bot profile upsert failed for '{display_name}' ({fake_email}). "
                 f"Payload={json.dumps(bot_data)}"
             )
 
-    print(
-        f"[DEBATE] Bot profile initialization complete: "
-        f"initialized={initialized}/{len(SEED_BOT_ROSTER)}"
-    )
-    return initialized
+    print(f"[DEBATE] Bot initialization complete: ready={len(ready_ids)}/{len(BOT_ACCOUNT_DEFS)}")
+    return ready_ids
 
 
 def _apply_seed_bot_xp(client, inserted_rows: List[Dict]) -> None:
@@ -2074,9 +2165,14 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
     if needed <= 0:
         return 0
 
-    initialized_bots = initialize_bot_profiles(client)
-    if initialized_bots <= 0:
-        print("[DEBATE] Warning: No bot profiles initialized; seeded votes may fail foreign key checks.")
+    bot_ids = get_bot_profile_ids(client)
+    if not bot_ids:
+        print("[DEBATE] No existing bot profiles found. Initializing bot accounts...")
+        initialize_bot_profiles(client)
+        bot_ids = get_bot_profile_ids(client)
+    if not bot_ids:
+        print("[DEBATE] No valid bot profile IDs available; skipping seed votes.")
+        return 0
 
     synthetic_votes: List[Dict] = []
     try:
@@ -2106,7 +2202,7 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
             ai_score = 6
         ai_score = max(4, min(7, ai_score))
 
-        bot_id = random.choice(SEED_BOT_ROSTER)["id"]
+        bot_id = random.choice(bot_ids)
         rows.append(
             {
                 "user_id": bot_id,
