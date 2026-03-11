@@ -154,6 +154,22 @@ VIDEO_SOURCE_ALLOWLIST = [
     if s.strip()
 ]
 
+# Hard allowlist for Shorts ingestion (Indian audience).
+INDIAN_VIDEO_SOURCES = [
+    "NDTV",
+    "India Today",
+    "Times of India",
+    "CNN-News18",
+    "Hindustan Times",
+    "WION",
+    "Republic World",
+    "Firstpost",
+    "The Indian Express",
+    "The Hindu",
+    "Drishti IAS",
+    "StudyIQ IAS",
+]
+
 # Scripts we explicitly do NOT allow for video ingestion (English/Hindi only).
 _DISALLOWED_VIDEO_SCRIPT_PATTERNS = [
     re.compile(r"[\u0980-\u09FF]"),  # Bengali
@@ -953,6 +969,25 @@ def _is_youtube_host(url: str) -> bool:
         return False
 
 
+def _is_youtube_shorts_url(url: str) -> bool:
+    """Strict Shorts detector: requires youtube.com/shorts/{id} path."""
+    try:
+        parsed = urlparse(url or "")
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        return ("youtube.com" in host) and ("/shorts/" in path)
+    except Exception:
+        return False
+
+
+def _is_approved_indian_video_source(source_name: str) -> bool:
+    """Case-insensitive partial match against approved Indian source names."""
+    source_lower = (source_name or "").strip().lower()
+    if not source_lower:
+        return False
+    return any(approved.lower() in source_lower for approved in INDIAN_VIDEO_SOURCES)
+
+
 def _is_english_or_hindi_text(text: str) -> bool:
     """
     Language guardrail:
@@ -1021,9 +1056,9 @@ def _safe_video_published_at(entry: dict) -> str:
 def fetch_video_news():
     """
     Dedicated video ingestor:
-    - Uses explicit YouTube-focused Google News RSS search queries
+    - Uses strict Google News RSS queries targeting YouTube Shorts
+    - Enforces approved Indian news/education source allowlist
     - Filters to English/Hindi only
-    - Applies trusted-source allowlist (configurable)
     - Saves to dedicated `videos` table (no article-table title conflicts)
     - Saves thumbnail via img.youtube.com
     - Stores metadata only (no video download/re-host, no AI summarization)
@@ -1031,9 +1066,8 @@ def fetch_video_news():
     print("[VIDEO] Starting dedicated video ingestion cycle...")
     client = supabase_client()
     search_queries = [
-        "India News (English OR Hindi OR हिंदी) site:youtube.com",
-        "World News (English OR Hindi OR हिंदी) site:youtube.com",
-        "Tech News (English OR Hindi OR हिंदी) site:youtube.com",
+        "India News inurl:shorts site:youtube.com",
+        "Top News inurl:shorts site:youtube.com",
     ]
 
     seen_youtube_ids: set[str] = set()
@@ -1043,6 +1077,7 @@ def fetch_video_news():
     failed = 0
     skipped_missing_id = 0
     skipped_non_youtube = 0
+    skipped_non_shorts = 0
     skipped_language = 0
     skipped_source = 0
 
@@ -1066,6 +1101,17 @@ def fetch_video_news():
                         print("[VIDEO] Skipping entry with empty link.")
                         continue
 
+                    # Strict allowlist gate before expensive parsing/saving.
+                    raw_source = entry.get("source")
+                    if isinstance(raw_source, dict):
+                        source_name = (raw_source.get("title") or "").strip()
+                    else:
+                        source_name = str(raw_source or "").strip()
+                    if not _is_approved_indian_video_source(source_name):
+                        skipped_source += 1
+                        print(f"[VIDEO] Skipping unapproved source: {source_name or 'UNKNOWN'}")
+                        continue
+
                     resolved_link = rss_link
                     try:
                         dec = new_decoderv1(rss_link)
@@ -1073,6 +1119,12 @@ def fetch_video_news():
                             resolved_link = dec.get("decoded_url") or rss_link
                     except Exception as decode_err:
                         print(f"[VIDEO] Decode failed for link: {decode_err}")
+
+                    # Strict format gate: keep only Shorts URLs.
+                    if not (_is_youtube_shorts_url(resolved_link) or _is_youtube_shorts_url(rss_link)):
+                        skipped_non_shorts += 1
+                        print(f"[VIDEO] Skipping non-Shorts URL: {resolved_link[:120]}")
+                        continue
 
                     try:
                         video_id = extract_youtube_id(resolved_link) or extract_youtube_id(rss_link)
@@ -1085,9 +1137,8 @@ def fetch_video_news():
                         print(f"[VIDEO] Skipping item with missing youtube_id: {resolved_link[:120]}")
                         continue
 
-                    source_url = resolved_link
-                    if not _is_youtube_host(source_url):
-                        source_url = f"https://www.youtube.com/watch?v={video_id}"
+                    # Canonical Shorts URL keeps the feed vertical-first.
+                    source_url = f"https://www.youtube.com/shorts/{video_id}"
                     if not _is_youtube_host(source_url):
                         skipped_non_youtube += 1
                         print(f"[VIDEO] Skipping non-YouTube item after decode: {resolved_link[:120]}")
@@ -1099,11 +1150,6 @@ def fetch_video_news():
                     seen_youtube_ids.add(video_id)
 
                     thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
-                    raw_source = entry.get("source")
-                    if isinstance(raw_source, dict):
-                        source_name = (raw_source.get("title") or "YouTube").strip()
-                    else:
-                        source_name = str(raw_source or "YouTube").strip() or "YouTube"
                     title = (entry.get("title") or "Video Update").strip()
                     description = _extract_rss_description(entry.get("summary", ""))
                     if not description:
@@ -1113,11 +1159,6 @@ def fetch_video_news():
                     if not _is_english_or_hindi_text(lang_sample):
                         skipped_language += 1
                         print(f"[VIDEO] Skipped non EN/HI item: {title[:80]}")
-                        continue
-
-                    if not _is_trusted_video_source(source_name, title, description):
-                        skipped_source += 1
-                        print(f"[VIDEO] Skipped non-allowlisted source: {source_name}")
                         continue
 
                     safe_published_date = _safe_video_published_at(entry)
@@ -1153,7 +1194,8 @@ def fetch_video_news():
         "[VIDEO] Cycle summary: "
         f"entries={total_entries}, processed={processed_entries}, saved={saved}, failed={failed}, "
         f"skipped_missing_id={skipped_missing_id}, skipped_non_youtube={skipped_non_youtube}, "
-        f"skipped_language={skipped_language}, skipped_source={skipped_source}"
+        f"skipped_non_shorts={skipped_non_shorts}, skipped_language={skipped_language}, "
+        f"skipped_source={skipped_source}"
     )
 
 
@@ -1998,14 +2040,47 @@ def get_bot_profile_ids(client=None) -> List[str]:
 
 def initialize_bot_profiles(client=None) -> List[str]:
     """
-    Create bot auth users first, then upsert corresponding profiles using the
-    real UUID assigned by Supabase Auth.
+    Create missing bot auth users/profiles, but do not reset existing bot XP/title.
+    New bots start as Rookie and climb normally through seeded-vote XP updates.
     """
     local_client = client or supabase_client()
     now_iso = datetime.now(timezone.utc).isoformat()
     ready_ids: List[str] = []
 
     for display_name, fake_email in BOT_ACCOUNT_DEFS:
+        # 1) Fast path: profile already exists. Keep XP/title untouched.
+        try:
+            existing_profile = (
+                local_client.table("profiles")
+                .select("id,email,display_name,full_name")
+                .eq("email", fake_email)
+                .limit(1)
+                .execute()
+            )
+            existing_rows = existing_profile.data or []
+            if existing_rows and existing_rows[0].get("id"):
+                existing_id = str(existing_rows[0]["id"])
+                ready_ids.append(existing_id)
+
+                # Keep identity fields fresh without touching gamification fields.
+                identity_update = {
+                    "email": fake_email,
+                    "display_name": display_name,
+                    "full_name": display_name,
+                    "updated_at": now_iso,
+                }
+                try:
+                    local_client.table("profiles").update(identity_update).eq("id", existing_id).execute()
+                except Exception as update_err:
+                    print(f"DB Error: {update_err}")
+                    print(f"[DEBATE] Could not refresh identity fields for existing bot {fake_email}.")
+                print(f"[DEBATE] Bot profile already exists: {display_name} ({existing_id})")
+                continue
+        except Exception as lookup_err:
+            print(f"DB Error: {lookup_err}")
+            print(f"[DEBATE] Existing profile lookup failed for {fake_email}; continuing with auth resolution.")
+
+        # 2) Resolve/create auth user.
         bot_uuid: Optional[str] = None
         try:
             create_resp = local_client.auth.admin.create_user(
@@ -2023,35 +2098,20 @@ def initialize_bot_profiles(client=None) -> List[str]:
             print(f"[DEBATE] Bot likely already exists in auth for {fake_email}.")
 
         if not bot_uuid:
-            try:
-                existing_profile = (
-                    local_client.table("profiles")
-                    .select("id,email")
-                    .eq("email", fake_email)
-                    .limit(1)
-                    .execute()
-                )
-                rows = existing_profile.data or []
-                if rows and rows[0].get("id"):
-                    bot_uuid = str(rows[0]["id"])
-            except Exception as e:
-                print(f"DB Error: {e}")
-                print(f"[DEBATE] Failed to resolve existing profile id for {fake_email}.")
-
-        if not bot_uuid:
             bot_uuid = _find_auth_user_id_by_email(local_client, fake_email)
 
         if not bot_uuid:
             print(f"[DEBATE] Could not resolve auth UUID for {fake_email}; skipping profile upsert.")
             continue
 
+        # 3) Create missing profile with Rookie baseline.
         bot_data = {
             "id": bot_uuid,
             "email": fake_email,
             "display_name": display_name,
             "full_name": display_name,
-            "current_title": "Analyst",
-            "debate_xp": random.randint(100, 500),
+            "current_title": "Rookie",
+            "debate_xp": 0,
             "created_at": now_iso,
             "updated_at": now_iso,
         }
