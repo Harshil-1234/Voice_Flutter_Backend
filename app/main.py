@@ -21,7 +21,8 @@ import json
 from pydantic import BaseModel
 from pathlib import Path as PPath
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import trafilatura
 from googlenewsdecoder import new_decoderv1
 from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
@@ -173,27 +174,60 @@ _DISALLOWED_VIDEO_SCRIPT_PATTERNS = [
 # --- END VIDEO INGEST SAFETY CONFIG ---
 
 # --- DEBATE SEED BOT NETWORK ---
-SEED_BOT_IDENTITIES: List[Tuple[str, str]] = [
-    ("2f7b77f7-9c8d-4c6f-8c7b-1d4e9d09f201", "Rohan Mehta"),
-    ("9a1c4f20-3b4e-4d91-9f3a-5b8e7a10c122", "Priya Desai"),
-    ("c4f21b9d-6d3f-44d0-a4f5-2ab8c9e71d33", "Amit Kumar"),
-    ("d1b7e395-8a4c-4f0a-b9de-31f76c2e4a44", "Neha Sharma"),
-    ("e8c23a71-1f6d-4b2b-8ce1-4dd9a7315b55", "Vikram Iyer"),
-    ("f3a9d6c2-7b1e-4c9a-a2f8-6b0c5e4d6f66", "Sneha Reddy"),
-    ("0d5e7f91-2a8b-4d3c-9e7a-7c1d8f2b7a77", "Arjun Nair"),
-    ("1e6f8a02-3b9c-4e4d-b1f9-8d2e9a3c8b88", "Kavya Joshi"),
-    ("2f7a9b13-4cad-4f5e-8a2b-9e3f0b4d9c99", "Rahul Verma"),
-    ("3a8b0c24-5dbe-4a6f-9b3c-af401c5ead10", "Ananya Gupta"),
-    ("4b9c1d35-6ecf-4b70-ac4d-b0512d6fbe21", "Siddharth Rao"),
-    ("5cad2e46-7fd0-4c81-8d5e-c1623e70cf32", "Pooja Singh"),
-    ("6dbe3f57-80e1-4d92-9e6f-d2734f81d043", "Manish Patel"),
-    ("7ecf4068-91f2-4ea3-af70-e3845092e154", "Isha Malhotra"),
-    ("8fd05179-a203-4fb4-8071-f49561a3f265", "Karan Bhat"),
-    ("9ae1628a-b314-40c5-9172-a5a672b40576", "Meera Kulkarni"),
-    ("abf2739b-c425-41d6-a273-b6b783c51687", "Aditya Sinha"),
-    ("bc0384ac-d536-42e7-b374-c7c894d62798", "Nidhi Jain"),
-    ("cd1495bd-e647-43f8-8475-d8d9a5e738a9", "Varun Chawla"),
-    ("de25a6ce-f758-4499-9576-e9eab6f849ba", "Sana Khan"),
+SEED_BOT_UUIDS: List[str] = [
+    "2f7b77f7-9c8d-4c6f-8c7b-1d4e9d09f201",
+    "9a1c4f20-3b4e-4d91-9f3a-5b8e7a10c122",
+    "c4f21b9d-6d3f-44d0-a4f5-2ab8c9e71d33",
+    "d1b7e395-8a4c-4f0a-b9de-31f76c2e4a44",
+    "e8c23a71-1f6d-4b2b-8ce1-4dd9a7315b55",
+    "f3a9d6c2-7b1e-4c9a-a2f8-6b0c5e4d6f66",
+    "0d5e7f91-2a8b-4d3c-9e7a-7c1d8f2b7a77",
+    "1e6f8a02-3b9c-4e4d-b1f9-8d2e9a3c8b88",
+    "2f7a9b13-4cad-4f5e-8a2b-9e3f0b4d9c99",
+    "3a8b0c24-5dbe-4a6f-9b3c-af401c5ead10",
+    "4b9c1d35-6ecf-4b70-ac4d-b0512d6fbe21",
+    "5cad2e46-7fd0-4c81-8d5e-c1623e70cf32",
+    "6dbe3f57-80e1-4d92-9e6f-d2734f81d043",
+    "7ecf4068-91f2-4ea3-af70-e3845092e154",
+    "8fd05179-a203-4fb4-8071-f49561a3f265",
+]
+SEED_BOT_DISPLAY_NAMES: List[str] = [
+    "Rohan M.",
+    "Priya Sharma",
+    "Amit K.",
+    "Neha Rao",
+    "Vikram I.",
+    "Sneha Reddy",
+    "Arjun Nair",
+    "Kavya Joshi",
+    "Rahul Verma",
+    "Ananya G.",
+    "Siddharth R.",
+    "Pooja Singh",
+    "Manish Patel",
+    "Isha Malhotra",
+    "Karan Bhat",
+]
+SEED_BOT_EMAILS: List[str] = [
+    "bot_rohan@readdio.internal",
+    "bot_priya@readdio.internal",
+    "bot_amit@readdio.internal",
+    "bot_neha@readdio.internal",
+    "bot_vikram@readdio.internal",
+    "bot_sneha@readdio.internal",
+    "bot_arjun@readdio.internal",
+    "bot_kavya@readdio.internal",
+    "bot_rahul@readdio.internal",
+    "bot_ananya@readdio.internal",
+    "bot_siddharth@readdio.internal",
+    "bot_pooja@readdio.internal",
+    "bot_manish@readdio.internal",
+    "bot_isha@readdio.internal",
+    "bot_karan@readdio.internal",
+]
+SEED_BOT_ROSTER: List[Dict[str, str]] = [
+    {"id": bot_id, "display_name": display_name, "email": email}
+    for bot_id, display_name, email in zip(SEED_BOT_UUIDS, SEED_BOT_DISPLAY_NAMES, SEED_BOT_EMAILS)
 ]
 # --- END DEBATE SEED BOT NETWORK ---
 
@@ -987,6 +1021,35 @@ def _is_trusted_video_source(source_name: str, title: str, description: str) -> 
     return any(token in haystack for token in VIDEO_SOURCE_ALLOWLIST)
 
 
+def _safe_video_published_at(entry: dict) -> str:
+    """
+    Parse RSS date into an ISO-8601 string in UTC.
+    Falls back to current UTC timestamp when missing/malformed.
+    """
+    fallback_iso = datetime.now(timezone.utc).isoformat()
+
+    parsed_tuple = entry.get("published_parsed") or entry.get("updated_parsed")
+    if parsed_tuple:
+        try:
+            return datetime(*parsed_tuple[:6], tzinfo=timezone.utc).isoformat()
+        except Exception as e:
+            print(f"[VIDEO] Date tuple parse failed: {e}")
+
+    raw_date = entry.get("published") or entry.get("updated")
+    if raw_date:
+        try:
+            dt = parsedate_to_datetime(str(raw_date))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.isoformat()
+        except Exception as e:
+            print(f"[VIDEO] Date string parse failed ('{raw_date}'): {e}")
+
+    return fallback_iso
+
+
 def fetch_video_news():
     """
     Dedicated video ingestor:
@@ -997,15 +1060,23 @@ def fetch_video_news():
     - Saves thumbnail via img.youtube.com
     - Stores metadata only (no video download/re-host, no AI summarization)
     """
-    print("ðŸŽ¬ Starting dedicated video ingestion cycle...")
+    print("[VIDEO] Starting dedicated video ingestion cycle...")
     client = supabase_client()
     search_queries = [
-        "India News (English OR Hindi OR à¤¹à¤¿à¤‚à¤¦à¥€) site:youtube.com",
-        "World News (English OR Hindi OR à¤¹à¤¿à¤‚à¤¦à¥€) site:youtube.com",
-        "Tech News (English OR Hindi OR à¤¹à¤¿à¤‚à¤¦à¥€) site:youtube.com",
+        "India News (English OR Hindi OR हिंदी) site:youtube.com",
+        "World News (English OR Hindi OR हिंदी) site:youtube.com",
+        "Tech News (English OR Hindi OR हिंदी) site:youtube.com",
     ]
 
-    candidate_rows: List[Dict] = []
+    seen_youtube_ids: set[str] = set()
+    total_entries = 0
+    processed_entries = 0
+    saved = 0
+    failed = 0
+    skipped_missing_id = 0
+    skipped_non_youtube = 0
+    skipped_language = 0
+    skipped_source = 0
 
     for query in search_queries:
         try:
@@ -1013,15 +1084,18 @@ def fetch_video_news():
                 "https://news.google.com/rss/search"
                 f"?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
             )
-            print(f"ðŸŽ¥ [VIDEO] Fetching query: {query} -> {search_url[:100]}...")
+            print(f"[VIDEO] Fetching query: {query} -> {search_url[:120]}")
             feed = feedparser.parse(search_url)
             entries = feed.entries if hasattr(feed, "entries") else []
-            print(f"ðŸŽ¥ [VIDEO] Found {len(entries)} entries for '{query}'")
+            print(f"[VIDEO] Found {len(entries)} entries for '{query}'")
 
-            for entry in entries[:20]:
+            for entry in entries[:40]:
+                total_entries += 1
                 try:
-                    rss_link = entry.get("link")
+                    rss_link = str(entry.get("link") or "").strip()
                     if not rss_link:
+                        skipped_non_youtube += 1
+                        print("[VIDEO] Skipping entry with empty link.")
                         continue
 
                     resolved_link = rss_link
@@ -1030,25 +1104,38 @@ def fetch_video_news():
                         if dec and dec.get("status") and dec.get("decoded_url"):
                             resolved_link = dec.get("decoded_url") or rss_link
                     except Exception as decode_err:
-                        print(f"âš ï¸ [VIDEO] Decode failed for link: {decode_err}")
-
-                    if not _is_youtube_host(resolved_link):
-                        continue
+                        print(f"[VIDEO] Decode failed for link: {decode_err}")
 
                     try:
-                        video_id = extract_youtube_id(resolved_link)
+                        video_id = extract_youtube_id(resolved_link) or extract_youtube_id(rss_link)
                     except Exception as youtube_err:
                         print(f"[VIDEO] youtube_id extraction failed for '{resolved_link}': {youtube_err}")
                         continue
+
                     if not video_id:
-                        # Strictly keep only videos from YouTube
+                        skipped_missing_id += 1
                         print(f"[VIDEO] Skipping item with missing youtube_id: {resolved_link[:120]}")
                         continue
 
-                    # Keep original YouTube format (watch/shorts/youtu.be) so UI can adapt layout.
                     source_url = resolved_link
-                    thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
-                    source_name = entry.get("source", {}).get("title") or "YouTube"
+                    if not _is_youtube_host(source_url):
+                        source_url = f"https://www.youtube.com/watch?v={video_id}"
+                    if not _is_youtube_host(source_url):
+                        skipped_non_youtube += 1
+                        print(f"[VIDEO] Skipping non-YouTube item after decode: {resolved_link[:120]}")
+                        continue
+
+                    if video_id in seen_youtube_ids:
+                        print(f"[VIDEO] Duplicate youtube_id in cycle, skipping: {video_id}")
+                        continue
+                    seen_youtube_ids.add(video_id)
+
+                    thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+                    raw_source = entry.get("source")
+                    if isinstance(raw_source, dict):
+                        source_name = (raw_source.get("title") or "YouTube").strip()
+                    else:
+                        source_name = str(raw_source or "YouTube").strip() or "YouTube"
                     title = (entry.get("title") or "Video Update").strip()
                     description = _extract_rss_description(entry.get("summary", ""))
                     if not description:
@@ -1056,81 +1143,66 @@ def fetch_video_news():
 
                     lang_sample = f"{title}\n{description}"
                     if not _is_english_or_hindi_text(lang_sample):
-                        print(f"â­ï¸ [VIDEO] Skipped non EN/HI item: {title[:80]}")
+                        skipped_language += 1
+                        print(f"[VIDEO] Skipped non EN/HI item: {title[:80]}")
                         continue
 
                     if not _is_trusted_video_source(source_name, title, description):
-                        print(f"â­ï¸ [VIDEO] Skipped non-allowlisted source: {source_name}")
+                        skipped_source += 1
+                        print(f"[VIDEO] Skipped non-allowlisted source: {source_name}")
                         continue
 
-                    published_at = entry.get("published")
-                    published_parsed = entry.get("published_parsed")
-                    if published_parsed:
+                    safe_published_date = _safe_video_published_at(entry)
+                    video_data = {
+                        "title": title,
+                        "url": source_url,
+                        "youtube_id": video_id,
+                        "thumbnail_url": thumbnail,
+                        "source": source_name,
+                        "published_at": safe_published_date,
+                    }
+                    processed_entries += 1
+
+                    inserted = False
+                    for conflict_col in ("url", "youtube_id", "title"):
                         try:
-                            published_at = datetime(*published_parsed[:6]).isoformat() + "Z"
-                        except Exception as date_err:
-                            print(f"[VIDEO] Failed to normalize published_at for '{title[:80]}': {date_err}")
+                            client.table("videos").upsert(video_data, on_conflict=conflict_col).execute()
+                            print(f"Saved Video: {video_data['title'][:50]}... (conflict={conflict_col})")
+                            saved += 1
+                            inserted = True
+                            break
+                        except Exception as e:
+                            print(f"DB Error: {e}")
+                            print(
+                                f"[VIDEO] Upsert failed for '{video_data['title'][:50]}' "
+                                f"(on_conflict={conflict_col}) payload={json.dumps(video_data)}"
+                            )
 
-                    candidate_rows.append(
-                        {
-                            "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"youtube:{video_id}")),
-                            "url": source_url,
-                            "title": title,
-                            "youtube_id": video_id,
-                            "thumbnail_url": thumbnail_url,
-                            "source": source_name,
-                            "published_at": published_at,
-                        }
-                    )
+                    if not inserted:
+                        try:
+                            client.table("videos").insert(video_data).execute()
+                            print(f"Saved Video: {video_data['title'][:50]}... (insert fallback)")
+                            saved += 1
+                        except Exception as e:
+                            failed += 1
+                            print(f"DB Error: {e}")
+                            print(
+                                f"[VIDEO] DB Insert Failed for Video '{video_data['title'][:30]}': "
+                                f"payload={json.dumps(video_data)}"
+                            )
                 except Exception as item_err:
-                    print(f"âš ï¸ [VIDEO] Failed to process entry: {item_err}")
+                    failed += 1
+                    print(f"[VIDEO] Failed to process entry: {item_err}")
         except Exception as e:
-            print(f"âŒ [VIDEO] Query failed for '{query}': {e}")
+            failed += 1
+            print(f"[VIDEO] Query failed for '{query}': {e}")
 
-    if not candidate_rows:
-        print("â„¹ï¸ [VIDEO] No YouTube video news found in this cycle.")
-        return
-
-    # Dedupe within this cycle by YouTube ID
-    unique_rows: Dict[str, Dict] = {}
-    for row in candidate_rows:
-        video_id = row.get("youtube_id")
-        url = row.get("url")
-        if not video_id or not url:
-            continue
-        unique_rows[str(video_id)] = row
-
-    saved = 0
-    for row in unique_rows.values():
-        payload = {
-            "id": row.get("id"),
-            "title": row.get("title"),
-            "url": row.get("url"),
-            "youtube_id": row.get("youtube_id"),
-            "thumbnail_url": row.get("thumbnail_url"),
-            "source": row.get("source"),
-            "published_at": row.get("published_at"),
-        }
-        try:
-            client.table("videos").upsert(payload, on_conflict="youtube_id").execute()
-            saved += 1
-        except Exception as upsert_err:
-            print(f"DB Error: {upsert_err}")
-            print(f"[VIDEO] Upsert by youtube_id failed. Payload: {json.dumps(payload)}")
-            try:
-                client.table("videos").upsert(payload, on_conflict="title").execute()
-                saved += 1
-            except Exception as title_fallback_err:
-                print(f"DB Error: {title_fallback_err}")
-                print(f"[VIDEO] Upsert by title failed. Payload: {json.dumps(payload)}")
-                try:
-                    client.table("videos").insert(payload).execute()
-                    saved += 1
-                except Exception as insert_err:
-                    print(f"DB Error: {insert_err}")
-                    print(f"[VIDEO] Final insert failed. Payload: {json.dumps(payload)}")
-
-    print(f"âœ… [VIDEO] Saved/updated {saved} video articles.")
+    print(
+        "[VIDEO] Cycle summary: "
+        f"entries={total_entries}, processed={processed_entries}, saved={saved}, failed={failed}, "
+        f"skipped_missing_id={skipped_missing_id}, skipped_non_youtube={skipped_non_youtube}, "
+        f"skipped_language={skipped_language}, skipped_source={skipped_source}"
+    )
 
 
 def update_live_ticker():
@@ -1865,53 +1937,46 @@ def _build_fallback_seed_votes(statement: str, count: int) -> List[Dict]:
     return votes
 
 
-def _ensure_seed_bot_profiles(client) -> bool:
+def initialize_bot_profiles(client=None) -> int:
     """
-    Ensure synthetic debate bots exist in profiles with stable IDs and names
-    so frontend profile joins resolve display names and ranks.
+    Initialize debate bot profiles with all key fields populated so profile inserts
+    satisfy stricter NOT NULL/required column constraints.
     """
-    full_rows = []
-    for idx, (bot_id, bot_name) in enumerate(SEED_BOT_IDENTITIES, start=1):
-        full_rows.append(
-            {
-                "id": bot_id,
-                "display_name": bot_name,
-                "full_name": bot_name,
-                "email": f"bot.seed.{idx}@readdio.local",
-                "debate_xp": 0,
-                "current_title": "Rookie",
-            }
-        )
+    local_client = client or supabase_client()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    initialized = 0
 
-    slim_rows = [
-        {"id": r["id"], "display_name": r["display_name"], "full_name": r["full_name"], "debate_xp": 0, "current_title": "Rookie"}
-        for r in full_rows
-    ]
-    minimal_rows = [
-        {"id": r["id"], "display_name": r["display_name"], "debate_xp": 0, "current_title": "Rookie"}
-        for r in full_rows
-    ]
-    tiny_rows = [
-        {"id": r["id"], "display_name": r["display_name"], "current_title": "Rookie"}
-        for r in full_rows
-    ]
-    id_name_rows = [
-        {"id": r["id"], "display_name": r["display_name"]}
-        for r in full_rows
-    ]
+    for bot in SEED_BOT_ROSTER:
+        bot_id = bot["id"]
+        display_name = bot["display_name"]
+        fake_email = bot["email"]
+        bot_data = {
+            "id": bot_id,
+            "email": fake_email,
+            "display_name": display_name,
+            "full_name": display_name,
+            "current_title": "Analyst",
+            "debate_xp": random.randint(100, 500),
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
 
-    attempts = [full_rows, slim_rows, minimal_rows, tiny_rows, id_name_rows]
-    for payload in attempts:
         try:
-            client.table("profiles").upsert(payload, on_conflict="id").execute()
-            print(f"[DEBATE] Bot profile network ensured ({len(payload)} profiles upserted).")
-            return True
+            local_client.table("profiles").upsert(bot_data, on_conflict="id").execute()
+            initialized += 1
+            print(f"[DEBATE] Bot profile ready: {display_name} ({bot_id})")
         except Exception as e:
             print(f"DB Error: {e}")
-            print("[DEBATE] Bot profile upsert attempt failed; trying schema fallback payload.")
+            print(
+                f"[DEBATE] Bot profile upsert failed for '{display_name}' ({bot_id}). "
+                f"Payload={json.dumps(bot_data)}"
+            )
 
-    print("[DEBATE] Could not ensure bot profiles. Seeded votes may show as 'User'.")
-    return False
+    print(
+        f"[DEBATE] Bot profile initialization complete: "
+        f"initialized={initialized}/{len(SEED_BOT_ROSTER)}"
+    )
+    return initialized
 
 
 def _apply_seed_bot_xp(client, inserted_rows: List[Dict]) -> None:
@@ -2009,7 +2074,9 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
     if needed <= 0:
         return 0
 
-    _ensure_seed_bot_profiles(client)
+    initialized_bots = initialize_bot_profiles(client)
+    if initialized_bots <= 0:
+        print("[DEBATE] Warning: No bot profiles initialized; seeded votes may fail foreign key checks.")
 
     synthetic_votes: List[Dict] = []
     try:
@@ -2039,7 +2106,7 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
             ai_score = 6
         ai_score = max(4, min(7, ai_score))
 
-        bot_id, _bot_name = random.choice(SEED_BOT_IDENTITIES)
+        bot_id = random.choice(SEED_BOT_ROSTER)["id"]
         rows.append(
             {
                 "user_id": bot_id,
@@ -2503,6 +2570,11 @@ def send_daily_quiz_notification():
 def schedule_jobs():
     # Heal inconsistent DB flags on startup
     heal_database_flags()
+    # Ensure debate bot profiles exist before any seeded debate votes are generated.
+    try:
+        initialize_bot_profiles()
+    except Exception as e:
+        print(f"[DEBATE] Bot profile initialization at startup failed: {e}")
 
     # Run news ingestion immediately on startup, then every 15 minutes
     scheduler.add_job(smart_ingest_all_categories, "interval", minutes=15, id="ingest_news", replace_existing=True)
