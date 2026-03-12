@@ -170,6 +170,24 @@ INDIAN_VIDEO_SOURCES = [
     "StudyIQ IAS",
 ]
 
+# Curated Indian news/UPSC channels for direct YouTube RSS ingestion.
+YOUTUBE_NEWS_CHANNELS: Dict[str, str] = {
+    "Drishti IAS": "UCzLffqA5E3b1M2H5w6fC1Zg",
+    "Aaj Tak": "UCt4t-jeY85JegMlZ-E5UWtA",
+    "Republic Bharat": "UCwG9XXFhmwEoFk9yZlX1qQw",
+    "NDTV India": "UCZFMm1mMw0F81Z37aaEzTUA",
+    "Firstpost": "UCz8QaiQxApLq8sLNcszYyJw",
+    "India Today": "UCYPvAwZP8pZhSMW8qsCEwFA",
+    "Zee News": "UCupm01yyxHAlObHhX0Z8WbQ",
+    "ABP News": "UCjzZvZEAiyC62S2DqZg28Yg",
+    "The Lallantop": "UCx8Z14PpntdaxCt2hakbQLQ",
+    "News18 India": "UC6ixz2v_kPpsj3qjVvOa85w",
+    "Times of India": "UCn0iEhyM6rRz4vS2aN-m11Q",
+    "WION": "UC_gUM8rL-LrgCAAxkHZ-bOQ",
+    "News24": "UCd5r3A261x4Jg-Vp0EaZ4gA",
+    "StudyIQ IAS": "UCrC8mOqJQpoB7zIiA2zQd7A",
+}
+
 # Scripts we explicitly do NOT allow for video ingestion (English/Hindi only).
 _DISALLOWED_VIDEO_SCRIPT_PATTERNS = [
     re.compile(r"[\u0980-\u09FF]"),  # Bengali
@@ -1092,11 +1110,101 @@ def _safe_video_published_at(entry: dict) -> str:
     return fallback_iso
 
 
+def _extract_youtube_video_id_from_entry(entry: dict) -> Optional[str]:
+    """Extract a YouTube video id from Atom/RSS entry fields."""
+    try:
+        direct_id = (entry.get("yt_videoid") or "").strip()
+        if direct_id:
+            return direct_id
+    except Exception:
+        pass
+
+    try:
+        raw_id = str(entry.get("id") or "").strip()
+        match = re.search(r"yt:video:([A-Za-z0-9_-]{6,})", raw_id)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+
+    try:
+        link = str(entry.get("link") or "").strip()
+        if link:
+            return extract_youtube_id(link)
+    except Exception:
+        pass
+
+    return None
+
+
+def _is_verified_shorts_video(video_id: str, timeout: int = 8) -> bool:
+    """
+    Best-effort Shorts detector without YouTube Data API.
+    - 200 on /shorts/{id} => Shorts
+    - Redirect to /watch => not Shorts
+    """
+    if not video_id:
+        return False
+
+    shorts_url = f"https://www.youtube.com/shorts/{video_id}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+    }
+
+    def _judge(status_code: int, location: str) -> Optional[bool]:
+        location_lc = (location or "").lower()
+        if status_code == 200:
+            return True
+        if status_code in {301, 302, 303, 307, 308}:
+            if "/watch" in location_lc:
+                return False
+            if "/shorts/" in location_lc:
+                return True
+        return None
+
+    try:
+        resp = requests.head(
+            shorts_url,
+            allow_redirects=False,
+            timeout=timeout,
+            headers=headers,
+        )
+        verdict = _judge(resp.status_code, resp.headers.get("location", ""))
+        if verdict is not None:
+            return verdict
+    except Exception as e:
+        print(f"[VIDEO] Shorts HEAD probe failed for {video_id}: {e}")
+
+    try:
+        resp = requests.get(
+            shorts_url,
+            allow_redirects=False,
+            timeout=timeout,
+            headers=headers,
+            stream=True,
+        )
+        verdict = _judge(resp.status_code, resp.headers.get("location", ""))
+        try:
+            resp.close()
+        except Exception:
+            pass
+        if verdict is not None:
+            return verdict
+    except Exception as e:
+        print(f"[VIDEO] Shorts GET probe failed for {video_id}: {e}")
+
+    return False
+
+
 def fetch_video_news():
     """
-    Dedicated video ingestor:
-    - Uses strict Google News RSS queries targeting YouTube Shorts
-    - Uses best-effort source naming from approved Indian news labels
+    Dedicated video ingestor (Inshorts-like channel curation):
+    - Uses direct YouTube channel RSS feeds
+    - Keeps only verified Shorts
+    - Uses curated Indian news/UPSC channels as source of truth
     - Filters to English/Hindi only
     - Saves to dedicated `videos` table (no article-table title conflicts)
     - Saves thumbnail via img.youtube.com
@@ -1104,10 +1212,7 @@ def fetch_video_news():
     """
     print("[VIDEO] Starting dedicated video ingestion cycle...")
     client = supabase_client()
-    search_queries = [
-        "India News inurl:shorts site:youtube.com",
-        "Top News inurl:shorts site:youtube.com",
-    ]
+    max_entries_per_channel = int(os.getenv("VIDEO_CHANNEL_RSS_MAX_ENTRIES", "20"))
 
     seen_youtube_ids: set[str] = set()
     total_entries = 0
@@ -1119,66 +1224,38 @@ def fetch_video_news():
     skipped_non_shorts = 0
     skipped_language = 0
 
-    for query in search_queries:
+    for channel_name, channel_id in YOUTUBE_NEWS_CHANNELS.items():
+        feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
         try:
-            search_url = (
-                "https://news.google.com/rss/search"
-                f"?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
-            )
-            print(f"[VIDEO] Fetching query: {query} -> {search_url[:120]}")
-            feed = feedparser.parse(search_url)
+            print(f"[VIDEO] Fetching channel feed: {channel_name} -> {feed_url}")
+            feed = feedparser.parse(feed_url)
+            if getattr(feed, "bozo", False):
+                print(
+                    f"[VIDEO] Warning malformed feed for {channel_name}: "
+                    f"{getattr(feed, 'bozo_exception', '')}"
+                )
             entries = feed.entries if hasattr(feed, "entries") else []
-            print(f"[VIDEO] Found {len(entries)} entries for '{query}'")
+            print(f"[VIDEO] Found {len(entries)} entries for '{channel_name}'")
 
-            for entry in entries[:40]:
+            for entry in entries[:max_entries_per_channel]:
                 total_entries += 1
                 try:
-                    rss_link = str(entry.get("link") or "").strip()
                     raw_title = (entry.get("title") or "").strip()
-                    if not rss_link:
-                        skipped_non_youtube += 1
-                        print("[VIDEO] Skipping entry with empty link.")
-                        continue
-
-                    # Best-effort source naming: match approved labels when visible.
-                    raw_source = entry.get("source")
-                    if isinstance(raw_source, dict):
-                        source_name = (raw_source.get("title") or "").strip()
-                    else:
-                        source_name = str(raw_source or "").strip()
-                    matched_source = _match_approved_indian_video_source(source_name, raw_title)
-                    fallback_source = "India News" if "india" in raw_title.lower() else "YouTube Shorts"
-
-                    resolved_link = rss_link
-                    try:
-                        dec = new_decoderv1(rss_link)
-                        if dec and dec.get("status") and dec.get("decoded_url"):
-                            resolved_link = dec.get("decoded_url") or rss_link
-                    except Exception as decode_err:
-                        print(f"[VIDEO] Decode failed for link: {decode_err}")
-
-                    # Strict format gate: keep only Shorts URLs.
-                    if not (_is_youtube_shorts_url(resolved_link) or _is_youtube_shorts_url(rss_link)):
-                        skipped_non_shorts += 1
-                        print(f"[VIDEO] Skipping non-Shorts URL: {resolved_link[:120]}")
-                        continue
-
-                    try:
-                        video_id = extract_youtube_id(resolved_link) or extract_youtube_id(rss_link)
-                    except Exception as youtube_err:
-                        print(f"[VIDEO] youtube_id extraction failed for '{resolved_link}': {youtube_err}")
-                        continue
-
+                    video_id = _extract_youtube_video_id_from_entry(entry)
                     if not video_id:
                         skipped_missing_id += 1
-                        print(f"[VIDEO] Skipping item with missing youtube_id: {resolved_link[:120]}")
+                        print(f"[VIDEO] Missing youtube_id in feed item from {channel_name}.")
                         continue
 
-                    # Canonical Shorts URL keeps the feed vertical-first.
+                    if not _is_verified_shorts_video(video_id):
+                        skipped_non_shorts += 1
+                        print(f"[VIDEO] Skipping non-Shorts video for {channel_name}: {video_id}")
+                        continue
+
                     source_url = f"https://www.youtube.com/shorts/{video_id}"
                     if not _is_youtube_host(source_url):
                         skipped_non_youtube += 1
-                        print(f"[VIDEO] Skipping non-YouTube item after decode: {resolved_link[:120]}")
+                        print(f"[VIDEO] Skipping non-YouTube item: {source_url[:120]}")
                         continue
 
                     if video_id in seen_youtube_ids:
@@ -1186,13 +1263,21 @@ def fetch_video_news():
                         continue
                     seen_youtube_ids.add(video_id)
 
-                    thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+                    thumbnail = ""
+                    media_thumbs = entry.get("media_thumbnail")
+                    if isinstance(media_thumbs, list) and media_thumbs:
+                        first_thumb = media_thumbs[0]
+                        if isinstance(first_thumb, dict):
+                            thumbnail = str(first_thumb.get("url") or "").strip()
+                    if not thumbnail:
+                        thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+
                     title = raw_title or "Video Update"
                     description = _extract_rss_description(entry.get("summary", ""))
                     if not description:
                         description = "Latest video update from YouTube."
 
-                    display_source = matched_source or fallback_source
+                    display_source = channel_name
 
                     lang_sample = f"{title}\n{description}"
                     if not _is_english_or_hindi_text(lang_sample):
@@ -1227,7 +1312,7 @@ def fetch_video_news():
                     print(f"[VIDEO] Failed to process entry: {item_err}")
         except Exception as e:
             failed += 1
-            print(f"[VIDEO] Query failed for '{query}': {e}")
+            print(f"[VIDEO] Channel feed failed for '{channel_name}': {e}")
 
     print(
         "[VIDEO] Cycle summary: "
@@ -1274,6 +1359,25 @@ def update_live_ticker():
         print("[LIVE] Active event is missing id/topic_query; skipping.")
         return
 
+    # Compare against the most recent persisted update first.
+    latest_status_text = previous_status
+    try:
+        latest_update_res = (
+            client.table("live_event_updates")
+            .select("status_text, created_at")
+            .eq("live_event_id", event_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        latest_rows = latest_update_res.data or []
+        if latest_rows:
+            latest_from_history = (latest_rows[0].get("status_text") or "").strip()
+            if latest_from_history:
+                latest_status_text = latest_from_history
+    except Exception as e:
+        print(f"[LIVE] Failed to fetch latest live_event_updates row: {e}")
+
     search_url = (
         "https://news.google.com/rss/search"
         f"?q={quote_plus(topic_query)}&hl=en-IN&gl=IN&ceid=IN:en"
@@ -1298,26 +1402,53 @@ def update_live_ticker():
             response_text = llm_service.generate_live_ticker_status(
                 topic_query,
                 headlines,
-                previous_status,
+                latest_status_text,
             )
-            clean_status = response_text.replace("NEW_STATUS:", "").replace('"', '').strip()
-            status_text = clean_status
+            status_text = response_text
         else:
             status_text = "NO_UPDATE"
     except Exception as e:
         print(f"[LIVE] LLM status generation failed: {e}")
         status_text = "NO_UPDATE"
 
-    status_text = re.sub(r"(?i)^new[\s_-]*status\s*:\s*", "", status_text or "")
-    status_text = re.sub(r"\s+", " ", (status_text or "").strip())
-    no_update_token = re.sub(r"[^A-Z]", "", status_text.upper())
-    if not status_text or no_update_token.startswith("NOUPDATE"):
-        print("[LIVE] Live event: No significant change.")
+    clean_response = (status_text or "").strip().strip('"').strip("'")
+    clean_response = re.sub(r"(?i)^new[\s_-]*status\s*:\s*", "", clean_response)
+    clean_response = re.sub(r"\s+", " ", clean_response).strip()
+
+    def _is_near_duplicate_status(a: str, b: str) -> bool:
+        a_tokens = {t for t in re.findall(r"[a-z0-9]+", (a or "").lower()) if len(t) > 2}
+        b_tokens = {t for t in re.findall(r"[a-z0-9]+", (b or "").lower()) if len(t) > 2}
+        if not a_tokens or not b_tokens:
+            return False
+        jaccard = len(a_tokens & b_tokens) / max(1, len(a_tokens | b_tokens))
+        return jaccard >= 0.78
+
+    if not clean_response or clean_response.upper() == "NO_UPDATE":
+        print("[LIVE] No significant new developments. Skipping database update.")
         return
 
-    if status_text == previous_status:
-        print("[LIVE] Live event: No significant change.")
+    # Extra safeguard against same-event paraphrase noise.
+    normalized_new = re.sub(r"[^a-z0-9]+", " ", clean_response.lower()).strip()
+    normalized_latest = re.sub(r"[^a-z0-9]+", " ", (latest_status_text or "").lower()).strip()
+    normalized_prev = re.sub(r"[^a-z0-9]+", " ", (previous_status or "").lower()).strip()
+
+    if clean_response == latest_status_text or normalized_new == normalized_latest:
+        print("[LIVE] No significant new developments. Skipping database update.")
         return
+
+    if _is_near_duplicate_status(clean_response, latest_status_text):
+        print("[LIVE] Near-duplicate ticker update detected. Skipping database update.")
+        return
+
+    if clean_response == previous_status or normalized_new == normalized_prev:
+        print("[LIVE] No significant new developments. Skipping database update.")
+        return
+
+    if _is_near_duplicate_status(clean_response, previous_status):
+        print("[LIVE] Near-duplicate ticker update detected. Skipping database update.")
+        return
+
+    status_text = clean_response
 
     try:
         client.table("live_events").update(

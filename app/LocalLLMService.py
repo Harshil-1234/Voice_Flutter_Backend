@@ -352,24 +352,23 @@ Do not use JSON. Write plain text."""
         if not cleaned_headlines:
             return "NO_UPDATE"
 
-        current_status = (current_status or "").strip()
-        if not current_status:
-            current_status = "No current ticker update."
+        current_status = (current_status or "").strip() or "No previous update."
 
         system_prompt = (
-            "You are a Senior Breaking News Editor.\n"
-            f"Current Ticker: '{current_status}'\n"
-            "Task: Decide if there is a MAJOR new development "
-            "(new attack, official statement/treaty, casualty update, major escalation/de-escalation).\n"
-            "If the new headlines are opinions, recycled reports, old news, or minor details, return NO_UPDATE.\n"
-            "If there is a real event update, write exactly ONE complete, present-tense sentence summarizing the latest update.\n"
-            "DO NOT use the prefix 'NEW_STATUS:'.\n"
-            "Just write the sentence and end with a period.\n"
-            "Output plain text only. Either NO_UPDATE or the new status sentence."
+            "You are a strict Breaking News Editor. Your job is to decide if a Live Ticker needs to be updated.\n\n"
+            "**RULES:**\n"
+            "1. Read the new headlines carefully.\n"
+            "2. Compare them to the PREVIOUS UPDATE.\n"
+            "3. Update only if there is a MAJOR NEW DEVELOPMENT "
+            "(new attack, new treaty, casualty change, major escalation/de-escalation, or statement from a different major leader).\n"
+            "4. If headlines are about the SAME event already captured in PREVIOUS UPDATE, even if phrased differently, return exactly: NO_UPDATE\n"
+            "5. If there is a major new development, write exactly ONE short sentence (max 15 words) describing ONLY the new event.\n"
+            "6. End the sentence with a period. Do not add prefixes like 'Status:' or 'New Update:'.\n"
+            "7. Output plain text only. Either NO_UPDATE or the one sentence."
         )
         user_prompt = (
             f"TOPIC: {topic}\n"
-            f"CURRENT_STATUS: \"{current_status}\"\n"
+            f"PREVIOUS UPDATE: \"{current_status}\"\n"
             "NEW_WIRE_HEADLINES:\n- "
             + "\n- ".join(cleaned_headlines)
         )
@@ -399,12 +398,16 @@ Do not use JSON. Write plain text."""
             if normalized.startswith("NOUPDATE"):
                 return "NO_UPDATE"
 
-            # Keep only one sentence and ensure punctuation for ticker rendering.
+            # Keep only one sentence and enforce short ticker format.
             match = re.search(r"([.!?])", status)
             if match:
                 status = status[: match.start() + 1].strip()
             elif status:
                 status = status.rstrip() + "."
+
+            words = status.split()
+            if len(words) > 15:
+                status = " ".join(words[:15]).rstrip(".!?") + "."
             return status
         except Exception as e:
             logger.error(f"Error generating live ticker status: {e}")
