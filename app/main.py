@@ -206,6 +206,11 @@ BOT_ACCOUNT_DEFS: List[Tuple[str, str]] = [
     ("Manish Patel", "bot_manish@readdio.internal"),
     ("Isha Malhotra", "bot_isha@readdio.internal"),
     ("Karan Bhat", "bot_karan@readdio.internal"),
+    ("Neha Gupta", "bot_neha_gupta@readdio.internal"),
+    ("Vikram S.", "bot_vikram_s@readdio.internal"),
+    ("Ananya R.", "bot_ananya_r@readdio.internal"),
+    ("Sanjay Patel", "bot_sanjay@readdio.internal"),
+    ("Kavita M.", "bot_kavita@readdio.internal"),
 ]
 BOT_DEFAULT_PASSWORD = "SecureBotPassword123!"
 # --- END DEBATE SEED BOT NETWORK ---
@@ -1091,7 +1096,7 @@ def fetch_video_news():
     """
     Dedicated video ingestor:
     - Uses strict Google News RSS queries targeting YouTube Shorts
-    - Enforces approved Indian news/education source allowlist
+    - Uses best-effort source naming from approved Indian news labels
     - Filters to English/Hindi only
     - Saves to dedicated `videos` table (no article-table title conflicts)
     - Saves thumbnail via img.youtube.com
@@ -1113,7 +1118,6 @@ def fetch_video_news():
     skipped_non_youtube = 0
     skipped_non_shorts = 0
     skipped_language = 0
-    skipped_source = 0
 
     for query in search_queries:
         try:
@@ -1136,17 +1140,14 @@ def fetch_video_news():
                         print("[VIDEO] Skipping entry with empty link.")
                         continue
 
-                    # Strict allowlist gate before expensive parsing/saving.
+                    # Best-effort source naming: match approved labels when visible.
                     raw_source = entry.get("source")
                     if isinstance(raw_source, dict):
                         source_name = (raw_source.get("title") or "").strip()
                     else:
                         source_name = str(raw_source or "").strip()
                     matched_source = _match_approved_indian_video_source(source_name, raw_title)
-                    if not matched_source:
-                        skipped_source += 1
-                        print(f"[VIDEO] Skipping unapproved source. Title: {raw_title[:40]}...")
-                        continue
+                    fallback_source = "India News" if "india" in raw_title.lower() else "YouTube Shorts"
 
                     resolved_link = rss_link
                     try:
@@ -1191,10 +1192,7 @@ def fetch_video_news():
                     if not description:
                         description = "Latest video update from YouTube."
 
-                    publisher_from_title = _extract_video_publisher_from_title(title)
-                    if publisher_from_title and matched_source.lower() not in publisher_from_title.lower():
-                        publisher_from_title = ""
-                    display_source = publisher_from_title or matched_source
+                    display_source = matched_source or fallback_source
 
                     lang_sample = f"{title}\n{description}"
                     if not _is_english_or_hindi_text(lang_sample):
@@ -1235,8 +1233,7 @@ def fetch_video_news():
         "[VIDEO] Cycle summary: "
         f"entries={total_entries}, processed={processed_entries}, saved={saved}, failed={failed}, "
         f"skipped_missing_id={skipped_missing_id}, skipped_non_youtube={skipped_non_youtube}, "
-        f"skipped_non_shorts={skipped_non_shorts}, skipped_language={skipped_language}, "
-        f"skipped_source={skipped_source}"
+        f"skipped_non_shorts={skipped_non_shorts}, skipped_language={skipped_language}"
     )
 
 
