@@ -2207,6 +2207,41 @@ def get_bot_profile_ids(client=None) -> List[str]:
         return []
 
 
+def _is_uuid_like(value: str) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_valid_bot_profile_ids(client, candidate_ids: List[str]) -> List[str]:
+    """
+    Keep only UUID-looking IDs that still exist in profiles.
+    This prevents seeding votes with null/fake user_id values.
+    """
+    cleaned_ids: List[str] = []
+    for raw_id in candidate_ids or []:
+        bot_id = str(raw_id or "").strip()
+        if not bot_id:
+            continue
+        if not _is_uuid_like(bot_id):
+            continue
+        cleaned_ids.append(bot_id)
+
+    if not cleaned_ids:
+        return []
+
+    try:
+        check_res = client.table("profiles").select("id").in_("id", cleaned_ids).execute()
+        existing = {str(row.get("id")) for row in (check_res.data or []) if row.get("id")}
+        return [bot_id for bot_id in cleaned_ids if bot_id in existing]
+    except Exception as e:
+        print(f"DB Error: {e}")
+        print("[DEBATE] Failed to verify bot IDs against profiles; aborting seed for safety.")
+        return []
+
+
 def initialize_bot_profiles(client=None) -> List[str]:
     """
     Create missing bot auth users/profiles, but do not reset existing bot XP/title.
@@ -2394,14 +2429,17 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
     if needed <= 0:
         return 0
 
-    bot_ids = get_bot_profile_ids(client)
+    bot_ids = _resolve_valid_bot_profile_ids(client, get_bot_profile_ids(client))
     if not bot_ids:
         print("[DEBATE] No existing bot profiles found. Initializing bot accounts...")
         initialize_bot_profiles(client)
-        bot_ids = get_bot_profile_ids(client)
+        bot_ids = _resolve_valid_bot_profile_ids(client, get_bot_profile_ids(client))
     if not bot_ids:
         print("[DEBATE] No valid bot profile IDs available; skipping seed votes.")
         return 0
+
+    # Shuffle the bot IDs to ensure unique, random assignment.
+    random.shuffle(bot_ids)
 
     synthetic_votes: List[Dict] = []
     try:
@@ -2417,6 +2455,11 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
 
     rows = []
     for item in synthetic_votes[:needed]:
+        # Safety check: if we run out of bots, stop.
+        if not bot_ids:
+            print("[DEBATE] Ran out of unique bot profiles to assign. Stopping seed.")
+            break
+
         side = str(item.get("side", "")).strip().lower()
         if side not in {"support", "oppose"}:
             side = "support" if (len(rows) % 2 == 0) else "oppose"
@@ -2431,7 +2474,8 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
             ai_score = 6
         ai_score = max(4, min(7, ai_score))
 
-        bot_id = random.choice(bot_ids)
+        # Assign a unique bot by popping from the shuffled list.
+        bot_id = bot_ids.pop()
         rows.append(
             {
                 "user_id": bot_id,
@@ -4216,6 +4260,3 @@ def _randomize_question_options(question: dict) -> dict:
     except (json.JSONDecodeError, ValueError, IndexError) as e:
         print(f"Error randomizing options for question {question.get('id')}: {e}")
         return question
-
-
-
