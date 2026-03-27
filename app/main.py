@@ -635,6 +635,77 @@ def summarize_text_if_possible(content, titles=None):
             return [None] * len(content)
 
 
+def summarize_text_if_possible(content, titles=None):
+    """
+    Summarize text using LocalLLMService (Gemma-2-2b-it).
+    Returns summary + UPSC relevance + tags.
+    - If `content` is a single string – returns a single Dict or None.
+    - If `content` is a list of strings – returns a list of Dicts aligned with input.
+    Titles are optional, mainly used for debugging/logging.
+    This redefinition processes items one-by-one with tiny sleeps to yield the LLM lock between calls.
+    """
+    if llm_service is None:
+        print("CRITICAL: LocalLLMService is None - model not loaded!")
+        print("   Check startup logs for initialization errors.")
+        print("   Skipping summarization for this batch.")
+        if isinstance(content, str):
+            return None
+        content_len = len(content) if isinstance(content, list) else 0
+        return [None] * content_len
+
+    try:
+        # Case 1: Single string
+        if isinstance(content, str):
+            if not content or not content.strip():
+                return None
+
+            result = llm_service.analyze_article(content)
+            if result:
+                return result
+            return None
+
+        # Case 2: List of strings
+        elif isinstance(content, list):
+            results = []
+            for idx, text in enumerate(content):
+                try:
+                    if not text or not text.strip():
+                        results.append(None)
+                        if titles and idx < len(titles):
+                            print(f"[summarize] Skipped empty article: {titles[idx][:80]}")
+                        continue
+
+                    result = llm_service.analyze_article(text)
+                    if result:
+                        results.append(result)
+                        if titles and idx < len(titles):
+                            summary = result.get("summary", "")[:80].replace("\n", " ")
+                            relevant = result.get("upsc_relevant", False)
+                            tags = result.get("tags", [])
+                            print(f"[summarize] Analyzed: {titles[idx][:60]} | Relevant: {relevant} | Tags: {tags}")
+                    else:
+                        results.append(None)
+                except Exception as item_err:
+                    results.append(None)
+                    if titles and idx < len(titles):
+                        print(f"[summarize] Error summarizing {titles[idx][:80]}: {item_err}")
+                finally:
+                    # Yield to scheduler so other threads can grab the LLM lock between articles
+                    time.sleep(0.1)
+
+            return results
+
+        else:
+            return None
+
+    except Exception as e:
+        print(f"Summarization error: {e}")
+        if isinstance(content, str):
+            return None
+        elif isinstance(content, list):
+            return [None] * len(content)
+
+
 def call_groq_summarize(titles: List[str], texts: List[str]) -> List[str]:
     """
     DEPRECATED: This function is no longer used.
