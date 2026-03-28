@@ -68,6 +68,7 @@ def _evaluate_vote_in_background(vote_id: str, user_id: str, statement: str, arg
 
     client = supabase_client()
     ai_analysis = judge_argument(statement, argument_text)
+    print(f"[VOTE] Judging vote_id={vote_id} user={user_id} statement_len={len(statement)} arg_len={len(argument_text)}")
 
     try:
         score = int(ai_analysis.get("score", 5))
@@ -87,6 +88,7 @@ def _evaluate_vote_in_background(vote_id: str, user_id: str, statement: str, arg
 
     # XP is awarded after AI scoring finishes.
     _calculate_and_apply_xp(client, user_id, score)
+    print(f"[VOTE] Judgment complete vote_id={vote_id} score={score}")
 
 @router.post("/vote", response_model=VoteResponse)
 async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
@@ -109,6 +111,7 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
         }
         insert_res = client.table("user_votes").insert(vote_data).execute()
         vote_id = insert_res.data[0]["id"] if insert_res.data else ""
+        print(f"[VOTE] Received (no-argument) vote_id={vote_id} topic={vote.topic_id} side={vote.side} user={vote.user_id} anonymous={vote.is_anonymous}")
 
         xp_earned, new_title_to_return = _calculate_and_apply_xp(client, vote.user_id, 1)
         return VoteResponse(
@@ -140,6 +143,7 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
     }
     insert_res = client.table("user_votes").insert(vote_data).execute()
     vote_id = insert_res.data[0]["id"] if insert_res.data else ""
+    print(f"[VOTE] Received vote_id={vote_id} topic={vote.topic_id} side={vote.side} user={vote.user_id} anonymous={vote.is_anonymous} arg_len={len(clean_argument)}")
 
     background_tasks.add_task(
         _evaluate_vote_in_background,
