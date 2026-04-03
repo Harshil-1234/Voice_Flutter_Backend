@@ -635,77 +635,6 @@ def summarize_text_if_possible(content, titles=None):
             return [None] * len(content)
 
 
-def summarize_text_if_possible(content, titles=None):
-    """
-    Summarize text using LocalLLMService (Gemma-2-2b-it).
-    Returns summary + UPSC relevance + tags.
-    - If `content` is a single string – returns a single Dict or None.
-    - If `content` is a list of strings – returns a list of Dicts aligned with input.
-    Titles are optional, mainly used for debugging/logging.
-    This redefinition processes items one-by-one with tiny sleeps to yield the LLM lock between calls.
-    """
-    if llm_service is None:
-        print("CRITICAL: LocalLLMService is None - model not loaded!")
-        print("   Check startup logs for initialization errors.")
-        print("   Skipping summarization for this batch.")
-        if isinstance(content, str):
-            return None
-        content_len = len(content) if isinstance(content, list) else 0
-        return [None] * content_len
-
-    try:
-        # Case 1: Single string
-        if isinstance(content, str):
-            if not content or not content.strip():
-                return None
-
-            result = llm_service.analyze_article(content)
-            if result:
-                return result
-            return None
-
-        # Case 2: List of strings
-        elif isinstance(content, list):
-            results = []
-            for idx, text in enumerate(content):
-                try:
-                    if not text or not text.strip():
-                        results.append(None)
-                        if titles and idx < len(titles):
-                            print(f"[summarize] Skipped empty article: {titles[idx][:80]}")
-                        continue
-
-                    result = llm_service.analyze_article(text)
-                    if result:
-                        results.append(result)
-                        if titles and idx < len(titles):
-                            summary = result.get("summary", "")[:80].replace("\n", " ")
-                            relevant = result.get("upsc_relevant", False)
-                            tags = result.get("tags", [])
-                            print(f"[summarize] Analyzed: {titles[idx][:60]} | Relevant: {relevant} | Tags: {tags}")
-                    else:
-                        results.append(None)
-                except Exception as item_err:
-                    results.append(None)
-                    if titles and idx < len(titles):
-                        print(f"[summarize] Error summarizing {titles[idx][:80]}: {item_err}")
-                finally:
-                    # Yield to scheduler so other threads can grab the LLM lock between articles
-                    time.sleep(0.1)
-
-            return results
-
-        else:
-            return None
-
-    except Exception as e:
-        print(f"Summarization error: {e}")
-        if isinstance(content, str):
-            return None
-        elif isinstance(content, list):
-            return [None] * len(content)
-
-
 def call_groq_summarize(titles: List[str], texts: List[str]) -> List[str]:
     """
     DEPRECATED: This function is no longer used.
@@ -2139,36 +2068,140 @@ def generate_daily_quiz_questions():
     print(f"Ã°Å¸ÂÂ Daily quiz generation complete. Total questions generated: {total_generated}")
 
 
-def _build_fallback_seed_votes(statement: str, count: int) -> List[Dict]:
+def _build_fallback_seed_votes(statement: str, count: int, force_side: Optional[str] = None) -> List[Dict]:
     """Fallback synthetic arguments if local LLM is unavailable."""
     support_templates = [
-        f"I support this because it could make implementation faster and easier to monitor for results in practice.",
-        f"This seems useful if executed properly, especially for people who want clearer accountability from leadership.",
-        f"I am in favor since the long-term gains could outweigh the short-term friction if checks are kept strong.",
-        f"Even if imperfect, this idea can help if authorities publish transparent progress and fix issues quickly.",
-        f"I think this can work because it pushes institutions to coordinate better instead of acting in silos.",
+        "I support this because it could make implementation faster and easier to monitor in practice.",
+        "This seems useful if executed properly, especially for people who want clearer accountability.",
+        "I am in favor since the long-term gains could outweigh short-term friction if checks stay strong.",
+        "Even if imperfect, this idea can help if authorities publish progress and fix issues quickly.",
+        "I think this can work because it pushes institutions to coordinate better instead of working in silos.",
     ]
     oppose_templates = [
-        f"I oppose this because it sounds good on paper but may create side effects that hurt ordinary citizens.",
-        f"This worries me since implementation gaps are usually ignored and then people carry the burden later.",
-        f"I am not convinced because similar plans often overpromise while ground realities remain unchanged.",
-        f"This should be reconsidered; without stronger safeguards it can centralize too much power too quickly.",
-        f"I disagree because the proposal may ignore local differences and could fail in many regions.",
+        "I oppose this because it sounds good on paper but may create side effects for ordinary citizens.",
+        "This worries me since implementation gaps are often ignored and people carry the burden later.",
+        "I am not convinced because similar plans overpromise while ground realities remain unchanged.",
+        "This should be reconsidered; without stronger safeguards it can centralize too much power too quickly.",
+        "I disagree because the proposal may ignore local differences and fail in many regions.",
     ]
 
     votes: List[Dict] = []
+    fixed_side = str(force_side or "").strip().lower()
     for idx in range(max(1, count)):
-        use_support = (idx % 2 == 0)
+        if fixed_side in {"support", "oppose"}:
+            use_support = fixed_side == "support"
+        else:
+            use_support = (idx % 2 == 0)
+
         template_pool = support_templates if use_support else oppose_templates
         argument = random.choice(template_pool)
         votes.append(
             {
                 "side": "support" if use_support else "oppose",
                 "argument": f"{argument} ({statement[:80]})",
-                "score": random.randint(4, 7),
             }
         )
     return votes
+
+
+def _estimate_seed_argument_score(argument_text: str) -> int:
+    """
+    Deterministic fallback score when LLM judging is unavailable.
+    Keeps synthetic scores mostly in normal-user low/mid range.
+    """
+    text = (argument_text or "").strip()
+    if not text:
+        return 1
+
+    lowered = text.lower()
+    word_count = len(re.findall(r"\w+", text))
+    reasoning_markers = [
+        "because",
+        "since",
+        "therefore",
+        "however",
+        "for example",
+        "for instance",
+        "but",
+        "although",
+        "if",
+        "then",
+    ]
+    marker_hits = sum(1 for marker in reasoning_markers if marker in lowered)
+    has_numeric_or_data_hint = bool(re.search(r"\d", text)) or any(
+        token in lowered for token in ["data", "survey", "report", "percent", "%"]
+    )
+
+    score = 2
+    if word_count >= 10:
+        score += 1
+    if word_count >= 20:
+        score += 1
+    if word_count >= 35:
+        score += 1
+    score += min(marker_hits, 2)
+    if has_numeric_or_data_hint:
+        score += 1
+
+    return max(1, min(7, score))
+
+
+def _score_seed_argument_like_user(statement: str, argument_text: str) -> int:
+    """Score seed arguments using the same judge used for normal users."""
+    try:
+        if llm_service is not None and hasattr(llm_service, "judge_argument"):
+            analysis = llm_service.judge_argument(statement, argument_text) or {}
+        else:
+            from LocalLLMService import judge_argument as _judge_argument
+
+            analysis = _judge_argument(statement, argument_text) or {}
+
+        score = int(analysis.get("score", 5))
+        return max(1, min(10, score))
+    except Exception as e:
+        print(f"[DEBATE] Seed argument judge failed; using fallback score. Error: {e}")
+        return _estimate_seed_argument_score(argument_text)
+
+
+def _decide_seed_side_targets(total_votes: int) -> Tuple[int, int]:
+    """
+    Decide support/oppose counts.
+    Randomly alternates which side gets majority so support does not always dominate.
+    """
+    total = max(0, int(total_votes or 0))
+    if total <= 0:
+        return (0, 0)
+    if total == 1:
+        return (1, 0) if random.random() < 0.5 else (0, 1)
+
+    majority_side = "support" if random.random() < 0.5 else "oppose"
+    majority_share = random.uniform(0.55, 0.70)
+    majority_count = int(round(total * majority_share))
+    majority_count = max((total // 2) + 1, majority_count)
+    majority_count = min(total - 1, majority_count)
+    minority_count = total - majority_count
+
+    if majority_side == "support":
+        return (majority_count, minority_count)
+    return (minority_count, majority_count)
+
+
+def _normalize_seed_vote(item: Dict, idx: int) -> Optional[Dict]:
+    if not isinstance(item, dict):
+        return None
+
+    side = str(item.get("side", "")).strip().lower()
+    if side not in {"support", "oppose"}:
+        side = "support" if (idx % 2 == 0) else "oppose"
+
+    argument_text = re.sub(r"\s+", " ", str(item.get("argument", "")).strip())
+    if not argument_text:
+        return None
+
+    return {
+        "side": side,
+        "argument": argument_text[:320],
+    }
 
 
 def _extract_auth_user_id(resp) -> Optional[str]:
@@ -2511,39 +2544,68 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
 
     # Shuffle the bot IDs to ensure unique, random assignment.
     random.shuffle(bot_ids)
+    target_total = min(needed, len(bot_ids))
+    if target_total <= 0:
+        return 0
+    support_target, oppose_target = _decide_seed_side_targets(target_total)
 
     synthetic_votes: List[Dict] = []
     try:
         if llm_service is not None and hasattr(llm_service, "generate_seed_debate_votes"):
             # Llama-3 prompt-backed synthetic vote generation.
-            synthetic_votes = llm_service.generate_seed_debate_votes(statement, needed) or []
+            synthetic_votes = llm_service.generate_seed_debate_votes(statement, target_total) or []
     except Exception as e:
         print(f"Ã¢Å¡Â Ã¯Â¸Â [DEBATE] LLM seed generation failed: {e}")
         synthetic_votes = []
 
-    if len(synthetic_votes) < needed:
-        synthetic_votes = (synthetic_votes or []) + _build_fallback_seed_votes(statement, needed)
+    if len(synthetic_votes) < target_total:
+        synthetic_votes = (synthetic_votes or []) + _build_fallback_seed_votes(statement, target_total)
+
+    normalized_votes: List[Dict] = []
+    for idx, item in enumerate(synthetic_votes):
+        normalized = _normalize_seed_vote(item, idx)
+        if normalized:
+            normalized_votes.append(normalized)
+
+    support_pool = [v for v in normalized_votes if v.get("side") == "support"]
+    oppose_pool = [v for v in normalized_votes if v.get("side") == "oppose"]
+    random.shuffle(support_pool)
+    random.shuffle(oppose_pool)
+
+    selected_votes: List[Dict] = []
+    selected_votes.extend(support_pool[:support_target])
+    selected_votes.extend(oppose_pool[:oppose_target])
+
+    support_selected = sum(1 for v in selected_votes if v.get("side") == "support")
+    oppose_selected = sum(1 for v in selected_votes if v.get("side") == "oppose")
+    support_deficit = support_target - support_selected
+    oppose_deficit = oppose_target - oppose_selected
+
+    if support_deficit > 0:
+        selected_votes.extend(
+            _build_fallback_seed_votes(statement, support_deficit, force_side="support")
+        )
+    if oppose_deficit > 0:
+        selected_votes.extend(
+            _build_fallback_seed_votes(statement, oppose_deficit, force_side="oppose")
+        )
+
+    selected_votes = selected_votes[:target_total]
+    random.shuffle(selected_votes)
 
     rows = []
-    for item in synthetic_votes[:needed]:
+    for item in selected_votes:
         # Safety check: if we run out of bots, stop.
         if not bot_ids:
             print("[DEBATE] Ran out of unique bot profiles to assign. Stopping seed.")
             break
 
         side = str(item.get("side", "")).strip().lower()
-        if side not in {"support", "oppose"}:
-            side = "support" if (len(rows) % 2 == 0) else "oppose"
-
         argument_text = re.sub(r"\s+", " ", str(item.get("argument", "")).strip())
-        if not argument_text:
+        if side not in {"support", "oppose"} or not argument_text:
             continue
 
-        try:
-            ai_score = int(item.get("score", 6))
-        except Exception:
-            ai_score = 6
-        ai_score = max(4, min(7, ai_score))
+        ai_score = _score_seed_argument_like_user(statement, argument_text)
 
         # Assign a unique bot by popping from the shuffled list.
         bot_id = bot_ids.pop()
@@ -2554,21 +2616,13 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
                 "side": side,
                 "argument_text": argument_text[:320],
                 "ai_score": ai_score,
-                "ai_feedback": "Community seed vote",
+                "ai_feedback": "Community seed vote (auto-judged using standard logic rubric)",
                 "ai_evaluated": True,
             }
         )
 
     if not rows:
         return 0
-
-    # Ensure both sides are represented for a realistic seed mix.
-    has_support = any(r.get("side") == "support" for r in rows)
-    has_oppose = any(r.get("side") == "oppose" for r in rows)
-    if not has_support and rows:
-        rows[0]["side"] = "support"
-    if not has_oppose and len(rows) > 1:
-        rows[-1]["side"] = "oppose"
 
     inserted = 0
     inserted_rows: List[Dict] = []
@@ -3022,7 +3076,7 @@ def send_daily_news_notification():
             android=messaging.AndroidConfig(
                 priority='high',
                 notification=messaging.AndroidNotification(
-                    icon='notification_icon',
+                    icon='ic_notification',
                     color='#FF6B35',
                     channel_id='high_importance_channel',
                 ),
@@ -3056,7 +3110,7 @@ def send_daily_quiz_notification():
             android=messaging.AndroidConfig(
                 priority='high',
                 notification=messaging.AndroidNotification(
-                    icon='notification_icon',
+                    icon='ic_notification',
                     color='#FF6B35',
                     channel_id='high_importance_channel',
                 ),
