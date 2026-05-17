@@ -1359,13 +1359,14 @@ def update_live_ticker():
         print("[LIVE] Active event is missing id/topic_query; skipping.")
         return
 
-    # Compare against the most recent persisted update first.
-    latest_status_text = previous_status
+    # Compare against the most recent persisted update for this specific event.
+    latest_status_text = ""
+    has_prior_update = False
     try:
         latest_update_res = (
             client.table("live_event_updates")
             .select("status_text, created_at")
-            .eq("live_event_id", event_id)
+            .eq("event_id", event_id)
             .order("created_at", desc=True)
             .limit(1)
             .execute()
@@ -1375,6 +1376,7 @@ def update_live_ticker():
             latest_from_history = (latest_rows[0].get("status_text") or "").strip()
             if latest_from_history:
                 latest_status_text = latest_from_history
+                has_prior_update = True
     except Exception as e:
         print(f"[LIVE] Failed to fetch latest live_event_updates row: {e}")
 
@@ -1403,6 +1405,7 @@ def update_live_ticker():
                 topic_query,
                 headlines,
                 latest_status_text,
+                has_prior_update=has_prior_update,
             )
             status_text = response_text
         else:
@@ -1466,7 +1469,7 @@ def update_live_ticker():
     try:
         client.table("live_event_updates").insert(
             {
-                "live_event_id": event_id,
+                "event_id": event_id,
                 "status_text": status_text,
             }
         ).execute()

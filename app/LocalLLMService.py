@@ -340,8 +340,9 @@ Do not use JSON. Write plain text."""
         topic: str,
         headlines: list[str],
         current_status: str = "",
+        has_prior_update: bool = True,
     ) -> str:
-        """Return NO_UPDATE unless headlines show a material event change."""
+        """Return a ticker sentence for cold start, else NO_UPDATE unless a material event change exists."""
         if not topic:
             topic = "breaking news"
         if not headlines:
@@ -352,26 +353,41 @@ Do not use JSON. Write plain text."""
         if not cleaned_headlines:
             return "NO_UPDATE"
 
-        current_status = (current_status or "").strip() or "No previous update."
+        current_status = (current_status or "").strip()
+        if has_prior_update and not current_status:
+            has_prior_update = False
 
-        system_prompt = (
-            "You are a strict Breaking News Editor. Your job is to decide if a Live Ticker needs to be updated.\n\n"
-            "**RULES:**\n"
-            "1. Read the new headlines carefully.\n"
-            "2. Compare them to the PREVIOUS UPDATE.\n"
-            "3. Update only if there is a MAJOR NEW DEVELOPMENT "
-            "(new attack, new treaty, casualty change, major escalation/de-escalation, or statement from a different major leader).\n"
-            "4. If headlines are about the SAME event already captured in PREVIOUS UPDATE, even if phrased differently, return exactly: NO_UPDATE\n"
-            "5. If there is a major new development, write exactly ONE short sentence (max 15 words) describing ONLY the new event.\n"
-            "6. End the sentence with a period. Do not add prefixes like 'Status:' or 'New Update:'.\n"
-            "7. Output plain text only. Either NO_UPDATE or the one sentence."
-        )
-        user_prompt = (
-            f"TOPIC: {topic}\n"
-            f"PREVIOUS UPDATE: \"{current_status}\"\n"
-            "NEW_WIRE_HEADLINES:\n- "
-            + "\n- ".join(cleaned_headlines)
-        )
+        if has_prior_update:
+            system_prompt = (
+                "You are a strict Breaking News Editor. Your job is to decide if a Live Ticker needs to be updated.\n\n"
+                "**RULES:**\n"
+                "1. Read the new headlines carefully.\n"
+                "2. Compare them to the PREVIOUS UPDATE.\n"
+                "3. Update only if there is a MAJOR NEW DEVELOPMENT "
+                "(new attack, new treaty, casualty change, major escalation/de-escalation, or statement from a different major leader).\n"
+                "4. If headlines are about the SAME event already captured in PREVIOUS UPDATE, even if phrased differently, return exactly: NO_UPDATE\n"
+                "5. If there is a major new development, write exactly ONE short sentence (max 15 words) describing ONLY the new event.\n"
+                "6. End the sentence with a period. Do not add prefixes like 'Status:' or 'New Update:'.\n"
+                "7. Output plain text only. Either NO_UPDATE or the one sentence."
+            )
+            user_prompt = (
+                f"TOPIC: {topic}\n"
+                f"PREVIOUS UPDATE: \"{current_status}\"\n"
+                "NEW_WIRE_HEADLINES:\n- "
+                + "\n- ".join(cleaned_headlines)
+            )
+        else:
+            system_prompt = (
+                "You are a Breaking News Editor.\n"
+                "Read the headlines and write exactly ONE present-tense sentence (max 15 words) "
+                "summarizing the current situation.\n"
+                "Do not use prefixes. Output plain text only."
+            )
+            user_prompt = (
+                f"HEADLINE TOPIC: {topic}\n"
+                "HEADLINES:\n- "
+                + "\n- ".join(cleaned_headlines)
+            )
 
         try:
             with self.lock:
@@ -518,9 +534,14 @@ def conclude_debate(statement: str, winning_side: str, top_args: str) -> str:
     service = get_local_llm_service()
     return service.conclude_debate(statement, winning_side, top_args)
 
-def generate_live_ticker_status(topic: str, headlines: list[str], current_status: str = "") -> str:
+def generate_live_ticker_status(
+    topic: str,
+    headlines: list[str],
+    current_status: str = "",
+    has_prior_update: bool = True,
+) -> str:
     service = get_local_llm_service()
-    return service.generate_live_ticker_status(topic, headlines, current_status)
+    return service.generate_live_ticker_status(topic, headlines, current_status, has_prior_update)
 
 def generate_seed_debate_votes(statement: str, count: int = 15) -> List[Dict]:
     service = get_local_llm_service()
