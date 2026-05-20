@@ -1473,8 +1473,17 @@ def update_live_ticker():
                 "status_text": status_text,
             }
         ).execute()
+        # Save to history table
+        history_data = {
+            "event_id": event_id,
+            "status_text": status_text
+            # created_at is handled by DB default
+        }
+        client.table("live_event_updates").insert(history_data).execute()
+        print("✅ Saved update to live_event_updates table.")
     except Exception as e:
         print(f"[LIVE] Failed to append update history: {e}")
+        print(f"❌ Failed to insert into live_event_updates: {e}")
 
 
 def process_rss_entry(entry: dict, category: str, country: str) -> Optional[dict]:
