@@ -1366,7 +1366,7 @@ def update_live_ticker():
         latest_update_res = (
             client.table("live_event_updates")
             .select("status_text, created_at")
-            .eq("event_id", event_id)
+            .eq("live_event_id", event_id)
             .order("created_at", desc=True)
             .limit(1)
             .execute()
@@ -1469,13 +1469,13 @@ def update_live_ticker():
     try:
         client.table("live_event_updates").insert(
             {
-                "event_id": event_id,
+                "live_event_id": event_id,
                 "status_text": status_text,
             }
         ).execute()
         # Save to history table
         history_data = {
-            "event_id": event_id,
+            "live_event_id": event_id,
             "status_text": status_text
             # created_at is handled by DB default
         }
