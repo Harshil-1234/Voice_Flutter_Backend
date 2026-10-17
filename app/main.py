@@ -27,7 +27,7 @@ import trafilatura
 from googlenewsdecoder import new_decoderv1
 from riddle_generator import generate_daily_riddle, get_latest_riddle, check_today_riddle_exists
 from LocalLLMService import get_local_llm_service
-from debate_service import router as debate_router
+from debate_service import router as debate_router, process_judge_queue_once
 import firebase_admin
 from firebase_admin import credentials, messaging
 
@@ -3279,7 +3279,8 @@ def schedule_jobs():
     try:
         # Debates
         scheduler.add_job(generate_daily_debate_topic, 'cron', hour=1, minute=0, id='gen_debate')
-        scheduler.add_job(manage_debate_lifecycle, 'interval', minutes=10, id='manage_debate')
+        scheduler.add_job(manage_debate_lifecycle, 'interval', minutes=1, id='manage_debate')
+        scheduler.add_job(process_judge_queue_once, 'interval', seconds=2, id='process_debate_judge_queue', max_instances=1, replace_existing=True)
         
         # Existing
         scheduler.add_job(smart_ingest_all_categories, "interval", hours=4, id="smart_ingest_job")
