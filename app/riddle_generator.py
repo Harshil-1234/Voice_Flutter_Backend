@@ -45,7 +45,7 @@ def get_existing_riddles(limit: int = 100) -> Set[str]:
         return existing
         
     except Exception as e:
-        print(f"⚠️ Error fetching existing riddles: {e}")
+        print(f" Error fetching existing riddles: {e}")
         return set()
 
 
@@ -79,12 +79,12 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     
     if not GROQ_API_KEY:
-        print("❌ GROQ_API_KEY missing; skipping riddle generation")
+        print(" GROQ_API_KEY missing; skipping riddle generation")
         return None
     
     # Fetch existing riddles to avoid duplicates
     existing_riddles = get_existing_riddles(limit=200)
-    print(f"📋 Checking against {len(existing_riddles)} existing riddles to avoid duplicates")
+    print(f" Checking against {len(existing_riddles)} existing riddles to avoid duplicates")
     
     try:
         headers = {
@@ -160,7 +160,7 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
                         
                         # Validate required fields
                         if not all(key in riddle_data for key in ["question", "answer", "explanation"]):
-                            print(f"❌ Attempt {generation_attempt}: Invalid riddle response: missing required fields")
+                            print(f" Attempt {generation_attempt}: Invalid riddle response: missing required fields")
                             break
                         
                         question = riddle_data["question"].strip()
@@ -168,7 +168,7 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
                         
                         # Validate answer is exactly 1 word
                         if not is_one_word(answer):
-                            print(f"⚠️ Attempt {generation_attempt}: Answer is not one word: '{answer}'")
+                            print(f" Attempt {generation_attempt}: Answer is not one word: '{answer}'")
                             print(f"   Retrying to generate a riddle with 1-word answer...")
                             break
                         
@@ -176,7 +176,7 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
                         question_normalized = question.lower().strip()
                         
                         if question_normalized in existing_riddles:
-                            print(f"⚠️ Attempt {generation_attempt}: Duplicate question detected")
+                            print(f" Attempt {generation_attempt}: Duplicate question detected")
                             print(f"   Retrying to generate a unique riddle...")
                             break
                         
@@ -194,28 +194,28 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
                         result = client.table("riddles").insert(riddle_row).execute()
                         
                         if result.data:
-                            print(f"✅ Successfully generated and stored daily riddle (attempt {generation_attempt})")
+                            print(f" Successfully generated and stored daily riddle (attempt {generation_attempt})")
                             print(f"   Question: {question[:100]}...")
-                            print(f"   Answer: {answer} (1 word ✓)")
-                            print(f"   Difficulty: High ✓")
+                            print(f"   Answer: {answer} (1 word )")
+                            print(f"   Difficulty: High ")
                             return result.data[0]
                         else:
-                            print("❌ Failed to store riddle in database")
+                            print(" Failed to store riddle in database")
                             return None
                             
                     except json.JSONDecodeError as e:
-                        print(f"❌ Attempt {generation_attempt}: JSON parse error: {e}")
+                        print(f" Attempt {generation_attempt}: JSON parse error: {e}")
                         print(f"Response content: {content[:200]}")
                         break
                         
                 elif resp.status_code == 429 and attempt < retries:
                     wait_s = backoffs[attempt] if attempt < len(backoffs) else backoffs[-1]
                     attempt += 1
-                    print(f"⏳ Groq rate limit reached (429). Retrying in {wait_s}s (attempt {attempt}/{retries}).")
+                    print(f" Groq rate limit reached (429). Retrying in {wait_s}s (attempt {attempt}/{retries}).")
                     time.sleep(wait_s)
                     continue
                 else:
-                    print(f"❌ Groq riddle generation error {resp.status_code}: {resp.text[:200]}")
+                    print(f" Groq riddle generation error {resp.status_code}: {resp.text[:200]}")
                     break
             
             # If we got here, the generation attempt failed validation
@@ -223,11 +223,11 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
             if generation_attempt < max_generation_attempts:
                 time.sleep(2)
         
-        print(f"❌ Failed to generate a valid unique riddle after {max_generation_attempts} attempts")
+        print(f" Failed to generate a valid unique riddle after {max_generation_attempts} attempts")
         return None
                 
     except Exception as e:
-        print(f"❌ Riddle generation exception: {e}")
+        print(f" Riddle generation exception: {e}")
     
     return None
 
@@ -254,7 +254,7 @@ def get_latest_riddle() -> Optional[Dict[str, Any]]:
             return None
             
     except Exception as e:
-        print(f"❌ Error fetching latest riddle: {e}")
+        print(f" Error fetching latest riddle: {e}")
         return None
 
 
@@ -283,14 +283,14 @@ def check_today_riddle_exists() -> bool:
         
         exists = len(result.data or []) > 0
         if exists:
-            print(f"✅ Riddle already exists for today (UTC): {today_utc.isoformat()}")
+            print(f" Riddle already exists for today (UTC): {today_utc.isoformat()}")
         else:
-            print(f"ℹ️ No riddle found for today (UTC): {today_utc.isoformat()}")
+            print(f" No riddle found for today (UTC): {today_utc.isoformat()}")
         
         return exists
         
     except Exception as e:
-        print(f"❌ Error checking today's riddle: {e}")
+        print(f" Error checking today's riddle: {e}")
         import traceback
         traceback.print_exc()
         return False
