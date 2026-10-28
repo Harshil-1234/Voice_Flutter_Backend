@@ -1,8 +1,8 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import datetime
 import random
-import re
+import string
 
 from LocalLLMService import judge_argument
 
@@ -10,9 +10,7 @@ from LocalLLMService import judge_argument
 router = APIRouter(prefix="/debate", tags=["debate"])
 
 class VoteRequest(BaseModel):
-    # Kept optional for older clients. The authenticated bearer token is always
-    # the source of truth for the user id.
-    user_id: str | None = None
+    user_id: str
     topic_id: str
     side: str
     argument_text: str
@@ -29,27 +27,107 @@ class VoteResponse(BaseModel):
 
 class UnlockRequest(BaseModel):
     vote_id: str
-    grant_access: bool = True
 
 class UnlockResponse(BaseModel):
     detailed_analysis: str
 
-class CreateRoomRequest(BaseModel):
+class CreateDebateRequest(BaseModel):
+    user_id: str
     statement: str
     context: str = ""
-    duration_minutes: int = 60
+    debate_type: str
 
-class JoinRoomRequest(BaseModel):
-    code: str
+
+@router.post("/create")
+async def create_debate(request: CreateDebateRequest):
+    if request.debate_type not in {"public", "private"}:
+        raise HTTPException(status_code=422, detail="debate_type must be public or private")
+    from main import supabase_client
+    client = supabase_client()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    topic = {
+        "statement": request.statement.strip(),
+        "context": request.context.strip(),
+        "debate_type": request.debate_type,
+        "created_by": request.user_id,
+        "status": "active",
+        "start_time": now.isoformat(),
+        "end_time": (now + datetime.timedelta(hours=24)).isoformat(),
+    }
+    if not topic["statement"]:
+        raise HTTPException(status_code=422, detail="statement is required")
+    if request.debate_type == "private":
+        for _ in range(10):
+            code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+            try:
+                existing = client.table("debate_topics").select("id").eq("room_code", code).limit(1).execute()
+                if not (existing.data or []):
+                    topic["room_code"] = code
+                    break
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Could not verify room code uniqueness: {exc}")
+        if not topic.get("room_code"):
+            raise HTTPException(status_code=503, detail="Could not allocate a unique room code")
+    try:
+        result = client.table("debate_topics").insert(topic).execute()
+        created = (result.data or [None])[0]
+        if not created:
+            raise HTTPException(status_code=500, detail="Database did not return the created debate")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not create debate: {exc}")
+    if request.debate_type == "public":
+        try:
+            from main import seed_debate_votes
+            seed_debate_votes(str(created["id"]), created["statement"], min_votes=5, max_votes=10)
+        except Exception as exc:
+            print(f"[DEBATE] Public room vote seeding failed: {exc}")
+    return created
+
+@router.get("/public")
+async def get_public_debates():
+    from main import supabase_client
+    client = supabase_client()
+    try:
+        result = (client.table("debate_topics").select("*")
+                  .eq("debate_type", "public").eq("status", "active")
+                  .order("created_at", desc=True).execute())
+        topics = result.data or []
+        for topic in topics:
+            try:
+                votes = client.table("user_votes").select("id", count="exact").eq("topic_id", topic["id"]).execute()
+                topic["total_votes"] = votes.count or 0
+                creator = client.table("profiles").select("display_name,full_name").eq("id", topic.get("created_by")).limit(1).execute()
+                profile = (creator.data or [{}])[0]
+                topic["creator_name"] = profile.get("display_name") or profile.get("full_name") or "User"
+            except Exception:
+                topic.setdefault("total_votes", 0)
+                topic.setdefault("creator_name", "User")
+        return topics
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not load public debates: {exc}")
+
+@router.get("/room/{room_code}")
+async def get_private_room(room_code: str):
+    from main import supabase_client
+    client = supabase_client()
+    try:
+        result = (client.table("debate_topics").select("*")
+                  .eq("room_code", room_code.upper()).eq("status", "active")
+                  .limit(1).execute())
+        topic = (result.data or [None])[0]
+        if not topic:
+            raise HTTPException(status_code=404, detail="Active room not found")
+        return topic
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not find room: {exc}")
 
 # Gamification Constants
 XP_BASE_VOTE = 10
 XP_MULTIPLIER_SCORE = 5
-PRIVATE_ROOM_DAILY_LIMIT = 1
-PRIVATE_ROOM_ACTIVE_LIMIT = 3
-JUDGE_PRIORITY = {"official": 3, "public": 2, "private": 1}
-JOIN_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-_failed_join_attempts: dict[str, list[datetime.datetime]] = {}
 
 def calculate_new_title(total_xp: int) -> str:
     if total_xp >= 5000:
@@ -61,31 +139,6 @@ def calculate_new_title(total_xp: int) -> str:
     elif total_xp >= 100:
         return 'Observer'
     return 'Rookie'
-
-
-def _authenticated_user_id(request: Request) -> str:
-    """Validate the Supabase bearer token and return its user id."""
-    authorization = request.headers.get("authorization", "")
-    if not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="A valid bearer token is required")
-
-    token = authorization.split(" ", 1)[1].strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="A valid bearer token is required")
-
-    try:
-        from main import supabase_client
-
-        user = supabase_client().auth.get_user(token).user
-        user_id = getattr(user, "id", None)
-        if not user_id:
-            raise ValueError("Token did not resolve to a user")
-        return str(user_id)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        print(f"[DEBATE] Authentication failed: {exc}")
-        raise HTTPException(status_code=401, detail="Invalid or expired session")
 
 def _calculate_and_apply_xp(client, user_id: str, score: int) -> tuple[int, str | None]:
     xp_earned = XP_BASE_VOTE + (score * XP_MULTIPLIER_SCORE)
@@ -106,244 +159,54 @@ def _calculate_and_apply_xp(client, user_id: str, score: int) -> tuple[int, str 
     client.table("profiles").update(update_data).eq("id", user_id).execute()
     return xp_earned, new_title_to_return
 
-def _new_join_code(client) -> str:
-    for _ in range(12):
-        code = "".join(random.choice(JOIN_ALPHABET) for _ in range(6))
-        if not client.table("debate_topics").select("id").eq("join_code", code).limit(1).execute().data:
-            return code
-    raise HTTPException(status_code=503, detail="Could not generate a room code; please retry")
-
-
-def _insert_private_room(client, statement: str, context: str, user_id: str,
-                         now: datetime.datetime, end: datetime.datetime,
-                         duration_minutes: int) -> dict:
-    """Insert a room with a collision-safe, user-visible join code.
-
-    The code is protected by a database unique constraint.  The short retry
-    loop handles the (rare) race where two requests select the same candidate
-    code before either insert commits.
-    """
-    for _ in range(5):
-        code = _new_join_code(client)
-        try:
-            result = client.table("debate_topics").insert({
-                "statement": statement,
-                "context": context,
-                "kind": "private",
-                "creator_id": user_id,
-                "join_code": code,
-                "duration_minutes": duration_minutes,
-                "max_participants": 50,
-                # The host is inserted below, so reflect that immediately.
-                "participant_count": 1,
-                "moderation_status": "approved",
-                "status": "active",
-                "start_time": now.isoformat(),
-                "end_time": end.isoformat(),
-            }).execute()
-            if result.data:
-                return result.data[0]
-        except Exception as exc:
-            # Retry only for a code collision; other database errors should be
-            # surfaced instead of creating a room with an unknown state.
-            if "duplicate" not in str(exc).lower() and "unique" not in str(exc).lower():
-                raise
-    raise HTTPException(status_code=503, detail="Could not generate a room code; please retry")
-
-def _validate_room_statement(statement: str) -> str:
-    text = re.sub(r"\s+", " ", (statement or "").strip())
-    if len(text) < 12 or len(text) > 160 or text.isdigit():
-        raise HTTPException(status_code=400, detail="Use a debatable statement between 12 and 160 characters")
-    blocked = ("fuck", "shit", "bitch", "kill yourself")
-    if any(term in text.lower() for term in blocked):
-        raise HTTPException(status_code=400, detail="The room statement violates community rules")
-    return text
-
-@router.post("/rooms")
-async def create_private_room(room: CreateRoomRequest, request: Request):
-    from main import supabase_client
-    client, user_id = supabase_client(), _authenticated_user_id(request)
-    statement = _validate_room_statement(room.statement)
-    context = (room.context or "").strip()
-    if len(context) > 500 or room.duration_minutes not in {60, 360, 1440, 4320, 10080}:
-        raise HTTPException(status_code=400, detail="Invalid room context or duration")
-    profile = client.table("profiles").select("display_name").eq("id", user_id).limit(1).execute().data
-    if not profile or not (profile[0].get("display_name") or "").strip():
-        raise HTTPException(status_code=403, detail="Set a validated display name before creating a room")
-    now = datetime.datetime.now(datetime.timezone.utc)
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    made_today = client.table("room_creations").select("id", count="exact").eq("user_id", user_id).gte("created_at", today).execute().count or 0
-    active = client.table("debate_topics").select("id", count="exact").eq("creator_id", user_id).eq("kind", "private").eq("status", "active").execute().count or 0
-    if made_today >= PRIVATE_ROOM_DAILY_LIMIT or active >= PRIVATE_ROOM_ACTIVE_LIMIT:
-        raise HTTPException(status_code=429, detail="Your private-room creation limit has been reached")
-    end = now + datetime.timedelta(minutes=room.duration_minutes)
-    inserted = _insert_private_room(client, statement, context, user_id, now, end, room.duration_minutes)
-    try:
-        client.table("debate_participants").insert({"topic_id": inserted["id"], "user_id": user_id, "role": "host"}).execute()
-        client.table("room_creations").insert({"user_id": user_id, "topic_id": inserted["id"]}).execute()
-    except Exception:
-        # Do not leave an active room that has no host/metering record if a
-        # dependent insert fails after the topic was created.
-        try:
-            client.table("debate_topics").delete().eq("id", inserted["id"]).execute()
-        finally:
-            raise
-    return {"topic": inserted, "join_code": inserted["join_code"]}
-
-@router.post("/rooms/join")
-async def join_private_room(body: JoinRoomRequest, request: Request):
-    from main import supabase_client
-    client, user_id = supabase_client(), _authenticated_user_id(request)
-    now = datetime.datetime.now(datetime.timezone.utc)
-    attempts = [t for t in _failed_join_attempts.get(user_id, []) if (now - t).total_seconds() < 600]
-    if len(attempts) >= 5: raise HTTPException(status_code=429, detail="Too many invalid code attempts; try again later")
-    code = re.sub(r"\s+", "", body.code.upper())
-    rows = client.table("debate_topics").select("id,status,max_participants,participant_count").eq("join_code", code).limit(1).execute().data
-    if not rows:
-        _failed_join_attempts[user_id] = attempts + [now]; raise HTTPException(status_code=404, detail="Room code not found")
-    topic = rows[0]
-    if topic.get("status") != "active": raise HTTPException(status_code=409, detail="This room is no longer active")
-    if int(topic.get("participant_count") or 0) >= int(topic.get("max_participants") or 50): raise HTTPException(status_code=409, detail="This room is full")
-    existing = client.table("debate_participants").select("user_id").eq("topic_id", topic["id"]).eq("user_id", user_id).execute().data
-    if not existing:
-        client.table("debate_participants").insert({"topic_id": topic["id"], "user_id": user_id}).execute()
-        client.table("debate_topics").update({"participant_count": int(topic.get("participant_count") or 0) + 1}).eq("id", topic["id"]).execute()
-    return {"topic_id": topic["id"]}
-
-@router.get("/hub")
-async def get_hub(request: Request):
-    """Phase-1 hub: official debate plus rooms the authenticated user joined."""
-    from main import supabase_client
-    client, user_id = supabase_client(), _authenticated_user_id(request)
-    official = client.table("debate_topics").select("*").eq("kind", "official").eq("status", "active").order("created_at", desc=True).limit(1).execute().data
-    memberships = client.table("debate_participants").select("topic_id").eq("user_id", user_id).execute().data or []
-    ids = [row["topic_id"] for row in memberships]
-    rooms = client.table("debate_topics").select("*").in_("id", ids).order("status").order("end_time").execute().data if ids else []
-    return {"official": official[0] if official else None, "your_rooms": rooms}
-
-@router.post("/rooms/{topic_id}/close")
-async def close_room(topic_id: str, request: Request):
-    from main import supabase_client
-    client, user_id = supabase_client(), _authenticated_user_id(request)
-    rows = client.table("debate_topics").select("creator_id,kind,status").eq("id", topic_id).limit(1).execute().data
-    if not rows or rows[0].get("kind") != "private": raise HTTPException(status_code=404, detail="Private room not found")
-    if rows[0].get("creator_id") != user_id: raise HTTPException(status_code=403, detail="Only the host can close this room")
-    client.table("debate_topics").update({"end_time": datetime.datetime.now(datetime.timezone.utc).isoformat()}).eq("id", topic_id).execute()
-    return {"ok": True}
-
 def _evaluate_vote_in_background(vote_id: str, user_id: str, statement: str, argument_text: str):
     from main import supabase_client
 
     client = supabase_client()
+    ai_analysis = judge_argument(statement, argument_text)
+
     try:
-        ai_analysis = judge_argument(statement, argument_text) or {}
-        print(f"[VOTE] Judging vote_id={vote_id} user={user_id} statement_len={len(statement)} arg_len={len(argument_text)}")
+        score = int(ai_analysis.get("score", 5))
+    except Exception:
+        score = 5
+    score = max(1, min(10, score))
 
-        try:
-            score = int(ai_analysis.get("score", 5))
-        except (TypeError, ValueError):
-            score = 5
-        score = max(1, min(10, score))
+    ai_feedback = ai_analysis.get("feedback", "AI analysis completed.")
+    detailed = ai_analysis.get("detailed_analysis", "No detailed analysis available.")
 
-        ai_feedback = str(ai_analysis.get("feedback") or "AI analysis completed.")
-        detailed = str(ai_analysis.get("detailed_analysis") or "No detailed analysis available.")
-        raw_factors = ai_analysis.get("key_factors") or ai_analysis.get("tags") or []
-        key_factors = [str(item).strip()[:80] for item in raw_factors if str(item).strip()][:5]
+    client.table("user_votes").update({
+        "ai_score": score,
+        "ai_feedback": ai_feedback,
+        "hidden_feedback": detailed,
+        "ai_evaluated": True
+    }).eq("id", vote_id).execute()
 
-        update_res = client.table("user_votes").update({
-            "ai_score": score,
-            "ai_feedback": ai_feedback,
-            "hidden_feedback": detailed,
-            "ai_tags": key_factors,
-            "ai_evaluated": True
-        }).eq("id", vote_id).eq("ai_evaluated", False).execute()
-
-        # Award XP only once, after a pending vote was actually transitioned.
-        if update_res.data:
-            _calculate_and_apply_xp(client, user_id, score)
-        print(f"[VOTE] Judgment complete vote_id={vote_id} score={score}")
-    except Exception as exc:
-        # Never leave the scorecard in a permanent judging state when the model
-        # or a transient database operation fails.
-        print(f"[VOTE] Judgment failed vote_id={vote_id}: {exc}")
-        try:
-            fallback_res = client.table("user_votes").update({
-                "ai_score": 5,
-                "ai_feedback": "AI analysis is temporarily unavailable; a standard logic score was applied.",
-                "hidden_feedback": "The detailed analysis could not be generated right now. Please use the feedback above as a starting point.",
-                "ai_tags": ["Analysis unavailable"],
-                "ai_evaluated": True,
-            }).eq("id", vote_id).eq("ai_evaluated", False).execute()
-            if fallback_res.data:
-                _calculate_and_apply_xp(client, user_id, 5)
-        except Exception as fallback_exc:
-            print(f"[VOTE] Could not settle failed judgment vote_id={vote_id}: {fallback_exc}")
+    # XP is awarded after AI scoring finishes.
+    _calculate_and_apply_xp(client, user_id, score)
 
 @router.post("/vote", response_model=VoteResponse)
-async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks, request: Request):
+async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
     from main import supabase_client
     client = supabase_client()
-    user_id = _authenticated_user_id(request)
     clean_argument = (vote.argument_text or "").strip()
-
-    if vote.side not in {"support", "oppose"}:
-        raise HTTPException(status_code=400, detail="Side must be either support or oppose")
-    if len(clean_argument) > 2000:
-        raise HTTPException(status_code=400, detail="Arguments must be 2,000 characters or fewer")
-
-    # A user can participate once in each daily topic. This keeps the blind
-    # reveal meaningful and prevents duplicate XP awards.
-    existing_vote = client.table("user_votes").select("id").eq("topic_id", vote.topic_id).eq("user_id", user_id).limit(1).execute()
-    if existing_vote.data:
-        raise HTTPException(status_code=409, detail="You have already voted in this debate")
-
-    topic_res = client.table("debate_topics").select("statement,status,end_time,kind,creator_id").eq("id", vote.topic_id).limit(1).execute()
-    if not topic_res.data:
-        raise HTTPException(status_code=404, detail="Topic not found")
-    topic = topic_res.data[0]
-    if topic.get("status") != "active":
-        raise HTTPException(status_code=409, detail="This debate is not accepting votes")
-    if topic.get("kind") == "private":
-        participant = client.table("debate_participants").select("user_id").eq("topic_id", vote.topic_id).eq("user_id", user_id).limit(1).execute().data
-        if not participant:
-            raise HTTPException(status_code=403, detail="Join this private room with its code before voting")
-    raw_end_time = topic.get("end_time")
-    if raw_end_time:
-        try:
-            end_time = datetime.datetime.fromisoformat(
-                str(raw_end_time).replace("Z", "+00:00")
-            )
-            if end_time.tzinfo is None:
-                end_time = end_time.replace(tzinfo=datetime.timezone.utc)
-            if end_time <= datetime.datetime.now(datetime.timezone.utc):
-                raise HTTPException(status_code=409, detail="This debate has ended")
-        except ValueError:
-            # Do not block an otherwise active debate over a malformed legacy
-            # timestamp; the lifecycle job will repair its state.
-            pass
-    statement = str(topic.get("statement") or "").strip()
-    if not statement:
-        raise HTTPException(status_code=409, detail="This debate has no valid statement")
 
     # Fast path: no argument means no AI call.
     if not clean_argument:
         vote_data = {
-            "user_id": user_id,
+            "user_id": vote.user_id,
             "topic_id": vote.topic_id,
             "side": vote.side,
             "argument_text": "",
             "ai_score": 1,
             "ai_feedback": "Vote counted. No argument provided.",
             "hidden_feedback": "To participate fully in the debate and earn a higher logic score, provide a written argument.",
-            "ai_evaluated": True,
-            "ai_tags": ["Missing reasoning"],
+            "ai_evaluated": False,
             "is_anonymous": vote.is_anonymous
         }
         insert_res = client.table("user_votes").insert(vote_data).execute()
         vote_id = insert_res.data[0]["id"] if insert_res.data else ""
-        print(f"[VOTE] Received (no-argument) vote_id={vote_id} topic={vote.topic_id} side={vote.side} user={user_id} anonymous={vote.is_anonymous}")
 
-        xp_earned, new_title_to_return = _calculate_and_apply_xp(client, user_id, 1)
+        xp_earned, new_title_to_return = _calculate_and_apply_xp(client, vote.user_id, 1)
         return VoteResponse(
             vote_id=vote_id,
             ai_score=1,
@@ -351,12 +214,17 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks, requ
             key_factors=["Missing reasoning"],
             xp_earned=xp_earned,
             new_title=new_title_to_return,
-            ai_evaluated=True
+            ai_evaluated=False
         )
 
     # Non-empty argument: insert pending vote and return immediately.
+    topic_res = client.table("debate_topics").select("statement").eq("id", vote.topic_id).execute()
+    if not topic_res.data:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    statement = topic_res.data[0]["statement"]
+
     vote_data = {
-        "user_id": user_id,
+        "user_id": vote.user_id,
         "topic_id": vote.topic_id,
         "side": vote.side,
         "argument_text": clean_argument,
@@ -368,14 +236,14 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks, requ
     }
     insert_res = client.table("user_votes").insert(vote_data).execute()
     vote_id = insert_res.data[0]["id"] if insert_res.data else ""
-    print(f"[VOTE] Received vote_id={vote_id} topic={vote.topic_id} side={vote.side} user={user_id} anonymous={vote.is_anonymous} arg_len={len(clean_argument)}")
 
-    # The worker consumes this serial queue; requests never invoke Llama.
-    client.table("judge_jobs").insert({
-        "vote_id": vote_id,
-        "topic_id": vote.topic_id,
-        "priority": JUDGE_PRIORITY.get(topic.get("kind"), 1),
-    }).execute()
+    background_tasks.add_task(
+        _evaluate_vote_in_background,
+        vote_id,
+        vote.user_id,
+        statement,
+        clean_argument,
+    )
 
     return VoteResponse(
         vote_id=vote_id,
@@ -387,54 +255,18 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks, requ
         ai_evaluated=False
     )
 
-def process_judge_queue_once() -> None:
-    """Run one queued Llama job. Schedule this frequently in the API process."""
-    from main import supabase_client
-    client = supabase_client()
-    # Recover jobs left in `running` by a worker crash.  This prevents an
-    # otherwise valid argument from waiting forever for AI feedback.
-    stale_before = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=10)).isoformat()
-    client.table("judge_jobs").update({"status": "queued"}).eq("status", "running").lt("started_at", stale_before).execute()
-    jobs = client.table("judge_jobs").select("id,vote_id,topic_id,attempts").eq("status", "queued").order("priority", desc=True).order("created_at").limit(1).execute().data or []
-    if not jobs: return
-    job = jobs[0]
-    client.table("judge_jobs").update({"status": "running", "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "attempts": int(job.get("attempts") or 0) + 1}).eq("id", job["id"]).execute()
-    try:
-        vote = client.table("user_votes").select("user_id,argument_text").eq("id", job["vote_id"]).single().execute().data
-        topic = client.table("debate_topics").select("statement").eq("id", job["topic_id"]).single().execute().data
-        _evaluate_vote_in_background(job["vote_id"], vote["user_id"], topic["statement"], vote["argument_text"])
-        client.table("judge_jobs").update({"status": "done"}).eq("id", job["id"]).execute()
-    except Exception as exc:
-        next_status = "failed" if int(job.get("attempts") or 0) >= 1 else "queued"
-        client.table("judge_jobs").update({"status": next_status}).eq("id", job["id"]).execute()
-        print(f"[DEBATE] judge queue job failed: {exc}")
-
 @router.post("/unlock_feedback", response_model=UnlockResponse)
-async def unlock_feedback(req: UnlockRequest, request: Request):
-    """Record a rewarded/fail-open unlock and return only the owner's critique."""
-    from main import supabase_client
-
-    user_id = _authenticated_user_id(request)
-    client = supabase_client()
-    vote_res = client.table("user_votes").select("id, hidden_feedback").eq("id", req.vote_id).eq("user_id", user_id).limit(1).execute()
-    if not vote_res.data:
-        raise HTTPException(status_code=404, detail="Vote not found")
-    if not req.grant_access:
-        raise HTTPException(status_code=403, detail="Detailed analysis requires a rewarded unlock")
-
-    # This is intentionally idempotent: an interrupted client can retry after
-    # earning the reward without seeing a duplicate-key failure.
-    existing = client.table("ad_attempts").select("id").eq("user_id", user_id).eq("reference_id", req.vote_id).eq("type", "debate_feedback").limit(1).execute()
-    if not existing.data:
-        client.table("ad_attempts").insert({
-            "user_id": user_id,
-            "type": "debate_feedback",
-            "reference_id": req.vote_id,
-            "unlock_date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        }).execute()
-
-    detailed = str(vote_res.data[0].get("hidden_feedback") or "Detailed analysis is still being prepared. Please check back shortly.")
-    return UnlockResponse(detailed_analysis=detailed)
+async def unlock_feedback(req: UnlockRequest):
+    # Retrieve from DB after ad watched
+    # supabase = get_supabase_client()
+    # vote_record = supabase.table("user_votes").select("hidden_feedback").eq("id", req.vote_id).execute().data
+    # if not vote_record:
+    #     raise HTTPException(status_code=404, detail="Vote not found")
+    
+    
+    mock_hidden_feedback = "Your argument lacked primary economic data regarding inflation, focusing purely on anecdotal social issues which weakens the logical structure."
+    
+    return UnlockResponse(detailed_analysis=mock_hidden_feedback)
 
 @router.get("/user_stats/{user_id}")
 async def get_user_stats(user_id: str):
@@ -479,7 +311,7 @@ async def get_current_debate(user_id: str):
     # 1. Fetch the active debate with schema fallbacks.
     active_debates = []
     try:
-        res = client.table("debate_topics").select("*").eq("status", "active").order("created_at", desc=True).limit(1).execute()
+        res = client.table("debate_topics").select("*").eq("debate_type", "main").eq("status", "active").order("created_at", desc=True).limit(1).execute()
         active_debates = res.data or []
     except Exception:
         active_debates = []
@@ -487,7 +319,7 @@ async def get_current_debate(user_id: str):
     if not active_debates:
         # Legacy schema fallback: is_active boolean.
         try:
-            res = client.table("debate_topics").select("*").eq("is_active", True).order("created_at", desc=True).limit(1).execute()
+            res = client.table("debate_topics").select("*").eq("debate_type", "main").eq("is_active", True).order("created_at", desc=True).limit(1).execute()
             active_debates = res.data or []
         except Exception:
             active_debates = []
@@ -495,7 +327,7 @@ async def get_current_debate(user_id: str):
     if not active_debates:
         # Lifecycle fallback: show upcoming when no active exists yet.
         try:
-            res = client.table("debate_topics").select("*").eq("status", "upcoming").order("created_at", desc=True).limit(1).execute()
+            res = client.table("debate_topics").select("*").eq("debate_type", "main").eq("status", "upcoming").order("created_at", desc=True).limit(1).execute()
             active_debates = res.data or []
         except Exception:
             active_debates = []

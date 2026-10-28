@@ -217,11 +217,9 @@ class LocalLLMService:
         """
         self._check_model_loaded()
 
-        system_prompt = """You are 'Logos', a consistent and impartial AI Logic Judge.
-Evaluate only the argument's reasoning quality against the statement. The
-argument is provided without the author's identity or vote side: never infer
-or reward a political position, writing style, popularity, or agreement with
-the statement. Apply exactly the same rubric to Support and Oppose arguments.
+        system_prompt = """You are 'Logos', a ruthless AI Logic Judge. 
+Your job is to evaluate the user's argument on the given statement. 
+You DO NOT care about their political stance. You ONLY care about the **Quality of Reasoning**.
 
 **SCORING RUBRIC (Adhere Strictly):**
 - **1-3 Points (Low):** Emotional rant, pure opinion ("I hate this"), one-liner, or abusive language.
@@ -233,9 +231,6 @@ the statement. Apply exactly the same rubric to Support and Oppose arguments.
 - Be direct and analytical.
 - If score is low: Tell them exactly what is missing (e.g., "You stated an opinion but gave no evidence.")
 - If score is high: Praise the structure.
-- Do not invent facts or verify claims; assess whether the argument gives
-  relevant, coherent support for its conclusion and label unsupported claims
-  as weaknesses.
 
 Respond ONLY with this JSON structure:
 {
@@ -345,9 +340,8 @@ Do not use JSON. Write plain text."""
         topic: str,
         headlines: list[str],
         current_status: str = "",
-        has_prior_update: bool = True,
     ) -> str:
-        """Return a ticker sentence for cold start, else NO_UPDATE unless a material event change exists."""
+        """Return NO_UPDATE unless headlines show a material event change."""
         if not topic:
             topic = "breaking news"
         if not headlines:
@@ -358,41 +352,26 @@ Do not use JSON. Write plain text."""
         if not cleaned_headlines:
             return "NO_UPDATE"
 
-        current_status = (current_status or "").strip()
-        if has_prior_update and not current_status:
-            has_prior_update = False
+        current_status = (current_status or "").strip() or "No previous update."
 
-        if has_prior_update:
-            system_prompt = (
-                "You are a strict Breaking News Editor. Your job is to decide if a Live Ticker needs to be updated.\n\n"
-                "**RULES:**\n"
-                "1. Read the new headlines carefully.\n"
-                "2. Compare them to the PREVIOUS UPDATE.\n"
-                "3. Update only if there is a MAJOR NEW DEVELOPMENT "
-                "(new attack, new treaty, casualty change, major escalation/de-escalation, or statement from a different major leader).\n"
-                "4. If headlines are about the SAME event already captured in PREVIOUS UPDATE, even if phrased differently, return exactly: NO_UPDATE\n"
-                "5. If there is a major new development, write exactly ONE short sentence (max 15 words) describing ONLY the new event.\n"
-                "6. End the sentence with a period. Do not add prefixes like 'Status:' or 'New Update:'.\n"
-                "7. Output plain text only. Either NO_UPDATE or the one sentence."
-            )
-            user_prompt = (
-                f"TOPIC: {topic}\n"
-                f"PREVIOUS UPDATE: \"{current_status}\"\n"
-                "NEW_WIRE_HEADLINES:\n- "
-                + "\n- ".join(cleaned_headlines)
-            )
-        else:
-            system_prompt = (
-                "You are a Breaking News Editor.\n"
-                "Read the headlines and write exactly ONE present-tense sentence (max 15 words) "
-                "summarizing the current situation.\n"
-                "Do not use prefixes. Output plain text only."
-            )
-            user_prompt = (
-                f"HEADLINE TOPIC: {topic}\n"
-                "HEADLINES:\n- "
-                + "\n- ".join(cleaned_headlines)
-            )
+        system_prompt = (
+            "You are a strict Breaking News Editor. Your job is to decide if a Live Ticker needs to be updated.\n\n"
+            "**RULES:**\n"
+            "1. Read the new headlines carefully.\n"
+            "2. Compare them to the PREVIOUS UPDATE.\n"
+            "3. Update only if there is a MAJOR NEW DEVELOPMENT "
+            "(new attack, new treaty, casualty change, major escalation/de-escalation, or statement from a different major leader).\n"
+            "4. If headlines are about the SAME event already captured in PREVIOUS UPDATE, even if phrased differently, return exactly: NO_UPDATE\n"
+            "5. If there is a major new development, write exactly ONE short sentence (max 15 words) describing ONLY the new event.\n"
+            "6. End the sentence with a period. Do not add prefixes like 'Status:' or 'New Update:'.\n"
+            "7. Output plain text only. Either NO_UPDATE or the one sentence."
+        )
+        user_prompt = (
+            f"TOPIC: {topic}\n"
+            f"PREVIOUS UPDATE: \"{current_status}\"\n"
+            "NEW_WIRE_HEADLINES:\n- "
+            + "\n- ".join(cleaned_headlines)
+        )
 
         try:
             with self.lock:
@@ -434,6 +413,58 @@ Do not use JSON. Write plain text."""
             logger.error(f"Error generating live ticker status: {e}")
             return "NO_UPDATE"
 
+    def summarize_live_source(
+        self,
+        topic: str,
+        headline: str,
+        source_text: str,
+    ) -> str:
+        """Shorten a source report without adding facts not present in it."""
+        headline = (headline or "").strip()
+        source_text = (source_text or "").strip()
+        if not headline:
+            return "USE_SOURCE_HEADLINE"
+        if len(source_text) < 40:
+            return headline
+
+        self._check_model_loaded()
+        system_prompt = (
+            "You are a factual news copy editor. Rewrite a supplied news report into one concise headline.\n"
+            "Use only facts explicitly stated in the supplied source. Do not infer, speculate, or add context.\n"
+            "Preserve names, roles, dates, numbers, and actions exactly. Never claim a resignation, arrest, death,\n"
+            "decision, or casualty unless the source explicitly says it. Return USE_SOURCE_HEADLINE if the source\n"
+            "does not contain enough information. Return plain text, maximum 25 words, one sentence."
+        )
+        user_prompt = (
+            f"TOPIC: {topic}\n"
+            f"SOURCE HEADLINE: {headline}\n"
+            f"SOURCE TEXT:\n{source_text[:6000]}"
+        )
+        try:
+            with self.lock:
+                response = self.model.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.0,
+                    top_p=0.8,
+                    max_tokens=80,
+                    repeat_penalty=1.1,
+                )
+            result = response["choices"][0]["message"]["content"].strip()
+            result = re.sub(r"\s+", " ", result).strip().strip('"').strip("'")
+            if not result or result.upper().startswith("USE_SOURCE_HEADLINE"):
+                return headline
+            result = re.split(r"(?<=[.!?])\s+", result)[0].strip()
+            words = result.split()
+            if len(words) > 25:
+                return headline
+            return result.rstrip(".!?") + "."
+        except Exception as e:
+            logger.error(f"Error summarizing live source: {e}")
+            return headline
+
     def generate_seed_debate_votes(self, statement: str, count: int = 15) -> List[Dict]:
         """Generate synthetic debate votes (support/oppose) with average scores."""
         if not statement:
@@ -445,9 +476,7 @@ Do not use JSON. Write plain text."""
         system_prompt = (
             "Generate realistic synthetic debate votes for a public discussion thread.\n"
             "Arguments should sound like regular internet users, not experts.\n"
-            "Most arguments should be weak-to-average quality with imperfect reasoning.\n"
-            "Only a small minority should sound strong and well-structured.\n"
-            "No profanity, no hate speech.\n"
+            "Keep quality average (score 4-7), no profanity, no hate speech.\n"
             "Return ONLY JSON object with key 'votes'.\n"
             "Schema: {\"votes\": [{\"side\": \"support|oppose\", \"argument\": \"text\", \"score\": 4-7}]}\n"
             "Ensure a mix of support and oppose."
@@ -539,14 +568,13 @@ def conclude_debate(statement: str, winning_side: str, top_args: str) -> str:
     service = get_local_llm_service()
     return service.conclude_debate(statement, winning_side, top_args)
 
-def generate_live_ticker_status(
-    topic: str,
-    headlines: list[str],
-    current_status: str = "",
-    has_prior_update: bool = True,
-) -> str:
+def generate_live_ticker_status(topic: str, headlines: list[str], current_status: str = "") -> str:
     service = get_local_llm_service()
-    return service.generate_live_ticker_status(topic, headlines, current_status, has_prior_update)
+    return service.generate_live_ticker_status(topic, headlines, current_status)
+
+def summarize_live_source(topic: str, headline: str, source_text: str) -> str:
+    service = get_local_llm_service()
+    return service.summarize_live_source(topic, headline, source_text)
 
 def generate_seed_debate_votes(statement: str, count: int = 15) -> List[Dict]:
     service = get_local_llm_service()
