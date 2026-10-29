@@ -107,6 +107,7 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
             "GOOD EXAMPLE (Witty): 'I have cities, but no houses. I have mountains, but no trees. I have water, but no fish. What am I?' (Answer: 'Map')\n\n"
             "Return ONLY a valid JSON object:\n"
             "- question: string (The riddle text)\n"
+            "- hint: string (A clever clue that helps without revealing the answer)\n"
             "- answer: string (One word, lowercase, singular form if possible)\n"
             "- explanation: string (A clear, plain-English breakdown that explicitly connects the metaphors in the riddle to the answer)"
         )
@@ -123,7 +124,7 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
                 "The answer MUST be exactly ONE WORD (no phrases, no multiple words). "
                 "Make it intellectually stimulating and thought-provoking. "
                 "Ensure the difficulty is HIGH - challenging and not easily solvable. "
-                "Return the response as a JSON object with question, answer, and explanation fields."
+                "Return the response as a JSON object with question, hint, answer, and explanation fields."
             )
             
             payload = {
@@ -159,11 +160,12 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
                         riddle_data = json.loads(content)
                         
                         # Validate required fields
-                        if not all(key in riddle_data for key in ["question", "answer", "explanation"]):
+                        if not all(key in riddle_data for key in ["question", "hint", "answer", "explanation"]):
                             print(f" Attempt {generation_attempt}: Invalid riddle response: missing required fields")
                             break
                         
                         question = riddle_data["question"].strip()
+                        hint = riddle_data["hint"].strip()
                         answer = riddle_data["answer"].strip()
                         
                         # Validate answer is exactly 1 word
@@ -186,6 +188,7 @@ def generate_daily_riddle() -> Optional[Dict[str, Any]]:
                         from datetime import timezone
                         riddle_row = {
                             "question": question,
+                            "hint": hint,
                             "answer": answer,
                             "explanation": riddle_data["explanation"],
                             "created_at": datetime.now(timezone.utc).isoformat()

@@ -76,6 +76,7 @@ async def create_debate(request: CreateDebateRequest):
     except HTTPException:
         raise
     except Exception as exc:
+        print(f"[ERROR] Supabase debate_topics insert failed: {exc!r}")
         raise HTTPException(status_code=500, detail=f"Could not create debate: {exc}")
     if request.debate_type == "public":
         try:
@@ -163,7 +164,16 @@ def _evaluate_vote_in_background(vote_id: str, user_id: str, statement: str, arg
     from main import supabase_client
 
     client = supabase_client()
-    ai_analysis = judge_argument(statement, argument_text)
+    debate_type = "main"
+    try:
+        vote = client.table("user_votes").select("topic_id").eq("id", vote_id).limit(1).execute()
+        topic_id = (vote.data or [{}])[0].get("topic_id")
+        if topic_id:
+            topic = client.table("debate_topics").select("debate_type").eq("id", topic_id).limit(1).execute()
+            debate_type = ((topic.data or [{}])[0].get("debate_type") or "main").lower()
+    except Exception as exc:
+        print(f"[ERROR] Could not determine debate type for vote {vote_id}: {exc!r}")
+    ai_analysis = judge_argument(statement, argument_text, debate_type)
 
     try:
         score = int(ai_analysis.get("score", 5))
