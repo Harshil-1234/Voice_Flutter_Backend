@@ -31,8 +31,10 @@ LocalLLMService: Manages local LLM inference via llama-cpp-python for text analy
 
 import logging
 import threading
+import time
 from typing import Dict, List
 from pathlib import Path
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -301,9 +303,8 @@ Respond ONLY with this JSON structure:
                 "detailed_analysis": "An error occurred while the Logic Professor was analyzing your argument. Please try again."
             }
 
-    def generate_debate_topic(self, articles_text: str) -> dict:
+    def generate_debate_topic(self, articles_text: str, api_key: str, model_name: str) -> dict:
         """Generates a debate topic statement from recent Indian politics articles."""
-        self._check_model_loaded()
         system_prompt = """You are a Senior Policy Analyst for a Think Tank in India.
 Your task is to synthesize recent news into a single, high-level **Debate Statement**.
 
@@ -323,14 +324,39 @@ Respond ONLY with this JSON structure:
     "context": "<Objective background info>"
 }"""
         try:
-            with self.lock:
-                response = self.model.create_chat_completion(
-                    messages=[{"role": "user", "content": f"{system_prompt}\n\nNews Data:\n{articles_text}"}],
-                    temperature=0.4,
-                    max_tokens=256,
-                    response_format={"type": "json_object"}
-                )
-            content = response["choices"][0]["message"]["content"].strip()
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY is not configured")
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"News Data:\n{articles_text}"},
+                ],
+                "temperature": 0.4,
+                "max_tokens": 8192,
+                "response_format": {"type": "json_object"},
+            }
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            backoffs = [5, 10, 20]
+            response = None
+            for attempt in range(len(backoffs) + 1):
+                try:
+                    response = requests.post(
+                        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                        json=payload,
+                        headers=headers,
+                        timeout=120,
+                    )
+                    response.raise_for_status()
+                    break
+                except requests.RequestException:
+                    if attempt == len(backoffs):
+                        raise
+                    time.sleep(backoffs[attempt])
+            content = response.json()["choices"][0]["message"]["content"].strip()
             if content.startswith("```json"): content = content[7:]
             if content.endswith("```"): content = content[:-3]
             return json.loads(content.strip())
@@ -586,9 +612,9 @@ def judge_argument(statement: str, argument: str, debate_type: str = "main") -> 
     service = get_local_llm_service()
     return service.judge_argument(statement, argument, debate_type)
 
-def generate_debate_topic(articles_text: str) -> dict:
+def generate_debate_topic(articles_text: str, api_key: str, model_name: str) -> dict:
     service = get_local_llm_service()
-    return service.generate_debate_topic(articles_text)
+    return service.generate_debate_topic(articles_text, api_key, model_name)
 
 def conclude_debate(statement: str, winning_side: str, top_args: str) -> str:
     service = get_local_llm_service()

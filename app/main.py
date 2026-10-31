@@ -51,7 +51,8 @@ for _p in _ENV_CANDIDATES:
 # Read environment variables after attempting to load .env
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
 # Default batch size set to 20 per requirements
 SUMMARIZE_BATCH_SIZE = int(os.getenv("SUMMARIZE_BATCH_SIZE", "20"))
 
@@ -635,17 +636,17 @@ def summarize_text_if_possible(content, titles=None):
             return [None] * len(content)
 
 
-def call_groq_summarize(titles: List[str], texts: List[str]) -> List[str]:
+def call_gemini_summarize(titles: List[str], texts: List[str]) -> List[str]:
     """
     DEPRECATED: This function is no longer used.
     All summarization is now handled by LocalLLMService (Gemma-2-2b-it).
     
     This function remains for backward compatibility but should NOT be called.
-    Returns empty list immediately to prevent any accidental Groq API usage.
+    Returns empty list immediately because summarization is handled locally.
     """
-    print("[INFO]  WARNING: call_groq_summarize() called but is DISABLED!")
+    print("[INFO]  WARNING: call_gemini_summarize() called but is DISABLED!")
     print("   Summarization is now exclusively using LocalLLMService (Gemma-2-2b-it).")
-    print("   Returning empty list to prevent Groq API usage.")
+    print("   Returning empty list because local summarization is active.")
     return []
 
 
@@ -1783,18 +1784,18 @@ def fetch_recent_summarized_articles(limit: int = 50, created_after: str | None 
         return []
 
 
-def call_groq_generate_quiz_questions(articles: List[dict]) -> tuple[List[dict], set[str]]:
+def call_gemini_generate_quiz_questions(articles: List[dict]) -> tuple[List[dict], set[str]]:
     """
-    Generate UPSC-style quiz questions from summarized articles using Groq API.
+    Generate UPSC-style quiz questions from summarized articles using Gemini API.
     Returns a list of question objects with all required fields.
     """
-    # New behavior: call Groq once per article, send title + first 1500 chars of summary,
+    # New behavior: call Gemini once per article, send title + first 1500 chars of summary,
     # expect a single JSON object per response, and only keep results where is_relevant==True.
-    if not GROQ_API_KEY or not articles:
+    if not GEMINI_API_KEY or not articles:
         return [], set()
 
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {GEMINI_API_KEY}",
         "Content-Type": "application/json",
     }
 
@@ -1838,13 +1839,13 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> tuple[List[dict],
             user_content = f"Title: {title}\nSummary: {summary}"
 
             payload = {
-                "model": "openai/gpt-oss-120b",
+                "model": GEMINI_MODEL_NAME,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
                 "temperature": 0.25,
-                "max_tokens": 1024,
+                "max_tokens": 8192,
                 "response_format": {"type": "json_object"},
             }
 
@@ -1855,7 +1856,7 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> tuple[List[dict],
 
             while True:
                 resp = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
+                    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                     json=payload,
                     headers=headers,
                     timeout=120,
@@ -1869,7 +1870,7 @@ def call_groq_generate_quiz_questions(articles: List[dict]) -> tuple[List[dict],
                         # Expect a single JSON object
                         parsed = json.loads(content)
                         if not isinstance(parsed, dict):
-                            print(f"Groq response for '{title[:60]}' is not a JSON object. Skipping.")
+                            print(f"Gemini response for '{title[:60]}' is not a JSON object. Skipping.")
                             break
 
                         # If the model explicitly says it's not relevant, skip
@@ -1993,10 +1994,10 @@ def generate_daily_quiz_questions():
     a target number is met or a safety limit is reached.
     """
     print("[INFO]  Starting 'Fill the Bucket' daily quiz generation...")
-    if not GROQ_API_KEY:
-        print("[QUIZ] GROQ_API_KEY is missing; Groq question generation is unavailable.")
+    if not GEMINI_API_KEY:
+        print("[QUIZ] GEMINI_API_KEY is missing; Gemini question generation is unavailable.")
         return
-    print("[QUIZ] GROQ_API_KEY is configured.")
+    print(f"[QUIZ] Gemini API key is configured (model: {GEMINI_MODEL_NAME}).")
     client = supabase_client()
 
     target_questions = 60
@@ -2037,13 +2038,13 @@ def generate_daily_quiz_questions():
 
         print(f"[INFO]  Fetched {len(articles_to_process)} new articles to process...")
 
-        # 2. Generate questions from the batch (in smaller sub-batches for Groq)
-        groq_batch_size = 20
+        # 2. Generate questions from the batch (in smaller sub-batches for Gemini)
+        gemini_batch_size = 20
         generated_questions_in_batch = []
         successfully_processed_titles = set()
-        for i in range(0, len(articles_to_process), groq_batch_size):
-            sub_batch = articles_to_process[i:i + groq_batch_size]
-            generated, processed_titles = call_groq_generate_quiz_questions(sub_batch)
+        for i in range(0, len(articles_to_process), gemini_batch_size):
+            sub_batch = articles_to_process[i:i + gemini_batch_size]
+            generated, processed_titles = call_gemini_generate_quiz_questions(sub_batch)
             successfully_processed_titles.update(processed_titles)
             if generated:
                 generated_questions_in_batch.extend(generated)
@@ -2500,9 +2501,9 @@ def generate_daily_debate_topic():
         combined_text = "\n".join([f"- {a['title']}: {a['summary']}" for a in articles])
         article_ids = [str(a['id']) for a in articles]
 
-        # Call Local LLM
+        # Generate the debate topic through Gemini.
         from LocalLLMService import generate_debate_topic
-        topic_data = generate_debate_topic(combined_text)
+        topic_data = generate_debate_topic(combined_text, GEMINI_API_KEY, GEMINI_MODEL_NAME)
 
         if "statement" in topic_data:
             insert_res = client.table("debate_topics").insert({

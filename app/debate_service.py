@@ -109,6 +109,40 @@ async def get_public_debates():
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not load public debates: {exc}")
 
+@router.get("/private")
+async def get_private_debates():
+    """List active private rooms without requiring participant membership.
+
+    Access to a private room is still performed through its room code. This
+    listing is intentionally separate from participant authorization so the
+    app can render the room cards without evaluating recursive RLS policies.
+    """
+    from main import supabase_client
+    client = supabase_client()
+    try:
+        result = (client.table("debate_topics").select("*")
+                  .eq("debate_type", "private").eq("status", "active")
+                  .order("created_at", desc=True).execute())
+        return result.data or []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not load private debates: {exc}")
+
+@router.get("/topic/{topic_id}")
+async def get_debate_topic(topic_id: str):
+    """Read a debate topic for the voting screen using the backend client."""
+    from main import supabase_client
+    client = supabase_client()
+    try:
+        result = client.table("debate_topics").select("*").eq("id", topic_id).limit(1).execute()
+        topic = (result.data or [None])[0]
+        if not topic:
+            raise HTTPException(status_code=404, detail="Debate not found")
+        return topic
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not load debate: {exc}")
+
 @router.get("/room/{room_code}")
 async def get_private_room(room_code: str):
     from main import supabase_client
@@ -350,8 +384,11 @@ async def get_current_debate(user_id: str):
     active_debate = active_debates[0]
 
     # 2. Check if user has voted
-    vote_res = client.table("user_votes").select("id, side").eq("topic_id", active_debate["id"]).eq("user_id", user_id).execute()
-    user_votes = vote_res.data or []
+    if user_id == "guest":
+        user_votes = []
+    else:
+        vote_res = client.table("user_votes").select("id, side").eq("topic_id", active_debate["id"]).eq("user_id", user_id).execute()
+        user_votes = vote_res.data or []
     has_voted = len(user_votes) > 0
 
     # 3. Fetch community stats
