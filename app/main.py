@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from pathlib import Path as PPath
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from email.utils import parsedate_to_datetime
 import trafilatura
 from googlenewsdecoder import new_decoderv1
@@ -55,6 +56,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
 # Default batch size set to 20 per requirements
 SUMMARIZE_BATCH_SIZE = int(os.getenv("SUMMARIZE_BATCH_SIZE", "20"))
+INDIA_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 # Initialize LocalLLMService (Gemma-2-2b-it)
 try:
@@ -2491,6 +2493,18 @@ def generate_daily_debate_topic():
     print("[INFO]  [DEBATE] Generating new daily debate topic...")
     client = supabase_client()
     try:
+        # The generated row is the next calendar day's main debate.  It remains
+        # upcoming during the 11:50 PM–midnight preview window.
+        now_ist = datetime.now(INDIA_TIMEZONE)
+        next_date = now_ist.date() + timedelta(days=1)
+        start_local = datetime.combine(next_date, datetime.min.time(), tzinfo=INDIA_TIMEZONE)
+        end_local = start_local + timedelta(hours=23, minutes=50)
+        existing = (client.table("debate_topics").select("id")
+                    .eq("debate_type", "main").eq("status", "upcoming")
+                    .limit(1).execute())
+        if existing.data:
+            print("[DEBATE] An upcoming main debate already exists; skipping generation.")
+            return
         # Fetch Top 5 Indian Politics articles
         res = client.table("articles").select("title, summary, id").eq("category", "politics").eq("country", "IN").eq("summarized", True).order("created_at", desc=True).limit(5).execute()
         articles = res.data or []
@@ -2511,6 +2525,8 @@ def generate_daily_debate_topic():
                 "context": topic_data.get("context", ""),
                 "debate_type": "main",
                 "status": "upcoming",
+                "start_time": start_local.astimezone(timezone.utc).isoformat(),
+                "end_time": end_local.astimezone(timezone.utc).isoformat(),
                 "related_article_ids": article_ids
             }).execute()
             print(f"[SUCCESS]  [DEBATE] Generated upcoming debate: {topic_data['statement']}")
@@ -2519,8 +2535,6 @@ def generate_daily_debate_topic():
                 topic_id = (insert_res.data or [{}])[0].get("id")
             except Exception:
                 topic_id = None
-            if topic_id:
-                seed_debate_votes(topic_id, topic_data["statement"])
 
     except Exception as e:
         print(f"[ERROR]  [DEBATE] Error generating topic: {e}")
@@ -2529,7 +2543,7 @@ def manage_debate_lifecycle():
     print("[DEBATE] Managing debate lifecycles...")
     client = supabase_client()
     try:
-        now_iso = datetime.now().isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
 
         # 1. Check for expired active debates.
         expired_res = (
@@ -2637,42 +2651,26 @@ def manage_debate_lifecycle():
                 f"support_votes={support_count}, oppose_votes={oppose_count}"
             )
 
-        # 2. Check if we need to activate an upcoming debate.
-        active_res = (
-            client.table("debate_topics")
-            .select("id", count="exact")
-            .eq("status", "active")
-            .execute()
-        )
-        if active_res.count == 0:
-            upcoming_res = (
-                client.table("debate_topics")
-                .select("id, statement")
-                .eq("status", "upcoming")
-                .order("created_at")
-                .limit(1)
-                .execute()
-            )
-            if upcoming_res.data:
-                next_id = upcoming_res.data[0]["id"]
-                next_statement = upcoming_res.data[0].get("statement") or ""
-                start_time = datetime.now()
-                end_time = start_time + timedelta(hours=24)
-
-                client.table("debate_topics").update(
-                    {
-                        "status": "active",
-                        "start_time": start_time.isoformat(),
-                        "end_time": end_time.isoformat(),
-                    }
-                ).eq("id", next_id).execute()
-                print(f"[DEBATE] Activated new debate topic ID: {next_id} for 24 hours.")
-                seed_debate_votes(next_id, next_statement)
-            else:
-                generate_daily_debate_topic()
-
     except Exception as e:
         print(f"[DEBATE] Lifecycle error: {e}")
+
+
+def activate_next_main_debate():
+    """Activate the prepared main debate exactly at midnight India time."""
+    client = supabase_client()
+    try:
+        upcoming = (client.table("debate_topics").select("id, statement")
+                    .eq("debate_type", "main").eq("status", "upcoming")
+                    .order("start_time").limit(1).execute())
+        if not upcoming.data:
+            print("[DEBATE] No upcoming main debate to activate at midnight.")
+            return
+        topic = upcoming.data[0]
+        client.table("debate_topics").update({"status": "active"}).eq("id", topic["id"]).execute()
+        seed_debate_votes(topic["id"], topic.get("statement") or "")
+        print(f"[DEBATE] Activated main debate topic ID {topic['id']} at midnight IST.")
+    except Exception as e:
+        print(f"[DEBATE] Failed to activate the next main debate: {e}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -2850,8 +2848,8 @@ def get_category_news(
     return _fetch_prioritized_articles(client, base_query, page, page_size)
 
 
-# Configure scheduler with UTC timezone for consistency
-scheduler = BackgroundScheduler(timezone="UTC")
+# The main debate lifecycle follows its Indian audience's calendar.
+scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
 
 
 def heal_database_flags():
@@ -3111,9 +3109,12 @@ def schedule_jobs():
 
     # Register scheduled jobs
     try:
-        # Debates
-        scheduler.add_job(generate_daily_debate_topic, 'cron', hour=1, minute=0, id='gen_debate')
-        scheduler.add_job(manage_debate_lifecycle, 'interval', minutes=10, id='manage_debate')
+        # Main Arena: conclude at 11:50 PM, prepare the next preview, then
+        # activate it at midnight. The interval job still expires public/private rooms.
+        scheduler.add_job(manage_debate_lifecycle, 'cron', hour=23, minute=50, id='conclude_main_debate', replace_existing=True)
+        scheduler.add_job(generate_daily_debate_topic, 'cron', hour=23, minute=51, id='generate_main_debate', replace_existing=True)
+        scheduler.add_job(activate_next_main_debate, 'cron', hour=0, minute=0, id='activate_main_debate', replace_existing=True)
+        scheduler.add_job(manage_debate_lifecycle, 'interval', minutes=10, id='manage_debate', replace_existing=True)
         
         # Existing
         scheduler.add_job(smart_ingest_all_categories, "interval", hours=4, id="smart_ingest_job")

@@ -38,6 +38,20 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+_PROMPT_INJECTION_PATTERN = re.compile(
+    r"(?:ignore\s+all\s+previous|system\s+prompt|you\s+are\s+an\s+ai|"
+    r"forget\s+previous\s+instructions|output\s+your\s+instructions|sudo|"
+    r"write\s+(?:a\s+)?code|print\s+system|bypass)",
+    re.IGNORECASE,
+)
+_CODE_PATTERN = re.compile(r"```|\bdef\s+\w+\s*\(|\bfunction\s*\(|<script\b", re.IGNORECASE)
+
+
+def sanitize_user_input(text: str) -> bool:
+    """Return False when user text resembles prompt injection or executable code."""
+    value = text or ""
+    return not (_PROMPT_INJECTION_PATTERN.search(value) or _CODE_PATTERN.search(value))
+
 # Model configuration
 HF_REPO_ID = "bartowski/Meta-Llama-3-8B-Instruct-GGUF"
 MODEL_FILENAME = "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
@@ -217,6 +231,14 @@ class LocalLLMService:
         AI Judge function using local Llama-3-8B.
         Scores the argument 1-10 based on logic, facts, and lack of fallacies.
         """
+        if not sanitize_user_input(argument) or not sanitize_user_input(statement):
+            return {
+                "score": 1,
+                "feedback": "Argument rejected: Invalid or prohibited content detected.",
+                "key_factors": ["Violation of Terms"],
+                "detailed_analysis": "Argument rejected: Invalid or prohibited content detected.",
+            }
+
         self._check_model_loaded()
 
         if debate_type in {"public", "private"}:

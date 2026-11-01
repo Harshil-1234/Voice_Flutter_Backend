@@ -4,7 +4,7 @@ import datetime
 import random
 import string
 
-from LocalLLMService import judge_argument
+from LocalLLMService import judge_argument, sanitize_user_input
 
 # Initialize Router
 router = APIRouter(prefix="/debate", tags=["debate"])
@@ -109,19 +109,14 @@ async def get_public_debates():
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not load public debates: {exc}")
 
-@router.get("/private")
-async def get_private_debates():
-    """List active private rooms without requiring participant membership.
-
-    Access to a private room is still performed through its room code. This
-    listing is intentionally separate from participant authorization so the
-    app can render the room cards without evaluating recursive RLS policies.
-    """
+@router.get("/private/{user_id}")
+async def get_private_debates(user_id: str):
+    """List only active private rooms created by the requesting user."""
     from main import supabase_client
     client = supabase_client()
     try:
         result = (client.table("debate_topics").select("*")
-                  .eq("debate_type", "private").eq("status", "active")
+                  .eq("debate_type", "private").eq("created_by", user_id).eq("status", "active")
                   .order("created_at", desc=True).execute())
         return result.data or []
     except Exception as exc:
@@ -133,7 +128,7 @@ async def get_debate_topic(topic_id: str):
     from main import supabase_client
     client = supabase_client()
     try:
-        result = client.table("debate_topics").select("*").eq("id", topic_id).limit(1).execute()
+        result = client.table("debate_topics").select("*").eq("id", topic_id).neq("debate_type", "private").limit(1).execute()
         topic = (result.data or [None])[0]
         if not topic:
             raise HTTPException(status_code=404, detail="Debate not found")
@@ -149,7 +144,7 @@ async def get_private_room(room_code: str):
     client = supabase_client()
     try:
         result = (client.table("debate_topics").select("*")
-                  .eq("room_code", room_code.upper()).eq("status", "active")
+                  .eq("debate_type", "private").eq("room_code", room_code.upper()).eq("status", "active")
                   .limit(1).execute())
         topic = (result.data or [None])[0]
         if not topic:
@@ -233,6 +228,35 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
     from main import supabase_client
     client = supabase_client()
     clean_argument = (vote.argument_text or "").strip()
+    topic_res = client.table("debate_topics").select("statement, status").eq("id", vote.topic_id).execute()
+    if not topic_res.data:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    if topic_res.data[0].get("status") != "active":
+        raise HTTPException(status_code=409, detail="Voting is not open for this debate")
+
+    if clean_argument and not sanitize_user_input(clean_argument):
+        rejected_vote = {
+            "user_id": vote.user_id,
+            "topic_id": vote.topic_id,
+            "side": vote.side,
+            "argument_text": clean_argument,
+            "ai_score": 1,
+            "ai_feedback": "Argument rejected: Invalid or prohibited content detected.",
+            "hidden_feedback": None,
+            "ai_evaluated": True,
+            "is_anonymous": vote.is_anonymous,
+        }
+        insert_res = client.table("user_votes").insert(rejected_vote).execute()
+        vote_id = insert_res.data[0]["id"] if insert_res.data else ""
+        return VoteResponse(
+            vote_id=vote_id,
+            ai_score=1,
+            ai_feedback="Argument rejected: Invalid or prohibited content detected.",
+            key_factors=["Violation of Terms"],
+            xp_earned=0,
+            new_title=None,
+            ai_evaluated=True,
+        )
 
     # Fast path: no argument means no AI call.
     if not clean_argument:
@@ -262,9 +286,6 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
         )
 
     # Non-empty argument: insert pending vote and return immediately.
-    topic_res = client.table("debate_topics").select("statement").eq("id", vote.topic_id).execute()
-    if not topic_res.data:
-        raise HTTPException(status_code=404, detail="Topic not found")
     statement = topic_res.data[0]["statement"]
 
     vote_data = {
@@ -387,13 +408,17 @@ async def get_current_debate(user_id: str):
     if user_id == "guest":
         user_votes = []
     else:
-        vote_res = client.table("user_votes").select("id, side").eq("topic_id", active_debate["id"]).eq("user_id", user_id).execute()
+        vote_res = client.table("user_votes").select(
+            "id, user_id, side, argument_text, ai_score, ai_feedback, ai_evaluated, is_anonymous, created_at, profiles:user_id(display_name, full_name, current_title)"
+        ).eq("topic_id", active_debate["id"]).eq("user_id", user_id).limit(1).execute()
         user_votes = vote_res.data or []
     has_voted = len(user_votes) > 0
 
     # 3. Fetch community stats
     # Aggregating count and scores for community meter
-    all_votes_res = client.table("user_votes").select("side, ai_score, argument_text").eq("topic_id", active_debate["id"]).execute()
+    all_votes_res = client.table("user_votes").select(
+        "id, user_id, side, ai_score, ai_feedback, ai_evaluated, argument_text, is_anonymous, created_at, profiles:user_id(display_name, full_name, current_title)"
+    ).eq("topic_id", active_debate["id"]).order("ai_score", desc=True).execute()
     all_votes = all_votes_res.data or []
     
     support_score = 0
@@ -436,7 +461,9 @@ async def get_current_debate(user_id: str):
                 "support_vote_count": support_vote_count,
                 "oppose_vote_count": oppose_vote_count,
                 "top_support_args": top_support_args,
-                "top_oppose_args": top_oppose_args
+                "top_oppose_args": top_oppose_args,
+                "arguments": all_votes,
+                "user_vote": user_votes[0] if user_votes else None,
             }
         }
 
@@ -445,7 +472,7 @@ async def get_debate_history(user_id: str):
     from main import supabase_client
     client = supabase_client()
     
-    res = client.table("debate_topics").select("*").eq("status", "completed").order("end_time", desc=True).limit(10).execute()
+    res = client.table("debate_topics").select("*").eq("debate_type", "main").eq("status", "completed").order("end_time", desc=True).limit(10).execute()
     history = res.data or []
     if not history:
         return []
