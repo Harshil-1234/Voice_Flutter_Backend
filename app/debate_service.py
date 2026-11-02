@@ -409,7 +409,7 @@ async def get_current_debate(user_id: str):
         user_votes = []
     else:
         vote_res = client.table("user_votes").select(
-            "id, user_id, side, argument_text, ai_score, ai_feedback, ai_evaluated, is_anonymous, created_at, profiles:user_id(display_name, full_name, current_title)"
+            "id, user_id, side, argument_text, ai_score, ai_feedback, ai_evaluated, is_anonymous, created_at, profiles(display_name, full_name, current_title)"
         ).eq("topic_id", active_debate["id"]).eq("user_id", user_id).limit(1).execute()
         user_votes = vote_res.data or []
     has_voted = len(user_votes) > 0
@@ -417,7 +417,7 @@ async def get_current_debate(user_id: str):
     # 3. Fetch community stats
     # Aggregating count and scores for community meter
     all_votes_res = client.table("user_votes").select(
-        "id, user_id, side, ai_score, ai_feedback, ai_evaluated, argument_text, is_anonymous, created_at, profiles:user_id(display_name, full_name, current_title)"
+        "id, user_id, side, ai_score, ai_feedback, ai_evaluated, argument_text, is_anonymous, created_at, profiles(display_name, full_name, current_title)"
     ).eq("topic_id", active_debate["id"]).order("ai_score", desc=True).execute()
     all_votes = all_votes_res.data or []
     
