@@ -53,7 +53,21 @@ for _p in _ENV_CANDIDATES:
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# The deployed environment currently provides Groq credentials. Select the
+# endpoint from the credential instead of sending a Groq key to Gemini.
+AI_API_KEY = GEMINI_API_KEY or GROQ_API_KEY
+AI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    if GEMINI_API_KEY
+    else "https://api.groq.com/openai/v1/chat/completions"
+)
+AI_MODEL_NAME = (
+    os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
+    if GEMINI_API_KEY
+    else os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")
+)
+os.environ.setdefault("LLM_API_BASE_URL", AI_API_URL)
 # Default batch size set to 20 per requirements
 SUMMARIZE_BATCH_SIZE = int(os.getenv("SUMMARIZE_BATCH_SIZE", "20"))
 INDIA_TIMEZONE = ZoneInfo("Asia/Kolkata")
@@ -1770,17 +1784,17 @@ def fetch_recent_summarized_articles(limit: int = 50, created_after: str | None 
     ]
     
     try:
-        query = (
-            client.table("articles")
-            .select("id, title, summary, category") # Select only needed columns
-            .eq("summarized", True)
-            .eq("quiz_generated", False) # Only fetch articles not yet processed
-            .in_("category", relevant_categories)
-        )
+        # Do not filter quiz_generated in PostgREST: old article rows may have
+        # NULL because the column was introduced after ingestion started.
+        query = (client.table("articles")
+                 .select("id, title, summary, category, quiz_generated")
+                 .eq("summarized", True)
+                 .in_("category", relevant_categories))
         if created_after:
             query = query.gte("created_at", created_after)
         result = query.order("created_at", desc=True).limit(limit).execute()
-        return result.data or []
+        return [row for row in (result.data or [])
+                if row.get("quiz_generated") is not True]
     except Exception as e:
         print(f"Error fetching summarized articles for quiz: {e}")
         return []
@@ -1793,11 +1807,34 @@ def call_gemini_generate_quiz_questions(articles: List[dict]) -> tuple[List[dict
     """
     # New behavior: call Gemini once per article, send title + first 1500 chars of summary,
     # expect a single JSON object per response, and only keep results where is_relevant==True.
-    if not GEMINI_API_KEY or not articles:
+    if not articles:
         return [], set()
 
+    if not AI_API_KEY:
+        # Production deployments may intentionally run without a hosted API
+        # key. Use the already-loaded local model instead of silently producing
+        # no quiz at all.
+        local_results: List[dict] = []
+        processed: set[str] = set()
+        for article in articles:
+            title = article.get("title", "") or ""
+            try:
+                from LocalLLMService import generate_quiz_question
+                question = generate_quiz_question(title, article.get("summary", "") or "")
+                if question.get("is_relevant") is False:
+                    processed.add(title)
+                    continue
+                if question:
+                    question["source_article_title"] = title
+                    question["source_article_id"] = article.get("id")
+                    local_results.append(question)
+                    processed.add(title)
+            except Exception as exc:
+                print(f"[QUIZ] Local question generation failed for '{title[:60]}': {exc}")
+        return local_results, processed
+
     headers = {
-        "Authorization": f"Bearer {GEMINI_API_KEY}",
+        "Authorization": f"Bearer {AI_API_KEY}",
         "Content-Type": "application/json",
     }
 
@@ -1841,7 +1878,7 @@ def call_gemini_generate_quiz_questions(articles: List[dict]) -> tuple[List[dict
             user_content = f"Title: {title}\nSummary: {summary}"
 
             payload = {
-                "model": GEMINI_MODEL_NAME,
+                "model": AI_MODEL_NAME,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
@@ -1858,7 +1895,7 @@ def call_gemini_generate_quiz_questions(articles: List[dict]) -> tuple[List[dict
 
             while True:
                 resp = requests.post(
-                    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                    AI_API_URL,
                     json=payload,
                     headers=headers,
                     timeout=120,
@@ -1996,13 +2033,13 @@ def generate_daily_quiz_questions():
     a target number is met or a safety limit is reached.
     """
     print("[INFO]  Starting 'Fill the Bucket' daily quiz generation...")
-    if not GEMINI_API_KEY:
-        print("[QUIZ] GEMINI_API_KEY is missing; Gemini question generation is unavailable.")
-        return
-    print(f"[QUIZ] Gemini API key is configured (model: {GEMINI_MODEL_NAME}).")
+    if AI_API_KEY:
+        print(f"[QUIZ] Hosted quiz model configured (model: {AI_MODEL_NAME}).")
+    else:
+        print("[QUIZ] GEMINI_API_KEY is not configured; using the local quiz model.")
     client = supabase_client()
 
-    target_questions = 60
+    target_questions = 50
     total_generated = 0
     max_articles_to_scan = 1000
     articles_scanned = 0
@@ -2114,6 +2151,18 @@ def _build_fallback_seed_votes(statement: str, count: int) -> List[Dict]:
             }
         )
     return votes
+
+
+def _score_seed_argument(statement: str, argument_text: str) -> int:
+    """Score a bot argument with the same rubric used for human arguments."""
+    try:
+        if llm_service is not None and hasattr(llm_service, "judge_argument"):
+            result = llm_service.judge_argument(statement, argument_text, "main") or {}
+            return max(1, min(10, int(result.get("score", 5))))
+    except Exception as exc:
+        print(f"[DEBATE] Bot argument scoring failed; using fallback score: {exc}")
+    words = len(argument_text.split())
+    return max(3, min(7, 3 + (1 if words >= 12 else 0) + (1 if words >= 24 else 0)))
 
 
 def _extract_auth_user_id(resp) -> Optional[str]:
@@ -2315,6 +2364,36 @@ def initialize_bot_profiles(client=None) -> List[str]:
     return ready_ids
 
 
+def heal_debate_schedule(client=None) -> int:
+    """Repair active/upcoming debate rows that predate the date columns."""
+    local_client = client or supabase_client()
+    repaired = 0
+    try:
+        rows = (local_client.table("debate_topics").select("id, status, created_at, start_time, end_time")
+                .in_("status", ["active", "upcoming"]).execute()).data or []
+        for row in rows:
+            if row.get("start_time") and row.get("end_time"):
+                continue
+            created = row.get("created_at")
+            try:
+                start = datetime.fromisoformat(str(created).replace("Z", "+00:00")) if created else datetime.now(timezone.utc)
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+            except Exception:
+                start = datetime.now(timezone.utc)
+            end = start + timedelta(hours=24)
+            local_client.table("debate_topics").update({
+                "start_time": start.isoformat(),
+                "end_time": end.isoformat(),
+            }).eq("id", row["id"]).execute()
+            repaired += 1
+        if repaired:
+            print(f"[DEBATE] Repaired schedule dates on {repaired} debate row(s).")
+    except Exception as exc:
+        print(f"[DEBATE] Schedule healing failed: {exc!r}")
+    return repaired
+
+
 def _apply_seed_bot_xp(client, inserted_rows: List[Dict]) -> None:
     """
     Apply debate XP/title progression to seed bots using the same formula as normal users.
@@ -2380,7 +2459,7 @@ def _apply_seed_bot_xp(client, inserted_rows: List[Dict]) -> None:
             print(f"[DEBATE] Failed to update bot XP/title for id={bot_id}.")
 
 
-def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_votes: int = 20) -> int:
+def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 20, max_votes: int = 20) -> int:
     """
     Seed a new debate with synthetic average-quality votes so the thread is not empty at launch.
     Uses local LLM first; falls back to template-based arguments when needed.
@@ -2392,13 +2471,11 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
     target_votes = random.randint(min_votes, max_votes)
 
     try:
-        existing_res = (
-            client.table("user_votes")
-            .select("id", count="exact")
-            .eq("topic_id", topic_id)
-            .execute()
-        )
-        existing_count = existing_res.count or 0
+        existing_res = (client.table("user_votes")
+                        .select("id,user_id")
+                        .eq("topic_id", topic_id).execute())
+        existing_rows = existing_res.data or []
+        existing_count = len(existing_rows)
     except Exception:
         existing_count = 0
 
@@ -2410,29 +2487,34 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
     if needed <= 0:
         return 0
 
-    bot_ids = get_bot_profile_ids(client)
+    used_user_ids = {str(row.get("user_id")) for row in existing_rows if row.get("user_id")}
+    bot_ids = [bot_id for bot_id in get_bot_profile_ids(client) if bot_id not in used_user_ids]
     if not bot_ids:
         print("[DEBATE] No existing bot profiles found. Initializing bot accounts...")
         initialize_bot_profiles(client)
-        bot_ids = get_bot_profile_ids(client)
+        bot_ids = [bot_id for bot_id in get_bot_profile_ids(client) if bot_id not in used_user_ids]
     if not bot_ids:
         print("[DEBATE] No valid bot profile IDs available; skipping seed votes.")
         return 0
 
+    random.shuffle(bot_ids)
+    target_total = min(needed, len(bot_ids))
     synthetic_votes: List[Dict] = []
     try:
         if llm_service is not None and hasattr(llm_service, "generate_seed_debate_votes"):
             # Llama-3 prompt-backed synthetic vote generation.
-            synthetic_votes = llm_service.generate_seed_debate_votes(statement, needed) or []
+            synthetic_votes = llm_service.generate_seed_debate_votes(statement, target_total) or []
     except Exception as e:
         print(f"[ERROR]  [DEBATE] LLM seed generation failed: {e}")
         synthetic_votes = []
 
-    if len(synthetic_votes) < needed:
-        synthetic_votes = (synthetic_votes or []) + _build_fallback_seed_votes(statement, needed)
+    if len(synthetic_votes) < target_total:
+        synthetic_votes = (synthetic_votes or []) + _build_fallback_seed_votes(
+            statement, target_total - len(synthetic_votes)
+        )
 
     rows = []
-    for item in synthetic_votes[:needed]:
+    for item in synthetic_votes[:target_total]:
         side = str(item.get("side", "")).strip().lower()
         if side not in {"support", "oppose"}:
             side = "support" if (len(rows) % 2 == 0) else "oppose"
@@ -2442,12 +2524,15 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
             continue
 
         try:
-            ai_score = int(item.get("score", 6))
+            ai_score = int(item.get("score", _score_seed_argument(statement, argument_text)))
         except Exception:
             ai_score = 6
         ai_score = max(4, min(7, ai_score))
 
-        bot_id = random.choice(bot_ids)
+        # Pop guarantees one distinct profile per seeded argument.
+        if not bot_ids:
+            break
+        bot_id = bot_ids.pop()
         rows.append(
             {
                 "user_id": bot_id,
@@ -2455,7 +2540,7 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 15, max_vo
                 "side": side,
                 "argument_text": argument_text[:320],
                 "ai_score": ai_score,
-                "ai_feedback": "Community seed vote",
+                "ai_feedback": "Community seed vote (auto-judged)",
                 "ai_evaluated": True,
             }
         )
@@ -2493,6 +2578,7 @@ def generate_daily_debate_topic():
     print("[INFO]  [DEBATE] Generating new daily debate topic...")
     client = supabase_client()
     try:
+        heal_debate_schedule(client)
         # Go live immediately and keep the main arena active for 24 hours.
         now_utc = datetime.now(timezone.utc)
         end_utc = now_utc + timedelta(hours=24)
@@ -2502,23 +2588,33 @@ def generate_daily_debate_topic():
         if existing.data:
             print("[DEBATE] An active main debate already exists; skipping generation.")
             return
-        # Fetch Top 5 Indian Politics articles
-        res = client.table("articles").select("title, summary, id").eq("category", "politics").eq("country", "IN").eq("summarized", True).order("created_at", desc=True).limit(5).execute()
+        # Do not require a particular country spelling. Older ingestion rows use
+        # both `IN`, `in`, and sometimes leave country empty.
+        res = (client.table("articles").select("title, summary, id")
+               .eq("category", "politics").eq("summarized", True)
+               .order("created_at", desc=True).limit(5).execute())
         articles = res.data or []
         if not articles:
-            print("[INFO]  [DEBATE] Not enough IN politics articles to generate a debate.")
-            return
+            # A missing article batch must not leave the arena without a topic.
+            # The LLM has a safe fallback statement, so generation can continue.
+            print("[WARN]  [DEBATE] No summarized politics articles; using fallback source text.")
+            articles = [{
+                "id": None,
+                "title": "Current public policy and governance priorities in India",
+                "summary": "A daily policy discussion should balance effective implementation, accountability, public welfare, and institutional safeguards.",
+            }]
 
         combined_text = "\n".join([f"- {a['title']}: {a['summary']}" for a in articles])
         article_ids = [str(a['id']) for a in articles]
 
         # Generate the debate topic through Gemini.
         from LocalLLMService import generate_debate_topic
-        topic_data = generate_debate_topic(combined_text, GEMINI_API_KEY, GEMINI_MODEL_NAME)
+        topic_data = generate_debate_topic(combined_text, AI_API_KEY, AI_MODEL_NAME)
 
-        if "statement" in topic_data:
+        statement = str(topic_data.get("statement") or "").strip()
+        if statement:
             insert_res = client.table("debate_topics").insert({
-                "statement": topic_data["statement"],
+                "statement": statement,
                 "context": topic_data.get("context", ""),
                 "debate_type": "main",
                 "status": "active",
@@ -2526,7 +2622,7 @@ def generate_daily_debate_topic():
                 "end_time": end_utc.isoformat(),
                 "related_article_ids": article_ids
             }).execute()
-            print(f"[SUCCESS]  [DEBATE] Generated active debate: {topic_data['statement']}")
+            print(f"[SUCCESS]  [DEBATE] Generated active debate: {statement}")
             topic_id = None
             try:
                 topic_id = (insert_res.data or [{}])[0].get("id")
@@ -2534,7 +2630,7 @@ def generate_daily_debate_topic():
                 topic_id = None
             if topic_id:
                 # Seed bot arguments before the newly active arena is visible.
-                seed_debate_votes(str(topic_id), topic_data["statement"])
+                seed_debate_votes(str(topic_id), statement, min_votes=20, max_votes=20)
             else:
                 print("[DEBATE] New main debate was created without a returned id; bot seeding skipped.")
 
@@ -2681,7 +2777,12 @@ def activate_next_main_debate():
             print("[DEBATE] No upcoming main debate to activate at midnight.")
             return
         topic = upcoming.data[0]
-        client.table("debate_topics").update({"status": "active"}).eq("id", topic["id"]).execute()
+        now_utc = datetime.now(timezone.utc)
+        client.table("debate_topics").update({
+            "status": "active",
+            "start_time": now_utc.isoformat(),
+            "end_time": (now_utc + timedelta(hours=24)).isoformat(),
+        }).eq("id", topic["id"]).execute()
         seed_debate_votes(topic["id"], topic.get("statement") or "")
         print(f"[DEBATE] Activated main debate topic ID {topic['id']} at midnight IST.")
     except Exception as e:
@@ -2772,6 +2873,19 @@ def trigger_quiz_notification():
         return {"status": "sent", "message": "Daily quiz notification triggered."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.post("/admin/generate-quiz")
+def trigger_quiz_generation():
+    """Run quiz generation on demand for deployment verification/recovery."""
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        ThreadPoolExecutor(max_workers=1).submit(generate_daily_quiz_questions)
+        return {"status": "started", "message": "Quiz generation started in the background."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not start quiz generation: {e}")
 
 
 @app.get("/admin/scheduler-status")
@@ -2990,13 +3104,27 @@ def send_daily_quiz_notification():
 
 @app.on_event("startup")
 def schedule_jobs():
+    # Startup can be invoked more than once by reloaders. Always rebuild one
+    # deterministic job set instead of accumulating duplicate debate/quiz jobs.
+    if scheduler.running:
+        scheduler.remove_all_jobs()
     # Heal inconsistent DB flags on startup
     heal_database_flags()
+    heal_debate_schedule()
     # Ensure debate bot profiles exist before any seeded debate votes are generated.
     try:
         initialize_bot_profiles()
     except Exception as e:
         print(f"[DEBATE] Bot profile initialization at startup failed: {e}")
+
+    # Repair or create the main arena immediately; do not wait for the first
+    # nightly cron tick after a deployment.
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        ThreadPoolExecutor(max_workers=2).submit(generate_daily_debate_topic)
+        ThreadPoolExecutor(max_workers=2).submit(generate_daily_quiz_questions)
+    except Exception as e:
+        print(f"[STARTUP] Immediate debate/quiz generation submission failed: {e}")
 
     # Run news ingestion immediately on startup, then every 15 minutes
     scheduler.add_job(smart_ingest_all_categories, "interval", minutes=15, id="ingest_news", replace_existing=True)
@@ -3122,32 +3250,24 @@ def schedule_jobs():
         except Exception as e:
             print(f"[ERROR]  Failed to start APScheduler: {e}")
 
-    # Register scheduled jobs
-    try:
-        # 11:00 PM IST is 17:30 UTC. One ordered job concludes the old arena,
-        # creates the new one with a 24-hour end time, and immediately seeds bots.
-        scheduler.add_job(
-            run_daily_main_debate_cycle,
-            'cron',
-            hour=17,
-            minute=30,
-            timezone='UTC',
-            id='daily_main_debate_rollover',
-            replace_existing=True,
-        )
-        scheduler.add_job(manage_debate_lifecycle, 'interval', minutes=10, id='manage_debate', replace_existing=True)
-        
-        # Existing
-        scheduler.add_job(smart_ingest_all_categories, "interval", hours=4, id="smart_ingest_job")
-        # Notice: removed duplicate summarize_round_robin_job since we have summarize_rr above
-        scheduler.add_job(generate_daily_quiz_questions, "cron", hour=2, minute=0, id="daily_quiz_gen_job")
-        scheduler.add_job(send_daily_news_notification, 'cron', hour=8, minute=0, id="daily_news_push")
-        scheduler.add_job(generate_daily_riddle, 'cron', hour=3, minute=0, id="daily_riddle_gen")
-        scheduler.add_job(send_daily_quiz_notification, 'cron', hour=12, minute=0, id="daily_quiz_push")
-        
-        print("[SUCCESS]  Scheduled jobs configured successfully")
-    except Exception as e:
-        print(f"[ERROR]  Error configuring scheduled jobs: {e}")
+    # Debate lifecycle jobs are registered exactly once here.
+    scheduler.add_job(
+        run_daily_main_debate_cycle,
+        "cron",
+        hour=17,
+        minute=30,
+        timezone="UTC",
+        id="daily_main_debate_rollover",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        manage_debate_lifecycle,
+        "interval",
+        minutes=10,
+        id="manage_debate",
+        replace_existing=True,
+    )
+    print("[SUCCESS]  Scheduled jobs configured successfully")
 
 
 @app.on_event("shutdown")

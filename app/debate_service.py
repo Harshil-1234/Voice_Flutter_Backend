@@ -39,7 +39,7 @@ class CreateDebateRequest(BaseModel):
 
 
 @router.post("/create")
-async def create_debate(request: CreateDebateRequest):
+async def create_debate(request: CreateDebateRequest, background_tasks: BackgroundTasks):
     if request.debate_type not in {"public", "private"}:
         raise HTTPException(status_code=422, detail="debate_type must be public or private")
     from main import supabase_client
@@ -79,12 +79,19 @@ async def create_debate(request: CreateDebateRequest):
         print(f"[ERROR] Supabase debate_topics insert failed: {exc!r}")
         raise HTTPException(status_code=500, detail=f"Could not create debate: {exc}")
     if request.debate_type == "public":
-        try:
-            from main import seed_debate_votes
-            seed_debate_votes(str(created["id"]), created["statement"], min_votes=5, max_votes=10)
-        except Exception as exc:
-            print(f"[DEBATE] Public room vote seeding failed: {exc}")
+        # Seeding uses the local model and must not hold the create request open.
+        # The debate is already persisted and immediately usable while this runs.
+        background_tasks.add_task(_seed_created_debate, str(created["id"]), created["statement"])
     return created
+
+
+def _seed_created_debate(topic_id: str, statement: str) -> None:
+    try:
+        from main import seed_debate_votes
+        inserted = seed_debate_votes(topic_id, statement, min_votes=5, max_votes=10)
+        print(f"[DEBATE] Background seed finished for {topic_id}: {inserted} votes")
+    except Exception as exc:
+        print(f"[DEBATE] Background public-room vote seeding failed for {topic_id}: {exc!r}")
 
 @router.get("/public")
 async def get_public_debates():
@@ -122,21 +129,107 @@ async def get_private_debates(user_id: str):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not load private debates: {exc}")
 
+def _build_topic_state(client, topic: dict, user_id: str) -> dict:
+    topic_id = str(topic.get("id") or "")
+    user_vote = None
+    if topic_id and user_id and user_id != "guest":
+        vote_result = (client.table("user_votes")
+                       .select("id, user_id, topic_id, side, argument_text, ai_score, ai_feedback, ai_evaluated, is_anonymous, created_at, profiles(display_name, full_name, current_title)")
+                       .eq("topic_id", topic_id).eq("user_id", user_id).limit(1).execute())
+        user_vote = (vote_result.data or [None])[0]
+
+    all_votes_result = (client.table("user_votes")
+                        .select("id, user_id, topic_id, side, ai_score, ai_feedback, ai_evaluated, argument_text, is_anonymous, created_at, profiles(display_name, full_name, current_title)")
+                        .eq("topic_id", topic_id).order("created_at", desc=True).limit(200).execute())
+    all_votes = all_votes_result.data or []
+
+    def vote_score(v):
+        try:
+            return int(v.get("ai_score") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    # The UI consumes this list directly. Keep the contract deterministic even
+    # when PostgREST returns NULL scores before AI evaluation completes.
+    all_votes.sort(key=vote_score, reverse=True)
+    support = [v for v in all_votes if str(v.get("side") or "").lower() == "support"]
+    oppose = [v for v in all_votes if str(v.get("side") or "").lower() == "oppose"]
+
+    top_support = [v for v in sorted(support, key=vote_score, reverse=True) if (v.get("argument_text") or "").strip()][:3]
+    top_oppose = [v for v in sorted(oppose, key=vote_score, reverse=True) if (v.get("argument_text") or "").strip()][:3]
+    has_voted = user_vote is not None
+    return {
+        "debate": topic,
+        "has_voted": has_voted,
+        "user_vote": user_vote,
+        # Keep blind voting, but never hide state after the user has voted.
+        "stats": {
+            "support_score": sum(vote_score(v) for v in support),
+            "oppose_score": sum(vote_score(v) for v in oppose),
+            "support_vote_count": len(support),
+            "oppose_vote_count": len(oppose),
+            "top_support_args": top_support,
+            "top_oppose_args": top_oppose,
+            "arguments": all_votes,
+            "user_vote": user_vote,
+        } if has_voted else None,
+    }
+
+
 @router.get("/topic/{topic_id}")
-async def get_debate_topic(topic_id: str):
-    """Read a debate topic for the voting screen using the backend client."""
+async def get_debate_topic(topic_id: str, user_id: str = "guest"):
+    """Return topic and viewer-specific state using the service-role backend client."""
     from main import supabase_client
     client = supabase_client()
     try:
-        result = client.table("debate_topics").select("*").eq("id", topic_id).neq("debate_type", "private").limit(1).execute()
+        result = client.table("debate_topics").select("*").eq("id", topic_id).limit(1).execute()
         topic = (result.data or [None])[0]
         if not topic:
             raise HTTPException(status_code=404, detail="Debate not found")
-        return topic
+        return _build_topic_state(client, topic, user_id)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not load debate: {exc}")
+
+
+@router.get("/state/{topic_id}/{user_id}")
+async def get_debate_state(topic_id: str, user_id: str):
+    """Fetch a known public/private debate and all viewer-specific vote state."""
+    from main import supabase_client
+    client = supabase_client()
+    try:
+        result = client.table("debate_topics").select("*").eq("id", topic_id).limit(1).execute()
+        topic = (result.data or [None])[0]
+        if not topic:
+            raise HTTPException(status_code=404, detail="Debate not found")
+        return _build_topic_state(client, topic, user_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not load debate state: {exc}")
+
+
+@router.get("/stats/{topic_id}/{user_id}")
+async def get_debate_stats(topic_id: str, user_id: str):
+    from main import supabase_client
+    client = supabase_client()
+    try:
+        result = client.table("debate_topics").select("*").eq("id", topic_id).limit(1).execute()
+        topic = (result.data or [None])[0]
+        if not topic:
+            raise HTTPException(status_code=404, detail="Debate not found")
+        state = _build_topic_state(client, topic, user_id)
+        return state.get("stats") or {
+            "support_score": 0, "oppose_score": 0,
+            "support_vote_count": 0, "oppose_vote_count": 0,
+            "top_support_args": [], "top_oppose_args": [],
+            "arguments": [], "user_vote": None,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not load debate stats: {exc}")
 
 @router.get("/room/{room_code}")
 async def get_private_room(room_code: str):

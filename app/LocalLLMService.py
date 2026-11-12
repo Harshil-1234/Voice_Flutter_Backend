@@ -367,7 +367,10 @@ Respond ONLY with this JSON structure:
             for attempt in range(len(backoffs) + 1):
                 try:
                     response = requests.post(
-                        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                        os.getenv(
+                            "LLM_API_BASE_URL",
+                            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                        ),
                         json=payload,
                         headers=headers,
                         timeout=120,
@@ -614,6 +617,43 @@ Do not use JSON. Write plain text."""
             logger.error(f"Error generating synthetic debate votes: {e}")
             return []
 
+    def generate_quiz_question(self, title: str, summary: str) -> Dict:
+        """Generate one validated four-option current-affairs question locally."""
+        if not title or not summary:
+            return {}
+        self._check_model_loaded()
+        prompt = (
+            "Create one UPSC-style current affairs MCQ from the article below. "
+            "Return only JSON with keys: is_relevant (boolean), topic, question_text, "
+            "options (exactly four strings), correct_option_index (0-3), explanation. "
+            "Reject entertainment, sports, partisan gossip, and trivial news with "
+            "is_relevant false.\n\n"
+            f"Title: {title}\nSummary: {summary[:1800]}"
+        )
+        try:
+            with self.lock:
+                response = self.model.create_chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    top_p=0.9,
+                    max_tokens=700,
+                    response_format={"type": "json_object"},
+                )
+            content = response["choices"][0]["message"]["content"].strip()
+            content = content.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(content)
+            options = parsed.get("options") if isinstance(parsed, dict) else None
+            if not isinstance(options, list) or len(options) != 4:
+                return {}
+            index = int(parsed.get("correct_option_index", -1))
+            if index not in range(4) or not parsed.get("question_text") or not parsed.get("explanation"):
+                return {}
+            parsed["correct_option_index"] = index
+            return parsed
+        except Exception as e:
+            logger.error(f"Error generating local quiz question: {e}")
+            return {}
+
 
 # Convenience functions
 _service = None
@@ -653,4 +693,8 @@ def summarize_live_source(topic: str, headline: str, source_text: str) -> str:
 def generate_seed_debate_votes(statement: str, count: int = 15) -> List[Dict]:
     service = get_local_llm_service()
     return service.generate_seed_debate_votes(statement, count)
+
+def generate_quiz_question(title: str, summary: str) -> Dict:
+    service = get_local_llm_service()
+    return service.generate_quiz_question(title, summary)
 
