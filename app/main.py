@@ -1987,7 +1987,9 @@ def insert_quiz_questions(questions: List[dict]) -> int:
                 "explanation": q.get("explanation", ""),
                 "topic": (q.get("topic") or "General").title(),
                 "difficulty": (q.get("difficulty") or "medium").lower(),
-                "source_article_id": q.get("source_article_id"),
+                # General-knowledge questions are intentionally independent
+                # of news articles.
+                "source_article_id": None,
                 "is_active": True,
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat()
@@ -2015,7 +2017,11 @@ def insert_quiz_questions(questions: List[dict]) -> int:
         
         for i in range(0, len(rows), batch_size):
             batch = rows[i:i + batch_size]
-            result = client.table("quiz_questions").insert(batch).execute()
+            # question_text is unique in the production schema.  Let Supabase
+            # ignore a race with another generator instead of duplicating it.
+            result = (client.table("quiz_questions")
+                      .upsert(batch, on_conflict="question_text",
+                              ignore_duplicates=True).execute())
             inserted_count += len(result.data or [])
         
         print(f"Successfully inserted {inserted_count} quiz questions")
@@ -2027,98 +2033,96 @@ def insert_quiz_questions(questions: List[dict]) -> int:
 
 
 def generate_daily_quiz_questions():
-    """
-    Main function to generate daily UPSC-style quiz questions using a 'Fill the Bucket' loop.
-    It iteratively fetches batches of unprocessed articles and generates questions until
-    a target number is met or a safety limit is reached.
-    """
-    print("[INFO]  Starting 'Fill the Bucket' daily quiz generation...")
-    if AI_API_KEY:
-        print(f"[QUIZ] Hosted quiz model configured (model: {AI_MODEL_NAME}).")
-    else:
-        print("[QUIZ] GEMINI_API_KEY is not configured; using the local quiz model.")
+    """Generate a fresh, news-independent daily pool of general-knowledge MCQs."""
+    print("[INFO] Starting daily General Knowledge quiz generation.")
+    if not AI_API_KEY:
+        print("[QUIZ] No hosted AI key configured; GK generation skipped.")
+        return
+
     client = supabase_client()
+    existing = client.table("quiz_questions").select("question_text").order(
+        "created_at", desc=True).limit(1000).execute()
+    known_questions = {
+        str(row.get("question_text", "")).strip().casefold()
+        for row in (existing.data or [])
+    }
+    topic_pool = [
+        "World Geography", "Food & Cuisine", "Human Biology", "Ancient History",
+        "Inventions", "National Animals & Nature", "Space & Science", "Sports",
+        "Pop Culture", "Literature", "Music", "Technology",
+    ]
+    system_prompt = (
+        "You are an elite, world-class Quizmaster. Your task is to generate highly engaging, "
+        "factually 100% accurate General Knowledge (GK) multiple-choice questions for a wide audience.\n\n"
+        "### PHASE 1: TOPIC DIVERSITY & DIFFICULTY\n"
+        "1. **Broad Appeal:** Generate questions across diverse everyday and academic topics: "
+        "World Geography (Capitals, Rivers), Nature (National Animals, Flora), Food & Culture (Dish ingredients, Origins), "
+        "General Science & Tech, History, Sports, and Pop Culture.\n"
+        "2. **Difficulty Mix:** Every batch must contain a balanced mix of 'easy' (everyone should know), "
+        "'medium' (requires some thought), and 'hard' (tricky trivia) questions.\n"
+        "3. **Standalone Facts:** Questions must be timeless General Knowledge. Do not reference 'recent news articles' or 'today's reports'.\n\n"
+        "### PHASE 2: QUESTION & OPTION RULES (STRICT)\n"
+        "1. **Clear Question Stem:** Write direct, engaging questions (e.g., 'Which country has the unicorn as its national animal?', "
+        "'What is the primary ingredient in traditional Middle Eastern hummus?').\n"
+        "2. **Clean Options:** Provide exactly 4 plausible options. The `options` array must contain ONLY the answer text. "
+        "**NEVER** include prefixes like 'A)', 'B.', '1.', or '(a)'.\n"
+        "   - GOOD: ['Chickpeas', 'Lentils', 'Black Beans', 'Soybeans']\n"
+        "   - BAD: ['A) Chickpeas', 'B) Lentils', 'C) Black Beans', 'D) Soybeans']\n"
+        "3. **Unambiguous Truth:** Ensure there is only ONE undeniably correct answer among the 4 options.\n\n"
+        "### PHASE 3: SHUFFLE-PROOF EXPLANATIONS\n"
+        "The app shuffles options randomly for each user. Therefore, your explanation must be **Position-Agnostic**:\n"
+        "1. **NEVER** refer to 'Option A', 'Option B', 'The first choice', etc.\n"
+        "2. **ALWAYS** state the correct answer explicitly by name and share a fun, educational fact about it.\n"
+        "   - GOOD: 'Chickpeas (garbanzo beans) are the main ingredient in hummus, blended with tahini, lemon juice, and garlic.'\n"
+        "   - BAD: 'Option A is correct because it is the main ingredient.'\n\n"
+        "### OUTPUT JSON FORMAT\n"
+        "Return ONLY a valid JSON object containing a 'questions' array. Each object must have these exact keys:\n"
+        "- question_text (String)\n- options (Array of 4 strings, NO PREFIXES)\n"
+        "- correct_option (Integer 0-3, pointing to the exact index of the correct string in your options array)\n"
+        "- explanation (String: Clear, fun, position-agnostic fact)\n"
+        "- topic (String: e.g., 'Geography', 'Food & Culture', 'Science', 'History', 'Nature', 'Sports')\n"
+        "- difficulty (String: 'easy', 'medium', or 'hard' - LOWERCASE ONLY)\n"
+        "- source_article_title (String: Set this to 'General Knowledge' for all items)\n"
+    )
 
-    target_questions = 50
-    total_generated = 0
-    max_articles_to_scan = 1000
-    articles_scanned = 0
-    
-    # Use a set to keep track of titles processed in this run to avoid reprocessing
-    processed_titles_in_run = set()
-    fetch_window = datetime.now(timezone.utc) - timedelta(hours=24)
-    fallback_window = datetime.now(timezone.utc) - timedelta(days=3)
-    using_fallback_window = False
-
-    while total_generated < target_questions and articles_scanned < max_articles_to_scan:
-        print(f"--- Iteration: {total_generated}/{target_questions} questions generated, {articles_scanned}/{max_articles_to_scan} articles scanned ---")
-
-        # 1. Fetch a new batch of unprocessed articles (increased batch size)
-        articles_batch = fetch_recent_summarized_articles(
-            limit=100,
-            created_after=(fallback_window if using_fallback_window else fetch_window).isoformat(),
+    generated_total = 0
+    for batch_number in range(3):
+        focus_topics = random.sample(topic_pool, k=random.randint(5, 10))
+        user_prompt = (
+            f"Generate 20 fresh GK questions. Focus this batch on: {', '.join(focus_topics)}. "
+            "Avoid these recently used question texts:\n" +
+            "\n".join(f"- {text}" for text in list(known_questions)[:100])
         )
-        if not articles_batch and not using_fallback_window:
-            print("[QUIZ] No unprocessed summarized articles in the last 24 hours; falling back to the last 3 days.")
-            using_fallback_window = True
-            articles_batch = fetch_recent_summarized_articles(limit=100, created_after=fallback_window.isoformat())
-        print(f"[QUIZ] fetch_recent_summarized_articles returned {len(articles_batch)} article(s).")
-
-        # Filter out any articles we might have already seen in this session (edge case)
-        articles_to_process = [a for a in articles_batch if a.get('title') not in processed_titles_in_run]
-
-        if not articles_to_process:
-            print("[INFO]  No more unprocessed articles in the database. Halting.")
-            break
-
-        titles_in_batch = [a.get('title') for a in articles_to_process if a.get('title')]
-        articles_scanned += len(articles_to_process)
-        processed_titles_in_run.update(titles_in_batch)
-
-        print(f"[INFO]  Fetched {len(articles_to_process)} new articles to process...")
-
-        # 2. Generate questions from the batch (in smaller sub-batches for Gemini)
-        gemini_batch_size = 20
-        generated_questions_in_batch = []
-        successfully_processed_titles = set()
-        for i in range(0, len(articles_to_process), gemini_batch_size):
-            sub_batch = articles_to_process[i:i + gemini_batch_size]
-            generated, processed_titles = call_gemini_generate_quiz_questions(sub_batch)
-            successfully_processed_titles.update(processed_titles)
-            if generated:
-                generated_questions_in_batch.extend(generated)
-
-        # 3. Insert new questions into DB
-        if generated_questions_in_batch:
-            inserted_count = insert_quiz_questions(generated_questions_in_batch)
-            total_generated += inserted_count
-            print(f"[SUCCESS]  Generated and inserted {inserted_count} new questions. Total so far: {total_generated}")
-            if inserted_count:
-                successfully_processed_titles.update(
-                    q.get("source_article_title") for q in generated_questions_in_batch
-                    if q.get("source_article_title")
-                )
-        else:
-            print("[SUCCESS]  No relevant questions generated in this batch.")
-
-        # 4. Mark the fetched articles as processed immediately
-        titles_to_mark_processed = list(successfully_processed_titles)
-        if titles_to_mark_processed:
-            try:
-                print(f"[INFO]  Marking {len(titles_to_mark_processed)} successfully processed articles...")
-                client.table("articles").update({
-                    "quiz_generated": True,
-                    "updated_at": "now()"
-                }).in_("title", titles_to_mark_processed).execute()
-            except Exception as e:
-                print(f"[ERROR]  Error marking articles as processed: {e}")
-
-        # 5. Sleep if we are going to continue
-        if total_generated < target_questions and articles_scanned < max_articles_to_scan and articles_to_process:
-            print("[INFO]  Waiting 3 seconds before next iteration...")
-            time.sleep(3)
-
-    print(f"[SUCCESS]  Daily quiz generation complete. Total questions generated: {total_generated}")
+        payload = {
+            "model": AI_MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.8,
+            "max_tokens": 8192,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            response = requests.post(AI_API_URL, json=payload,
+                                     headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
+                                     timeout=120)
+            if response.status_code != 200:
+                print(f"[QUIZ] GK batch {batch_number + 1} failed: {response.status_code} {response.text}")
+                continue
+            content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            questions = json.loads(content).get("questions", [])
+            fresh = []
+            for question in questions:
+                text = str(question.get("question_text", "")).strip()
+                if text and text.casefold() not in known_questions:
+                    question["source_article_title"] = "General Knowledge"
+                    fresh.append(question)
+                    known_questions.add(text.casefold())
+            generated_total += insert_quiz_questions(fresh)
+        except Exception as exc:
+            print(f"[QUIZ] GK batch {batch_number + 1} failed: {exc}")
+    print(f"[SUCCESS] Daily GK quiz generation complete: {generated_total} new questions.")
 
 
 def _build_fallback_seed_votes(statement: str, count: int) -> List[Dict]:
