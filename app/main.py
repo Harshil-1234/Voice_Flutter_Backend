@@ -2468,6 +2468,17 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 20, max_vo
         return 0
 
     client = supabase_client()
+    # Bot activity belongs exclusively to the platform-operated Main Arena.
+    # This guard protects public/private rooms even if another caller regresses.
+    try:
+        topic_res = client.table("debate_topics").select("debate_type").eq("id", topic_id).limit(1).execute()
+        debate_type = ((topic_res.data or [{}])[0].get("debate_type") or "").lower()
+        if debate_type != "main":
+            print(f"[DEBATE] Seed skipped for non-main topic {topic_id} ({debate_type or 'unknown'}).")
+            return 0
+    except Exception as exc:
+        print(f"[DEBATE] Seed skipped because topic type could not be verified: {exc!r}")
+        return 0
     target_votes = random.randint(min_votes, max_votes)
 
     try:
@@ -2575,19 +2586,25 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 20, max_vo
 
 
 def generate_daily_debate_topic():
+    """Prepare one fresh Main Arena topic as `upcoming` for the next activation."""
     print("[INFO]  [DEBATE] Generating new daily debate topic...")
     client = supabase_client()
     try:
         heal_debate_schedule(client)
-        # Go live immediately and keep the main arena active for 24 hours.
         now_utc = datetime.now(timezone.utc)
-        end_utc = now_utc + timedelta(hours=24)
         existing = (client.table("debate_topics").select("id")
                     .eq("debate_type", "main").eq("status", "active")
                     .limit(1).execute())
         if existing.data:
             print("[DEBATE] An active main debate already exists; skipping generation.")
             return
+        # Pull a fresh news batch before topic generation rather than repeatedly
+        # deriving debates from yesterday's cached politics rows.
+        try:
+            smart_ingest_all_categories()
+        except Exception as exc:
+            print(f"[DEBATE] Fresh news ingest failed; using latest available rows: {exc!r}")
+
         # Do not require a particular country spelling. Older ingestion rows use
         # both `IN`, `in`, and sometimes leave country empty.
         res = (client.table("articles").select("title, summary, id")
@@ -2604,7 +2621,19 @@ def generate_daily_debate_topic():
                 "summary": "A daily policy discussion should balance effective implementation, accountability, public welfare, and institutional safeguards.",
             }]
 
-        combined_text = "\n".join([f"- {a['title']}: {a['summary']}" for a in articles])
+        recent_res = (client.table("debate_topics").select("statement")
+                      .order("created_at", desc=True).limit(10).execute())
+        recent_statements = [
+            str(row.get("statement")).strip()
+            for row in (recent_res.data or []) if str(row.get("statement") or "").strip()
+        ]
+        recent_text = "\n".join(f"- {statement}" for statement in recent_statements) or "- None"
+        combined_text = (
+            "Fresh news data:\n"
+            + "\n".join([f"- {a['title']}: {a['summary']}" for a in articles])
+            + "\n\nCRITICAL: Do NOT generate a topic similar to these recent debates:\n"
+            + recent_text
+        )
         article_ids = [str(a['id']) for a in articles]
 
         # Generate the debate topic through Gemini.
@@ -2617,19 +2646,19 @@ def generate_daily_debate_topic():
                 "statement": statement,
                 "context": topic_data.get("context", ""),
                 "debate_type": "main",
-                "status": "active",
+                "status": "upcoming",
                 "start_time": now_utc.isoformat(),
-                "end_time": end_utc.isoformat(),
+                "end_time": None,
                 "related_article_ids": article_ids
             }).execute()
-            print(f"[SUCCESS]  [DEBATE] Generated active debate: {statement}")
+            print(f"[SUCCESS]  [DEBATE] Generated upcoming debate: {statement}")
             topic_id = None
             try:
                 topic_id = (insert_res.data or [{}])[0].get("id")
             except Exception:
                 topic_id = None
             if topic_id:
-                # Seed bot arguments before the newly active arena is visible.
+                # Seed the prepared Main Arena topic only.
                 seed_debate_votes(str(topic_id), statement, min_votes=20, max_votes=20)
             else:
                 print("[DEBATE] New main debate was created without a returned id; bot seeding skipped.")
@@ -2760,7 +2789,7 @@ def manage_debate_lifecycle(force_main: bool = False):
 
 
 def run_daily_main_debate_cycle():
-    """Conclude the expired arena, then publish and seed the next one at 11 PM IST."""
+    """At 18:20 UTC / 11:50 PM IST, conclude and prepare the next arena."""
     print("[DEBATE] Starting scheduled main-debate rollover.")
     manage_debate_lifecycle(force_main=True)
     generate_daily_debate_topic()
@@ -2772,21 +2801,52 @@ def activate_next_main_debate():
     try:
         upcoming = (client.table("debate_topics").select("id, statement")
                     .eq("debate_type", "main").eq("status", "upcoming")
-                    .order("start_time").limit(1).execute())
+                    .order("created_at", desc=True).limit(1).execute())
         if not upcoming.data:
             print("[DEBATE] No upcoming main debate to activate at midnight.")
             return
         topic = upcoming.data[0]
+        # Clear abandoned/manual upcoming rows without touching the newest one.
+        client.table("debate_topics").update({"status": "completed"}).eq(
+            "debate_type", "main"
+        ).eq("status", "upcoming").neq("id", topic["id"]).execute()
         now_utc = datetime.now(timezone.utc)
         client.table("debate_topics").update({
             "status": "active",
             "start_time": now_utc.isoformat(),
             "end_time": (now_utc + timedelta(hours=24)).isoformat(),
         }).eq("id", topic["id"]).execute()
-        seed_debate_votes(topic["id"], topic.get("statement") or "")
         print(f"[DEBATE] Activated main debate topic ID {topic['id']} at midnight IST.")
     except Exception as e:
         print(f"[DEBATE] Failed to activate the next main debate: {e}")
+
+
+def ensure_active_main_debate_for_today():
+    """Startup repair: guarantee a Main Arena active for the current IST day."""
+    client = supabase_client()
+    today_ist = datetime.now(INDIA_TIMEZONE).date()
+    try:
+        active = (client.table("debate_topics").select("id,start_time")
+                  .eq("debate_type", "main").eq("status", "active")
+                  .order("created_at", desc=True).limit(1).execute()).data or []
+        if active:
+            start_raw = active[0].get("start_time")
+            try:
+                start = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                if start.astimezone(INDIA_TIMEZONE).date() == today_ist:
+                    print("[DEBATE] Today's Main Arena is already active.")
+                    return
+            except Exception:
+                print("[DEBATE] Active Main Arena has an unreadable start_time; retaining it.")
+                return
+
+        manage_debate_lifecycle(force_main=True)
+        generate_daily_debate_topic()
+        activate_next_main_debate()
+    except Exception as exc:
+        print(f"[DEBATE] Startup Main Arena repair failed: {exc!r}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -3121,7 +3181,7 @@ def schedule_jobs():
     # nightly cron tick after a deployment.
     try:
         from concurrent.futures import ThreadPoolExecutor
-        ThreadPoolExecutor(max_workers=2).submit(generate_daily_debate_topic)
+        ThreadPoolExecutor(max_workers=2).submit(ensure_active_main_debate_for_today)
         ThreadPoolExecutor(max_workers=2).submit(generate_daily_quiz_questions)
     except Exception as e:
         print(f"[STARTUP] Immediate debate/quiz generation submission failed: {e}")
@@ -3254,10 +3314,19 @@ def schedule_jobs():
     scheduler.add_job(
         run_daily_main_debate_cycle,
         "cron",
-        hour=17,
-        minute=30,
+        hour=18,
+        minute=20,
         timezone="UTC",
         id="daily_main_debate_rollover",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        activate_next_main_debate,
+        "cron",
+        hour=18,
+        minute=30,
+        timezone="UTC",
+        id="activate_main_debate",
         replace_existing=True,
     )
     scheduler.add_job(

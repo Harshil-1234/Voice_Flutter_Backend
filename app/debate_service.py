@@ -78,20 +78,7 @@ async def create_debate(request: CreateDebateRequest, background_tasks: Backgrou
     except Exception as exc:
         print(f"[ERROR] Supabase debate_topics insert failed: {exc!r}")
         raise HTTPException(status_code=500, detail=f"Could not create debate: {exc}")
-    if request.debate_type == "public":
-        # Seeding uses the local model and must not hold the create request open.
-        # The debate is already persisted and immediately usable while this runs.
-        background_tasks.add_task(_seed_created_debate, str(created["id"]), created["statement"])
     return created
-
-
-def _seed_created_debate(topic_id: str, statement: str) -> None:
-    try:
-        from main import seed_debate_votes
-        inserted = seed_debate_votes(topic_id, statement, min_votes=5, max_votes=10)
-        print(f"[DEBATE] Background seed finished for {topic_id}: {inserted} votes")
-    except Exception as exc:
-        print(f"[DEBATE] Background public-room vote seeding failed for {topic_id}: {exc!r}")
 
 @router.get("/public")
 async def get_public_debates():
@@ -359,9 +346,9 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
             "side": vote.side,
             "argument_text": "",
             "ai_score": 1,
-            "ai_feedback": "Vote counted. No argument provided.",
+            "ai_feedback": "Vote recorded (No argument provided).",
             "hidden_feedback": "To participate fully in the debate and earn a higher logic score, provide a written argument.",
-            "ai_evaluated": False,
+            "ai_evaluated": True,
             "is_anonymous": vote.is_anonymous
         }
         insert_res = client.table("user_votes").insert(vote_data).execute()
@@ -371,11 +358,11 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
         return VoteResponse(
             vote_id=vote_id,
             ai_score=1,
-            ai_feedback="Vote counted. No argument provided.",
+            ai_feedback="Vote recorded (No argument provided).",
             key_factors=["Missing reasoning"],
             xp_earned=xp_earned,
             new_title=new_title_to_return,
-            ai_evaluated=False
+            ai_evaluated=True
         )
 
     # Non-empty argument: insert pending vote and return immediately.
@@ -526,17 +513,21 @@ async def get_current_debate(user_id: str):
         if v["side"] == "support":
             support_vote_count += 1
             support_score += score_val
-            if score_val >= 7:
-                support_args.append({"text": v["argument_text"], "score": score_val})
+            if (v.get("argument_text") or "").strip():
+                support_args.append(v)
         elif v["side"] == "oppose":
             oppose_vote_count += 1
             oppose_score += score_val
-            if score_val >= 7:
-                oppose_args.append({"text": v["argument_text"], "score": score_val})
+            if (v.get("argument_text") or "").strip():
+                oppose_args.append(v)
 
     # Sort and pick top 3 for each side
-    top_support_args = sorted(support_args, key=lambda x: x["score"], reverse=True)[:3]
-    top_oppose_args = sorted(oppose_args, key=lambda x: x["score"], reverse=True)[:3]
+    top_support_args = sorted(
+        support_args, key=lambda x: int(x.get("ai_score") or 0), reverse=True
+    )[:3]
+    top_oppose_args = sorted(
+        oppose_args, key=lambda x: int(x.get("ai_score") or 0), reverse=True
+    )[:3]
 
     if not has_voted:
         return {
