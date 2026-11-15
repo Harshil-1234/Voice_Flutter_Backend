@@ -234,6 +234,7 @@ class LocalLLMService:
         if not sanitize_user_input(argument) or not sanitize_user_input(statement):
             return {
                 "score": 1,
+                "is_flagged": False,
                 "feedback": "Argument rejected: Invalid or prohibited content detected.",
                 "key_factors": ["Violation of Terms"],
                 "detailed_analysis": "Argument rejected: Invalid or prohibited content detected.",
@@ -290,6 +291,16 @@ Respond ONLY with this JSON structure:
     "detailed_analysis": "<Paragraph analyzing their logic strength and weakness>"
 }"""
 
+        # Keep the existing judge personas/rubrics intact and append only the
+        # requested moderation and zero-substance constraints.
+        system_prompt += """
+
+ADDITIONAL SCORING AND MODERATION RULES:
+CRITICAL SCORING RULE: If the user merely writes 'Yes', 'No', 'I agree', or simply repeats the debate topic without providing a reason, why, fact, impact, or evidence, it provides ZERO value. You MUST score it 1 point. In feedback and detailed_analysis, explicitly state: 'Your argument contributed no reasoning, facts, or evidence to the topic, which is equivalent to writing nothing, earning the minimum 1 point.'
+MODERATION RULE (is_flagged boolean): Check for abusive, vulgar, or hateful language in English, Hindi, or Hinglish. If strong language still includes a valid point, fact, or logical reason related to the topic, set is_flagged to false and score the logic normally. If it is pure trolling, vulgarity, or a personal/emotional rant with zero logical value or relevance, set is_flagged to true and score 1.
+The JSON output must also include: "is_flagged": <boolean>.
+"""
+
         user_prompt = f"Topic Statement: {statement}\nUser Argument: {argument}"
         combined_prompt = f"{system_prompt}\n\n{user_prompt}"
 
@@ -320,6 +331,7 @@ Respond ONLY with this JSON structure:
             # Fallback response in case of error
             return {
                 "score": 5,
+                "is_flagged": False,
                 "feedback": "AI analysis temporarily unavailable due to a server error.",
                 "key_factors": ["Could not parse argument logically."],
                 "detailed_analysis": "An error occurred while the Logic Professor was analyzing your argument. Please try again."
@@ -554,6 +566,10 @@ Do not use JSON. Write plain text."""
             "Generate realistic synthetic debate votes for a public discussion thread.\n"
             "Arguments should sound like regular internet users, not experts.\n"
             "Keep quality average (score 4-7), no profanity, no hate speech.\n"
+            "For a 20-vote request, generate exactly 10 support and 10 oppose arguments. "
+            "Vary length and quality wildly: 5 lazy one-word or one-line opinions, "
+            "8 average one-sentence points, and 7 deep multi-sentence analytical arguments "
+            "that cite facts, impacts, or examples. Do not make them uniform.\n"
             "Return ONLY JSON object with key 'votes'.\n"
             "Schema: {\"votes\": [{\"side\": \"support|oppose\", \"argument\": \"text\", \"score\": 4-7}]}\n"
             "Ensure a mix of support and oppose."

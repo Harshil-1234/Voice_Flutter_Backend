@@ -24,6 +24,7 @@ class VoteResponse(BaseModel):
     xp_earned: int
     new_title: str | None = None
     ai_evaluated: bool = True
+    is_flagged: bool = False
 
 class UnlockRequest(BaseModel):
     vote_id: str
@@ -57,6 +58,7 @@ async def create_debate(request: CreateDebateRequest, background_tasks: Backgrou
     if not topic["statement"]:
         raise HTTPException(status_code=422, detail="statement is required")
     if request.debate_type == "private":
+        topic["joined_user_ids"] = []
         for _ in range(10):
             code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
             try:
@@ -105,14 +107,16 @@ async def get_public_debates():
 
 @router.get("/private/{user_id}")
 async def get_private_debates(user_id: str):
-    """List only active private rooms created by the requesting user."""
+    """List active private rooms owned by or joined by the requesting user."""
     from main import supabase_client
     client = supabase_client()
     try:
         result = (client.table("debate_topics").select("*")
-                  .eq("debate_type", "private").eq("created_by", user_id).eq("status", "active")
+                  .eq("debate_type", "private").eq("status", "active")
                   .order("created_at", desc=True).execute())
-        return result.data or []
+        return [row for row in (result.data or [])
+                if str(row.get("created_by") or "") == user_id
+                or user_id in [str(value) for value in (row.get("joined_user_ids") or [])]]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not load private debates: {exc}")
 
@@ -121,14 +125,19 @@ def _build_topic_state(client, topic: dict, user_id: str) -> dict:
     user_vote = None
     if topic_id and user_id and user_id != "guest":
         vote_result = (client.table("user_votes")
-                       .select("id, user_id, topic_id, side, argument_text, ai_score, ai_feedback, ai_evaluated, is_anonymous, created_at, profiles(display_name, full_name, current_title)")
+                       .select("id, user_id, topic_id, side, argument_text, ai_score, ai_feedback, ai_evaluated, is_anonymous, is_flagged, created_at, profiles(display_name, full_name, current_title)")
                        .eq("topic_id", topic_id).eq("user_id", user_id).limit(1).execute())
         user_vote = (vote_result.data or [None])[0]
 
     all_votes_result = (client.table("user_votes")
-                        .select("id, user_id, topic_id, side, ai_score, ai_feedback, ai_evaluated, argument_text, is_anonymous, created_at, profiles(display_name, full_name, current_title)")
+                        .select("id, user_id, topic_id, side, ai_score, ai_feedback, ai_evaluated, argument_text, is_anonymous, is_flagged, created_at, profiles(display_name, full_name, current_title)")
                         .eq("topic_id", topic_id).order("created_at", desc=True).limit(200).execute())
     all_votes = all_votes_result.data or []
+    scoring_votes = list(all_votes)
+    if str(topic.get("debate_type") or "main").lower() in {"main", "public"}:
+        visible_votes = [vote for vote in all_votes if vote.get("is_flagged") is not True]
+    else:
+        visible_votes = list(all_votes)
 
     def vote_score(v):
         try:
@@ -138,9 +147,11 @@ def _build_topic_state(client, topic: dict, user_id: str) -> dict:
 
     # The UI consumes this list directly. Keep the contract deterministic even
     # when PostgREST returns NULL scores before AI evaluation completes.
-    all_votes.sort(key=vote_score, reverse=True)
-    support = [v for v in all_votes if str(v.get("side") or "").lower() == "support"]
-    oppose = [v for v in all_votes if str(v.get("side") or "").lower() == "oppose"]
+    visible_votes.sort(key=vote_score, reverse=True)
+    support = [v for v in visible_votes if str(v.get("side") or "").lower() == "support"]
+    oppose = [v for v in visible_votes if str(v.get("side") or "").lower() == "oppose"]
+    scoring_support = [v for v in scoring_votes if str(v.get("side") or "").lower() == "support"]
+    scoring_oppose = [v for v in scoring_votes if str(v.get("side") or "").lower() == "oppose"]
 
     top_support = [v for v in sorted(support, key=vote_score, reverse=True) if (v.get("argument_text") or "").strip()][:3]
     top_oppose = [v for v in sorted(oppose, key=vote_score, reverse=True) if (v.get("argument_text") or "").strip()][:3]
@@ -151,13 +162,13 @@ def _build_topic_state(client, topic: dict, user_id: str) -> dict:
         "user_vote": user_vote,
         # Keep blind voting, but never hide state after the user has voted.
         "stats": {
-            "support_score": sum(vote_score(v) for v in support),
-            "oppose_score": sum(vote_score(v) for v in oppose),
+            "support_score": sum(vote_score(v) for v in scoring_support),
+            "oppose_score": sum(vote_score(v) for v in scoring_oppose),
             "support_vote_count": len(support),
             "oppose_vote_count": len(oppose),
             "top_support_args": top_support,
             "top_oppose_args": top_oppose,
-            "arguments": all_votes,
+            "arguments": visible_votes,
             "user_vote": user_vote,
         } if has_voted else None,
     }
@@ -219,7 +230,7 @@ async def get_debate_stats(topic_id: str, user_id: str):
         raise HTTPException(status_code=500, detail=f"Could not load debate stats: {exc}")
 
 @router.get("/room/{room_code}")
-async def get_private_room(room_code: str):
+async def get_private_room(room_code: str, user_id: str | None = None):
     from main import supabase_client
     client = supabase_client()
     try:
@@ -229,6 +240,14 @@ async def get_private_room(room_code: str):
         topic = (result.data or [None])[0]
         if not topic:
             raise HTTPException(status_code=404, detail="Active room not found")
+        if user_id and user_id != "guest":
+            joined_ids = [str(value) for value in (topic.get("joined_user_ids") or [])]
+            if user_id not in joined_ids and str(topic.get("created_by") or "") != user_id:
+                joined_ids.append(user_id)
+                client.table("debate_topics").update({
+                    "joined_user_ids": joined_ids,
+                }).eq("id", topic["id"]).execute()
+                topic["joined_user_ids"] = joined_ids
         return topic
     except HTTPException:
         raise
@@ -292,12 +311,16 @@ def _evaluate_vote_in_background(vote_id: str, user_id: str, statement: str, arg
 
     ai_feedback = ai_analysis.get("feedback", "AI analysis completed.")
     detailed = ai_analysis.get("detailed_analysis", "No detailed analysis available.")
+    is_flagged = bool(ai_analysis.get("is_flagged", False))
+    if debate_type == "private":
+        is_flagged = False
 
     client.table("user_votes").update({
         "ai_score": score,
         "ai_feedback": ai_feedback,
         "hidden_feedback": detailed,
-        "ai_evaluated": True
+        "ai_evaluated": True,
+        "is_flagged": is_flagged,
     }).eq("id", vote_id).execute()
 
     # XP is awarded after AI scoring finishes.
@@ -308,13 +331,14 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
     from main import supabase_client
     client = supabase_client()
     clean_argument = (vote.argument_text or "").strip()
-    topic_res = client.table("debate_topics").select("statement, status").eq("id", vote.topic_id).execute()
+    topic_res = client.table("debate_topics").select("statement, status, debate_type").eq("id", vote.topic_id).execute()
     if not topic_res.data:
         raise HTTPException(status_code=404, detail="Topic not found")
     if topic_res.data[0].get("status") != "active":
         raise HTTPException(status_code=409, detail="Voting is not open for this debate")
 
     if clean_argument and not sanitize_user_input(clean_argument):
+        debate_type = (topic_res.data[0].get("debate_type") or "main").lower()
         rejected_vote = {
             "user_id": vote.user_id,
             "topic_id": vote.topic_id,
@@ -325,6 +349,7 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
             "hidden_feedback": None,
             "ai_evaluated": True,
             "is_anonymous": vote.is_anonymous,
+            "is_flagged": debate_type != "private",
         }
         insert_res = client.table("user_votes").insert(rejected_vote).execute()
         vote_id = insert_res.data[0]["id"] if insert_res.data else ""
@@ -336,6 +361,7 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
             xp_earned=0,
             new_title=None,
             ai_evaluated=True,
+            is_flagged=debate_type != "private",
         )
 
     # Fast path: no argument means no AI call.
@@ -349,7 +375,8 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
             "ai_feedback": "Vote recorded (No argument provided).",
             "hidden_feedback": "To participate fully in the debate and earn a higher logic score, provide a written argument.",
             "ai_evaluated": True,
-            "is_anonymous": vote.is_anonymous
+            "is_anonymous": vote.is_anonymous,
+            "is_flagged": False,
         }
         insert_res = client.table("user_votes").insert(vote_data).execute()
         vote_id = insert_res.data[0]["id"] if insert_res.data else ""
@@ -362,7 +389,8 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
             key_factors=["Missing reasoning"],
             xp_earned=xp_earned,
             new_title=new_title_to_return,
-            ai_evaluated=True
+            ai_evaluated=True,
+            is_flagged=False,
         )
 
     # Non-empty argument: insert pending vote and return immediately.
@@ -377,7 +405,8 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
         "ai_feedback": "AI is judging your logic...",
         "hidden_feedback": None,
         "ai_evaluated": False,
-        "is_anonymous": vote.is_anonymous
+        "is_anonymous": vote.is_anonymous,
+        "is_flagged": False,
     }
     insert_res = client.table("user_votes").insert(vote_data).execute()
     vote_id = insert_res.data[0]["id"] if insert_res.data else ""
@@ -397,7 +426,8 @@ async def submit_vote(vote: VoteRequest, background_tasks: BackgroundTasks):
         key_factors=[],
         xp_earned=0,
         new_title=None,
-        ai_evaluated=False
+        ai_evaluated=False,
+        is_flagged=False,
     )
 
 @router.post("/unlock_feedback", response_model=UnlockResponse)
@@ -489,7 +519,7 @@ async def get_current_debate(user_id: str):
         user_votes = []
     else:
         vote_res = client.table("user_votes").select(
-            "id, user_id, side, argument_text, ai_score, ai_feedback, ai_evaluated, is_anonymous, created_at, profiles(display_name, full_name, current_title)"
+            "id, user_id, side, argument_text, ai_score, ai_feedback, ai_evaluated, is_anonymous, is_flagged, created_at, profiles(display_name, full_name, current_title)"
         ).eq("topic_id", active_debate["id"]).eq("user_id", user_id).limit(1).execute()
         user_votes = vote_res.data or []
     has_voted = len(user_votes) > 0
@@ -497,9 +527,11 @@ async def get_current_debate(user_id: str):
     # 3. Fetch community stats
     # Aggregating count and scores for community meter
     all_votes_res = client.table("user_votes").select(
-        "id, user_id, side, ai_score, ai_feedback, ai_evaluated, argument_text, is_anonymous, created_at, profiles(display_name, full_name, current_title)"
+        "id, user_id, side, ai_score, ai_feedback, ai_evaluated, argument_text, is_anonymous, is_flagged, created_at, profiles(display_name, full_name, current_title)"
     ).eq("topic_id", active_debate["id"]).order("ai_score", desc=True).execute()
     all_votes = all_votes_res.data or []
+    visible_votes = [v for v in all_votes if v.get("is_flagged") is not True]
+    visible_votes.sort(key=lambda v: int(v.get("ai_score") or 0), reverse=True)
     
     support_score = 0
     oppose_score = 0
@@ -513,12 +545,12 @@ async def get_current_debate(user_id: str):
         if v["side"] == "support":
             support_vote_count += 1
             support_score += score_val
-            if (v.get("argument_text") or "").strip():
+            if v.get("is_flagged") is not True and (v.get("argument_text") or "").strip():
                 support_args.append(v)
         elif v["side"] == "oppose":
             oppose_vote_count += 1
             oppose_score += score_val
-            if (v.get("argument_text") or "").strip():
+            if v.get("is_flagged") is not True and (v.get("argument_text") or "").strip():
                 oppose_args.append(v)
 
     # Sort and pick top 3 for each side
@@ -546,7 +578,7 @@ async def get_current_debate(user_id: str):
                 "oppose_vote_count": oppose_vote_count,
                 "top_support_args": top_support_args,
                 "top_oppose_args": top_oppose_args,
-                "arguments": all_votes,
+                "arguments": visible_votes,
                 "user_vote": user_votes[0] if user_votes else None,
             }
         }

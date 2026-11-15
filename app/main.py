@@ -2162,7 +2162,14 @@ def _score_seed_argument(statement: str, argument_text: str) -> int:
     try:
         if llm_service is not None and hasattr(llm_service, "judge_argument"):
             result = llm_service.judge_argument(statement, argument_text, "main") or {}
-            return max(1, min(10, int(result.get("score", 5))))
+            score = max(1, min(10, int(result.get("score", 5))))
+            words = argument_text.split()
+            lowered = argument_text.lower()
+            has_reason = any(marker in lowered for marker in
+                             ("because", "since", "therefore", "however", "impact", "evidence"))
+            if len(words) <= 6 and not has_reason:
+                return min(score, 2)
+            return score
     except Exception as exc:
         print(f"[DEBATE] Bot argument scoring failed; using fallback score: {exc}")
     words = len(argument_text.split())
@@ -2539,7 +2546,9 @@ def seed_debate_votes(topic_id: str, statement: str, min_votes: int = 20, max_vo
             continue
 
         try:
-            ai_score = int(item.get("score", _score_seed_argument(statement, argument_text)))
+            # Never trust a model-provided synthetic score. Every bot argument
+            # goes through the same judge/rubric as a human argument.
+            ai_score = _score_seed_argument(statement, argument_text)
         except Exception:
             ai_score = 6
         ai_score = max(4, min(7, ai_score))
