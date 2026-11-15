@@ -58,7 +58,6 @@ async def create_debate(request: CreateDebateRequest, background_tasks: Backgrou
     if not topic["statement"]:
         raise HTTPException(status_code=422, detail="statement is required")
     if request.debate_type == "private":
-        topic["joined_user_ids"] = []
         for _ in range(10):
             code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
             try:
@@ -136,6 +135,7 @@ def _build_topic_state(client, topic: dict, user_id: str) -> dict:
     scoring_votes = list(all_votes)
     if str(topic.get("debate_type") or "main").lower() in {"main", "public"}:
         visible_votes = [vote for vote in all_votes if vote.get("is_flagged") is not True]
+
     else:
         visible_votes = list(all_votes)
 
@@ -244,10 +244,15 @@ async def get_private_room(room_code: str, user_id: str | None = None):
             joined_ids = [str(value) for value in (topic.get("joined_user_ids") or [])]
             if user_id not in joined_ids and str(topic.get("created_by") or "") != user_id:
                 joined_ids.append(user_id)
-                client.table("debate_topics").update({
-                    "joined_user_ids": joined_ids,
-                }).eq("id", topic["id"]).execute()
-                topic["joined_user_ids"] = joined_ids
+                try:
+                    client.table("debate_topics").update({
+                        "joined_user_ids": joined_ids,
+                    }).eq("id", topic["id"]).execute()
+                    topic["joined_user_ids"] = joined_ids
+                except Exception as exc:
+                    # The column may not exist yet or PostgREST may not have
+                    # refreshed its schema cache. Joining must still succeed.
+                    print(f"[DEBATE] Could not persist joined_user_ids; continuing: {exc!r}")
         return topic
     except HTTPException:
         raise
@@ -500,6 +505,18 @@ async def get_current_debate(user_id: str):
             active_debates = []
 
     if not active_debates:
+        # The scheduled rollover can complete the old debate before midnight
+        # activates the next one. Keep the finished arena visible during that
+        # short handover window so clients can render final results.
+        try:
+            res = (client.table("debate_topics").select("*")
+                   .eq("debate_type", "main").eq("status", "completed")
+                   .order("end_time", desc=True).limit(1).execute())
+            active_debates = res.data or []
+        except Exception:
+            active_debates = []
+
+    if not active_debates:
         # Lifecycle fallback: show upcoming when no active exists yet.
         try:
             res = client.table("debate_topics").select("*").eq("debate_type", "main").eq("status", "upcoming").order("created_at", desc=True).limit(1).execute()
@@ -508,8 +525,7 @@ async def get_current_debate(user_id: str):
             active_debates = []
     
     if not active_debates:
-        # Check if we should fallback to showing the last completed one or a "Coming Soon" state
-        # For now return None so frontend shows "No active debate"
+        # No usable main debate row is available.
         return None
 
     active_debate = active_debates[0]
@@ -522,7 +538,10 @@ async def get_current_debate(user_id: str):
             "id, user_id, side, argument_text, ai_score, ai_feedback, ai_evaluated, is_anonymous, is_flagged, created_at, profiles(display_name, full_name, current_title)"
         ).eq("topic_id", active_debate["id"]).eq("user_id", user_id).limit(1).execute()
         user_votes = vote_res.data or []
-    has_voted = len(user_votes) > 0
+    is_completed = active_debate.get("status") == "completed"
+    # Completed debates reveal their final result to everyone, including users
+    # who did not vote before the debate ended.
+    has_voted = len(user_votes) > 0 or is_completed
 
     # 3. Fetch community stats
     # Aggregating count and scores for community meter
