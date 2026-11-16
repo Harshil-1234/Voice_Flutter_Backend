@@ -106,16 +106,22 @@ async def get_public_debates():
 
 @router.get("/private/{user_id}")
 async def get_private_debates(user_id: str):
-    """List active private rooms owned by or joined by the requesting user."""
+    """List active private rooms created by or joined by the requesting user."""
     from main import supabase_client
     client = supabase_client()
     try:
+        memberships = (client.table("debate_room_members")
+                       .select("topic_id").eq("user_id", user_id).execute())
+        joined_topic_ids = {
+            str(row.get("topic_id")) for row in (memberships.data or [])
+            if row.get("topic_id") is not None
+        }
         result = (client.table("debate_topics").select("*")
                   .eq("debate_type", "private").eq("status", "active")
                   .order("created_at", desc=True).execute())
         return [row for row in (result.data or [])
                 if str(row.get("created_by") or "") == user_id
-                or user_id in [str(value) for value in (row.get("joined_user_ids") or [])]]
+                or str(row.get("id")) in joined_topic_ids]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not load private debates: {exc}")
 
@@ -241,18 +247,12 @@ async def get_private_room(room_code: str, user_id: str | None = None):
         if not topic:
             raise HTTPException(status_code=404, detail="Active room not found")
         if user_id and user_id != "guest":
-            joined_ids = [str(value) for value in (topic.get("joined_user_ids") or [])]
-            if user_id not in joined_ids and str(topic.get("created_by") or "") != user_id:
-                joined_ids.append(user_id)
-                try:
-                    client.table("debate_topics").update({
-                        "joined_user_ids": joined_ids,
-                    }).eq("id", topic["id"]).execute()
-                    topic["joined_user_ids"] = joined_ids
-                except Exception as exc:
-                    # The column may not exist yet or PostgREST may not have
-                    # refreshed its schema cache. Joining must still succeed.
-                    print(f"[DEBATE] Could not persist joined_user_ids; continuing: {exc!r}")
+            # Membership is kept in its own table so joining is durable and
+            # concurrent joins cannot overwrite one another.
+            client.table("debate_room_members").upsert({
+                "topic_id": topic["id"],
+                "user_id": user_id,
+            }, on_conflict="topic_id,user_id").execute()
         return topic
     except HTTPException:
         raise
