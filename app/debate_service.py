@@ -110,6 +110,7 @@ async def get_private_debates(user_id: str):
     from main import supabase_client
     client = supabase_client()
     try:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         memberships = (client.table("debate_room_members")
                        .select("topic_id").eq("user_id", user_id).execute())
         joined_topic_ids = {
@@ -118,6 +119,7 @@ async def get_private_debates(user_id: str):
         }
         result = (client.table("debate_topics").select("*")
                   .eq("debate_type", "private").eq("status", "active")
+                  .gt("end_time", now)
                   .order("created_at", desc=True).execute())
         return [row for row in (result.data or [])
                 if str(row.get("created_by") or "") == user_id
@@ -240,8 +242,10 @@ async def get_private_room(room_code: str, user_id: str | None = None):
     from main import supabase_client
     client = supabase_client()
     try:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         result = (client.table("debate_topics").select("*")
-                  .eq("debate_type", "private").eq("room_code", room_code.upper()).eq("status", "active")
+                  .eq("debate_type", "private").eq("room_code", room_code.upper())
+                  .eq("status", "active").gt("end_time", now)
                   .limit(1).execute())
         topic = (result.data or [None])[0]
         if not topic:
