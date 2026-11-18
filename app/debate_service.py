@@ -140,9 +140,18 @@ def _build_topic_state(client, topic: dict, user_id: str) -> dict:
                         .select("id, user_id, topic_id, side, ai_score, ai_feedback, ai_evaluated, argument_text, is_anonymous, is_flagged, created_at, profiles(display_name, full_name, current_title)")
                         .eq("topic_id", topic_id).order("created_at", desc=True).limit(200).execute())
     all_votes = all_votes_result.data or []
+    # Only evaluated, non-flagged, non-empty arguments may enter a community
+    # response.  `user_vote` above remains separate so its author can see a
+    # pending moderation status without exposing it to anyone else.
     scoring_votes = list(all_votes)
     if str(topic.get("debate_type") or "main").lower() in {"main", "public"}:
-        visible_votes = [vote for vote in all_votes if vote.get("is_flagged") is not True]
+        visible_votes = [
+            vote for vote in all_votes
+            if vote.get("ai_evaluated") is True
+            and vote.get("ai_score") is not None
+            and vote.get("is_flagged") is False
+            and (vote.get("argument_text") or "").strip()
+        ]
 
     else:
         visible_votes = list(all_votes)
@@ -158,8 +167,20 @@ def _build_topic_state(client, topic: dict, user_id: str) -> dict:
     visible_votes.sort(key=vote_score, reverse=True)
     support = [v for v in visible_votes if str(v.get("side") or "").lower() == "support"]
     oppose = [v for v in visible_votes if str(v.get("side") or "").lower() == "oppose"]
-    scoring_support = [v for v in scoring_votes if str(v.get("side") or "").lower() == "support"]
-    scoring_oppose = [v for v in scoring_votes if str(v.get("side") or "").lower() == "oppose"]
+    # Community totals must use the same moderation gate as their lists.
+    # (Private rooms intentionally retain their existing live-vote behavior.)
+    is_community_debate = str(topic.get("debate_type") or "main").lower() in {
+        "main", "public"
+    }
+    score_source = visible_votes if is_community_debate else scoring_votes
+    scoring_support = [
+        v for v in score_source
+        if str(v.get("side") or "").lower() == "support"
+    ]
+    scoring_oppose = [
+        v for v in score_source
+        if str(v.get("side") or "").lower() == "oppose"
+    ]
 
     top_support = [v for v in sorted(support, key=vote_score, reverse=True) if (v.get("argument_text") or "").strip()][:3]
     top_oppose = [v for v in sorted(oppose, key=vote_score, reverse=True) if (v.get("argument_text") or "").strip()][:3]
@@ -553,7 +574,13 @@ async def get_current_debate(user_id: str):
         "id, user_id, side, ai_score, ai_feedback, ai_evaluated, argument_text, is_anonymous, is_flagged, created_at, profiles(display_name, full_name, current_title)"
     ).eq("topic_id", active_debate["id"]).order("ai_score", desc=True).execute()
     all_votes = all_votes_res.data or []
-    visible_votes = [v for v in all_votes if v.get("is_flagged") is not True]
+    visible_votes = [
+        v for v in all_votes
+        if v.get("ai_evaluated") is True
+        and v.get("ai_score") is not None
+        and v.get("is_flagged") is False
+        and (v.get("argument_text") or "").strip()
+    ]
     visible_votes.sort(key=lambda v: int(v.get("ai_score") or 0), reverse=True)
     
     support_score = 0
@@ -563,18 +590,16 @@ async def get_current_debate(user_id: str):
     support_args = []
     oppose_args = []
     
-    for v in all_votes:
+    for v in visible_votes:
         score_val = v.get("ai_score") or 0
         if v["side"] == "support":
             support_vote_count += 1
             support_score += score_val
-            if v.get("is_flagged") is not True and (v.get("argument_text") or "").strip():
-                support_args.append(v)
+            support_args.append(v)
         elif v["side"] == "oppose":
             oppose_vote_count += 1
             oppose_score += score_val
-            if v.get("is_flagged") is not True and (v.get("argument_text") or "").strip():
-                oppose_args.append(v)
+            oppose_args.append(v)
 
     # Sort and pick top 3 for each side
     top_support_args = sorted(
